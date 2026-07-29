@@ -1,0 +1,18 @@
+{
+  "format": "nativescript-android-metadata-v1",
+  "generator": {
+    "file": "android-metadata-generator.jar",
+    "sha256": "6940e3b0b202beb37dd921a1eda0f693ce9ad8cb3b7d8977f0a92e651390ed81"
+  },
+  "dependencies": [
+    {
+      "file": "android.jar",
+      "sha256": "d9eb9da824d9e247a352f570f01e1169e725b2954bca9e283a71786c59b59f9a"
+    }
+  ],
+  "streams": {
+    "treeNodeStream.dat": "25324639112e6fbf121c845b109f8e6c84f9bb938f6413c16ebc76ee5e4ea3d9",
+    "treeStringsStream.dat": "26c34d8c55027207106cf396d899fd485b0b8b39b0d513c2cf66347407da2c99",
+    "treeValueStream.dat": "d4d7f05ec04948bb06acddc72d758f7bda99b110d15289a78af67d0e42d5d2e8"
+  }
+}

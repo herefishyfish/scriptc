@@ -27,6 +27,7 @@ Requires clang on the PATH (Xcode Command Line Tools on macOS, `clang` package o
 ## Commands
 
 - `scriptc build <file.ts>` — compile to a native executable
+- `scriptc build <file.ts> --target android` — emit a Gradle/NDK Android project
 - `scriptc run <file.ts>` — compile and run
 - `scriptc coverage <file.ts>` — what compiles statically, and why the rest doesn't
 

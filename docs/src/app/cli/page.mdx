@@ -11,6 +11,8 @@ Usage:
   scriptc run <file.ts|.js> [options]       compile and run
   scriptc coverage <file.ts|.js>            how much compiles statically, and why not
   scriptc coverage <file.ts|.js> --dynamic  what a --dynamic build compiles, and what still blocks it
+  scriptc build <file.ts|.js> --target android
+                                            emit an Android Gradle/NDK project
 ```
 
 ## scriptc build
@@ -33,6 +35,50 @@ fib.c
 fib.ir.json
 ```
 
+### Android projects
+
+`scriptc build app.ts --target android -o android-app` emits an Android
+Studio project instead of a desktop executable. The checked-in Android
+template supplies the Gradle application and Activity lifecycle shell;
+scriptc adds the generated native translation unit, its runtime sources,
+and the JNI bridge. Gradle and the Android NDK then build
+`libscriptc_app.so` for the selected device ABI.
+
+The initial typed platform surface is compatible with NativeScript's access
+pattern:
+
+```ts:app.ts
+const activity = Application.android.foregroundActivity;
+const button = new android.widget.Button(activity);
+button.setAllCaps(false);
+let count = 0;
+
+button.setText(`Count: ${count}`);
+button.setOnClickListener(() => {
+  count += 1;
+  button.setText(`Count: ${count}`);
+});
+const layout = new android.widget.LinearLayout(activity);
+layout.setOrientation(android.widget.LinearLayout.VERTICAL);
+layout.setPadding(0, 160, 0, 0);
+layout.addView(button);
+activity.setContentView(layout);
+```
+
+Android constructors and instance calls are resolved against the binary API
+metadata emitted by NativeScript's Android metadata generator. The compiler
+selects a compatible overload and writes its JVM owner and descriptor into the
+native program; one cached JNI dispatcher handles the call at runtime.
+Java-interface parameters accept zero-argument, void-returning compiled
+JavaScript callbacks through a generic proxy, which is how the click listener
+above re-enters JavaScript.
+
+This first metadata-driven slice is synchronous and UI-thread-only. Current
+marshalling covers Android object references, strings, booleans, numbers, and
+the callback shape above. Static methods, fields, arrays, callback arguments
+and return values, background-thread JNI attachment, and Android event-loop
+integration remain future work.
+
 ## scriptc run
 
 `build` followed by executing the binary, with stdio inherited.
@@ -52,7 +98,16 @@ Analyzes the program without producing a binary and reports, statement by statem
 
 <dl>
   <dt><code>-o, --out &lt;path&gt;</code></dt>
-  <dd>Output executable path. Default: <code>.scriptc/&lt;name&gt;</code> next to the input file.</dd>
+  <dd>Output executable path, or the project directory under <code>--target android</code>. The Android default is <code>.scriptc/android</code>.</dd>
+
+  <dt><code>--target android</code></dt>
+  <dd>Emit a self-contained Gradle/NDK Android application project. Android currently supports <code>build</code>, not <code>run</code> or <code>coverage</code>.</dd>
+
+  <dt><code>--android-package &lt;id&gt;</code></dt>
+  <dd>Application id and Java package for the generated Activity. Default: <code>org.scriptc.app</code>.</dd>
+
+  <dt><code>--android-name &lt;name&gt;</code></dt>
+  <dd>Launcher label for the generated Android application. Default: <code>scriptc</code>.</dd>
 
   <dt><code>--dynamic</code></dt>
   <dd>Embed the dynamic engine (~620KB) so npm dependencies and <code>any</code>-typed code can run. Static stays the default — without this flag, dynamic-tier sites are per-site compile errors. See <a href="/dependencies">npm Dependencies</a>.</dd>

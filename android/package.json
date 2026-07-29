@@ -1,0 +1,28 @@
+{
+  "name": "@scriptc/android",
+  "version": "0.0.17",
+  "description": "Android Gradle/JNI host template for scriptc applications",
+  "license": "Apache-2.0",
+  "type": "module",
+  "files": [
+    "metadata",
+    "scripts",
+    "template"
+  ],
+  "exports": {
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "node -e \"void 0\"",
+    "metadata": "node scripts/generate-metadata.mjs"
+  },
+  "dependencies": {
+    "@nativescript/core": "^9.0.0"
+  },
+  "devDependencies": {
+    "@nativescript/types": "^9.0.0"
+  }
+}

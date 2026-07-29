@@ -30,6 +30,7 @@ import { isJsSourceFileName, isRelativeSpecifier } from "./frontend/shared.js";
 import { lowerToIr, type LowerOptions, type LowerResult } from "./frontend/lowering/lowerer.js";
 import type { CoverageInput, NpmStaticStatus } from "./coverage/report.js";
 import { loadFfiProfile, type FfiProfile } from "./ffi/profile.js";
+import { emitAndroidProject } from "./android/project.js";
 
 export const VERSION = "0.0.1";
 
@@ -137,6 +138,30 @@ export interface CompileOptions {
    * appended to the executable link. */
   ffiProfilePath?: string;
 }
+
+export interface AndroidCompileOptions {
+  /** Destination Gradle project directory. */
+  outDir: string;
+  applicationId?: string;
+  appName?: string;
+  minSdk?: number;
+  targetSdk?: number;
+  compileSdk?: number;
+  emitIr?: boolean;
+  /** Static compilation of eligible package sources; the Android lane has
+   * no engine fallback yet. */
+  npmStatic?: readonly string[] | "auto";
+}
+
+export type AndroidCompileResult =
+  | {
+      ok: true;
+      projectDir: string;
+      cPath: string;
+      irPath?: string;
+      backend: "c";
+    }
+  | { ok: false; diagnostics: ScrDiagnostic[]; sourceTexts: Map<string, string> };
 
 export type CompileResult =
   /** `cPath` is the generated program TU next to the binary: the .ll under
@@ -836,6 +861,85 @@ export async function compile(entryPath: string, opts: CompileOptions): Promise<
  * handlers, traps to the host's registered sink. The profile pins the
  * emission; there is no fallback concept on this path (an out-of-tier
  * program under emission "llvm" is SC3001, fail-loudly). */
+
+/** Compile a synchronous scriptc program into a self-contained Android
+ * application project. Gradle/AGP performs the NDK build and packaging;
+ * unlike the executable lane, this function never invokes the host C
+ * compiler. */
+export async function compileAndroid(
+  entryPath: string,
+  opts: AndroidCompileOptions,
+): Promise<AndroidCompileResult> {
+  const fe = runFrontend(entryPath, opts.npmStatic);
+  let mod: IrModule;
+  let entryText: string;
+  try {
+    const fail = (diagnostics: ScrDiagnostic[]): AndroidCompileResult => ({
+      ok: false,
+      diagnostics,
+      sourceTexts: fe.sourceTexts(),
+    });
+    if (fe.preflight.length > 0) return fail(fe.preflight);
+
+    let lowered: LowerResult;
+    try {
+      lowered = fe.lower({ dynamic: false, targetPlatform: "android" });
+    } catch (e) {
+      if (!isCheckerPanic(e)) throw e;
+      return fail([
+        checkerPanicDiag(e.message.split("\n", 1)[0]!, {
+          file: entryPath,
+          start: 0,
+          end: 0,
+        }),
+      ]);
+    }
+    if (lowered.module === null) return fail(lowered.diagnostics);
+    mod = lowered.module;
+    const validation = validateModule(mod);
+    if (validation.length > 0) {
+      return fail(validation.map((v) => iceDiag(v.message, v.loc)));
+    }
+    const asyncSurface = moduleLibAsyncSurface(mod);
+    if (asyncSurface !== null) {
+      return fail([
+        {
+          code: "SC6001",
+          message:
+            `Android target currently requires a synchronous program; ` +
+            `${asyncSurface.surface} needs the Android event-loop bridge`,
+          loc: asyncSurface.loc,
+        },
+      ]);
+    }
+    entryText = fe.entryText();
+  } finally {
+    fe.dispose();
+  }
+
+  const project = await emitAndroidProject({
+    outDir: opts.outDir,
+    generatedC: emitModule(mod, entryText, { host: "android" }),
+    ...(opts.applicationId !== undefined ? { applicationId: opts.applicationId } : {}),
+    ...(opts.appName !== undefined ? { appName: opts.appName } : {}),
+    ...(opts.minSdk !== undefined ? { minSdk: opts.minSdk } : {}),
+    ...(opts.targetSdk !== undefined ? { targetSdk: opts.targetSdk } : {}),
+    ...(opts.compileSdk !== undefined ? { compileSdk: opts.compileSdk } : {}),
+  });
+
+  let irPath: string | undefined;
+  if (opts.emitIr) {
+    irPath = join(opts.outDir, "app", "src", "main", "cpp", "scriptc_app.ir.json");
+    await writeFile(irPath, serializeModule(mod));
+  }
+  return {
+    ok: true,
+    projectDir: project.projectDir,
+    cPath: project.nativeSourcePath,
+    ...(irPath !== undefined ? { irPath } : {}),
+    backend: "c",
+  };
+}
 
 export interface CompileLibraryOptions {
   profilePath: string;

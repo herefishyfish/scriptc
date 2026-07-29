@@ -50,9 +50,10 @@ import type {
   IrUnionDef,
   SrcLoc,
 } from "../../ir/nodes.js";
-import { arrayOf, BOOL, canAdaptDynFuncTo, canConvertToDyn, canCrossIslandBoundary, canExitIslandToType, canMarshalTypedFuncIntoIsland, DYN, F64, isJsonSafeType, isUndefinedArmedUnion, isUnitType, JSVAL, RUNTIME_ERROR_CLASSES, STRING, typeEquals, UNDEFINED_T, VOID } from "../../ir/nodes.js";
+import { androidJavaClass, arrayOf, BOOL, canAdaptDynFuncTo, canConvertToDyn, canCrossIslandBoundary, canExitIslandToType, canMarshalTypedFuncIntoIsland, DYN, F64, isAndroidObjectType, isJsonSafeType, isUndefinedArmedUnion, isUnitType, JSVAL, RUNTIME_ERROR_CLASSES, STRING, typeEquals, UNDEFINED_T, VOID } from "../../ir/nodes.js";
 import { type DynamicImportResolution, type NpmBuiltinUse, type NpmLazyTrap } from "../npm.js";
 import { provenanceActive } from "../provenance-registry.js";
+import { getAndroidMetadata } from "../../android/metadata.js";
 import {
   ambientDtsPath,
   canonicalBuiltinModule,
@@ -1211,6 +1212,7 @@ export class Lowerer {
       isStdlibFile: this.isStdlibFile,
       isNpmFile: this.isNpmFile,
       dynamic: this.dynamic,
+      targetPlatform: this.targetPlatform,
       // fileTag is filled just below; the hook is only ever CALLED during
       // lowering, long after the constructor completes.
       isProgramFile: (sf) => this.fileTag.has(sf),
@@ -1887,6 +1889,7 @@ export class Lowerer {
       typeof v === "object" && v !== null &&
       (v as { kind?: unknown }).kind === "object" &&
       typeof (v as { className?: unknown }).className === "string" &&
+      !isAndroidObjectType(v as IrType) &&
       !this.classes.has((v as { className: string }).className);
     const sweep = (node: unknown): void => {
       if (node === null || typeof node !== "object") return;
@@ -1915,7 +1918,7 @@ export class Lowerer {
   typeNamesUnregisteredClass(t: IrType, seen: Set<string> = new Set()): boolean {
     switch (t.kind) {
       case "object":
-        return !this.classes.has(t.className);
+        return !isAndroidObjectType(t) && !this.classes.has(t.className);
       case "array":
       case "set":
         return this.typeNamesUnregisteredClass(t.elem, seen);
@@ -7242,6 +7245,54 @@ export class Lowerer {
   }
 
   lowerNew(expr: ts.NewExpression): IrExpr {
+    if (this.targetPlatform === "android") {
+      const loc = locOf(expr);
+      const resultType = this.mapTypeOf(this.typeOf(expr));
+      const javaClass = resultType === null ? null : androidJavaClass(resultType);
+      if (javaClass !== null) {
+        const sourceArgs = expr.arguments ?? [];
+        if (sourceArgs.some(ts.isSpreadElement)) {
+          this.noLowering(`${javaClass} constructor spread call`, expr);
+        }
+        const args = sourceArgs.map((arg) => this.lowerExpr(arg));
+        for (const arg of args) {
+          if (
+            arg.type.kind === "func" &&
+            (arg.type.params.length !== 0 || arg.type.ret.kind !== "void")
+          ) {
+            this.noLowering(
+              `${javaClass} constructor callback with parameters or a return value`,
+              expr,
+            );
+          }
+        }
+        let constructor;
+        try {
+          constructor = getAndroidMetadata().resolveConstructor(
+            javaClass,
+            args.map((arg) => arg.type),
+          );
+        } catch (error) {
+          this.noLowering(
+            error instanceof Error ? error.message : `${javaClass} constructor`,
+            expr,
+          );
+        }
+        const lit = (value: string): IrExpr => ({
+          kind: "strLit",
+          value,
+          type: STRING,
+          loc,
+        });
+        return {
+          kind: "libCall",
+          fn: "android.construct",
+          args: [lit(constructor!.owner), lit(constructor!.descriptor), ...args],
+          type: resultType!,
+          loc,
+        };
+      }
+    }
     // `new Uint8Array(handle)` (and the other typed-array ctors) over an
     // ISLAND argument: the construction is an ENGINE operation — the
     // engine's own constructor over the engine's own value (an Emscripten
@@ -7272,6 +7323,45 @@ export class Lowerer {
   }
 
   lowerFieldRead(expr: ts.PropertyAccessExpression): IrExpr | null {
+    if (this.targetPlatform === "android") {
+      const constructorType = this.typeOf(expr.expression);
+      const signatures = this.checker.getConstructSignatures(constructorType);
+      if (signatures.length > 0) {
+        const instanceType = this.mapTypeOf(
+          this.checker.getReturnTypeOfSignature(signatures[0]!),
+        );
+        const javaClass = instanceType === null ? null : androidJavaClass(instanceType);
+        if (javaClass !== null) {
+          const loc = locOf(expr);
+          const resultType = this.mapTypeOf(this.typeOf(expr));
+          if (resultType === null) {
+            this.noLowering(`${javaClass}.${expr.name.text} Android field type`, expr);
+          }
+          let field;
+          try {
+            field = getAndroidMetadata().resolveStaticField(javaClass, expr.name.text);
+          } catch (error) {
+            this.noLowering(
+              error instanceof Error ? error.message : `${javaClass}.${expr.name.text}`,
+              expr,
+            );
+          }
+          const lit = (value: string): IrExpr => ({
+            kind: "strLit",
+            value,
+            type: STRING,
+            loc,
+          });
+          return {
+            kind: "libCall",
+            fn: "android.staticField",
+            args: [lit(field!.owner), lit(field!.name), lit(field!.descriptor)],
+            type: resultType!,
+            loc,
+          };
+        }
+      }
+    }
     // `C.x` static reads first (the receiver is a CLASS, not an instance
     // — the instance field path below could never claim it), then static
     // access through class VALUES (classval-typed bindings).

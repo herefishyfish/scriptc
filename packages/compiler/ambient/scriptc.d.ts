@@ -72,3 +72,51 @@ declare function comptime<T>(compute: () => T): T;
  * the engine embed end-to-end in tests; user-facing constructs will lower
  * to the island through their own paths, not through this. */
 declare function __island_eval(code: string): string;
+
+/* Android target bootstrap surface. These declarations mirror the initial
+ * NativeScript-style android.* globals; non-Android builds still fence any
+ * reached use because only targetPlatform=android installs the JNI type
+ * mapping and lowerings. */
+declare namespace android {
+  namespace content {
+    class Context {}
+  }
+  namespace view {
+    class View {
+      constructor(context: content.Context);
+      setPadding(left: number, top: number, right: number, bottom: number): void;
+    }
+    class ViewGroup extends View {
+      addView(view: View): void;
+    }
+  }
+  namespace app {
+    class Activity extends content.Context {
+      setContentView(view: view.View): void;
+    }
+  }
+  namespace widget {
+    class TextView extends view.View {
+      constructor(context: content.Context);
+      setText(text: string): void;
+      setAllCaps(allCaps: boolean): void;
+    }
+    class Button extends TextView {
+      constructor(context: content.Context);
+      setOnClickListener(listener: () => void): void;
+    }
+    class LinearLayout extends view.ViewGroup {
+      static readonly VERTICAL: number;
+      constructor(context: content.Context);
+      setOrientation(orientation: number): void;
+    }
+  }
+}
+
+/** NativeScript-compatible access to the Activity supplied by the generated
+ * Android host. */
+declare const Application: {
+  readonly android: {
+    readonly foregroundActivity: android.app.Activity;
+  };
+};

@@ -347,6 +347,24 @@ export const CAUGHT: IrType = { kind: "caught" };
 export const UNDEFINED_T: IrType = { kind: "undefinedT" };
 export const NULL_T: IrType = { kind: "nullT" };
 
+/** Android platform objects reuse the IR's nominal object slot while the
+ * Android backend gives them an opaque JNI-reference representation. The
+ * reserved prefix can never collide with a source class name. */
+export const ANDROID_CLASS_PREFIX = "%Android:";
+export function androidObjectType(javaClass: string): IrType {
+  return { kind: "object", className: `${ANDROID_CLASS_PREFIX}${javaClass}` };
+}
+export function isAndroidObjectType(
+  type: IrType,
+): type is { kind: "object"; className: `%Android:${string}` } {
+  return type.kind === "object" && type.className.startsWith(ANDROID_CLASS_PREFIX);
+}
+export function androidJavaClass(type: IrType): string | null {
+  return isAndroidObjectType(type)
+    ? type.className.slice(ANDROID_CLASS_PREFIX.length)
+    : null;
+}
+
 /** True for the payload-less unit kinds (`undefined`/`null`). Unit values
  * exist only inside unions: a unit-armed union instance is tag-only, so
  * wrapping allocates no payload, narrowing to a unit arm produces no value
@@ -1567,6 +1585,17 @@ export type IrRegexIntrinsicMethod =
  * assume the island runtime is linked when they see it; island exceptions
  * bridge into the exception cell as catchable strings (may-throw). */
 export type IrLibFn =
+  /** Typed Android/JNI bootstrap slice. Platform references are opaque,
+   * owned global JNI references in the C runtime. */
+  | "android.currentActivity"
+  /** Metadata-resolved JNI constructor. Args: owner, descriptor, values. */
+  | "android.construct"
+  /** Metadata-resolved JNI instance call. Args: receiver, owner, name,
+   * descriptor, values. */
+  | "android.call"
+  /** Metadata-resolved JNI static field read. Args: owner, name,
+   * descriptor. */
+  | "android.staticField"
   | "island.eval"
   /** Load an embedded npm package's runtime entry in the island (cached by
    * the engine's module registry) and take one export: args are the entry
@@ -6432,6 +6461,10 @@ export function moduleLibNondeterministicSurface(mod: IrModule): string | null {
  * seed on `dynCheck` and `awaitExpr` nodes, which throw on validation
  * failure / promise rejection). */
 export const MAY_THROW_LIB_FNS: ReadonlySet<IrLibFn> = new Set([
+  "android.currentActivity",
+  "android.construct",
+  "android.call",
+  "android.staticField",
   "num.toFixed",
   "insp.jsonDyn",
   // diagnostics_channel: publish runs subscribers synchronously (a throw

@@ -4,7 +4,7 @@ import { readFileSync, rmSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { analyze, compile, compileC, compileLibrary, renderAll, renderCoverage, resolveProvenanceSources, setProvenanceSources } from "@scriptc/compiler";
+import { analyze, compile, compileAndroid, compileC, compileLibrary, renderAll, renderCoverage, resolveProvenanceSources, setProvenanceSources } from "@scriptc/compiler";
 import { defaultExecutableName } from "./paths.js";
 
 const USAGE = `scriptc — TypeScript/JavaScript to native executables (experimental)
@@ -14,6 +14,8 @@ Usage:
   scriptc run <file.ts|.js> [options]       compile and run
   scriptc coverage <file.ts|.js>            how much compiles statically, and why not
   scriptc coverage <file.ts|.js> --dynamic  what a --dynamic build compiles, and what still blocks it
+  scriptc build <file.ts|.js> --target android
+                                            emit an Android Gradle/NDK project
   scriptc build --lib --profile <p.json>    library mode: compile the profile's entry
                                             module to a linkable static archive
                                             (<name>.lib.a) exporting the
@@ -23,6 +25,11 @@ Usage:
 
 Options:
   -o, --out <path>   output executable path (default: .scriptc/<name>)
+      --target <t>   artifact target (currently: android)
+      --android-package <id>
+                     Android application id (default: org.scriptc.app)
+      --android-name <name>
+                     Android launcher label (default: scriptc)
       --backend <b>  code generator. llvm is the default and the output that
                      ships; c emits readable C for inspecting what the
                      compiler produced, and program behavior is identical
@@ -104,6 +111,9 @@ function parseCli(): ReturnType<typeof parseArgs<{ options: typeof CLI_OPTIONS; 
 
 const CLI_OPTIONS = {
   out: { type: "string", short: "o" },
+  target: { type: "string" },
+  "android-package": { type: "string" },
+  "android-name": { type: "string" },
   // No parseArgs default: unset means the compiler's default lane
   // (LLVM with the transparent C fallback); an explicit value pins.
   backend: { type: "string" },
@@ -151,9 +161,9 @@ async function main(): Promise<number> {
     if (inputArg) {
       fail("scriptc build --lib takes no input positional: the profile names the entry module");
     }
-    if (values.dynamic || values.backend !== undefined || values.ffi !== undefined || (values["npm-static"] ?? []).length > 0) {
+    if (values.target !== undefined || values.dynamic || values.backend !== undefined || values.ffi !== undefined || (values["npm-static"] ?? []).length > 0) {
       fail(
-        "scriptc build --lib takes no --dynamic/--backend/--npm-static/--ffi: the profile pins the emission, npm imports are judged automatically, and outbound FFI currently belongs to executable builds",
+        "scriptc build --lib takes no --target/--dynamic/--backend/--npm-static/--ffi: the profile pins the emission, npm imports are judged automatically, and outbound FFI currently belongs to executable builds",
       );
     }
     const profilePath = resolve(profileArg);
@@ -182,6 +192,16 @@ async function main(): Promise<number> {
   if (!inputArg) fail(`missing input file\n\n${USAGE}`);
   const input = resolve(inputArg);
   const ffiProfilePath = values.ffi !== undefined ? resolve(values.ffi) : undefined;
+  const target = values.target;
+  if (target !== undefined && target !== "android") {
+    fail(`unknown target "${target}" (supported: android)\n\n${USAGE}`);
+  }
+  if (
+    target !== "android" &&
+    (values["android-package"] !== undefined || values["android-name"] !== undefined)
+  ) {
+    fail("--android-package/--android-name require --target android");
+  }
   const backend = values.backend;
   if (backend !== undefined && backend !== "c" && backend !== "llvm") {
     fail(`unknown backend "${backend}" (supported: c, llvm)\n\n${USAGE}`);
@@ -197,6 +217,48 @@ async function main(): Promise<number> {
     npmStatic = "auto";
   } else if (npmStaticRaw.length > 0) {
     npmStatic = npmStaticRaw;
+  }
+
+  if (target === "android") {
+    if (command !== "build") {
+      fail("--target android currently supports build only");
+    }
+    if (
+      values.dynamic ||
+      values["from-c"] ||
+      values.sanitize ||
+      !values["keep-c"] ||
+      backend !== undefined ||
+      ffiProfilePath !== undefined ||
+      values["provenance-sources"]
+    ) {
+      fail(
+        "--target android takes no --dynamic/--from-c/--sanitize/--no-keep-c/--backend/--ffi/--provenance-sources",
+      );
+    }
+    const projectDir = values.out
+      ? resolve(values.out)
+      : join(dirname(input), ".scriptc", "android");
+    const result = await compileAndroid(input, {
+      outDir: projectDir,
+      emitIr: values["emit-ir"],
+      ...(values["android-package"] !== undefined
+        ? { applicationId: values["android-package"] }
+        : {}),
+      ...(values["android-name"] !== undefined
+        ? { appName: values["android-name"] }
+        : {}),
+      ...(npmStatic !== undefined ? { npmStatic } : {}),
+    });
+    if (!result.ok) {
+      const color = process.stderr.isTTY ?? false;
+      process.stderr.write(renderAll(result.diagnostics, result.sourceTexts, { color }) + "\n");
+      const n = result.diagnostics.length;
+      process.stderr.write(`\n${n} error${n === 1 ? "" : "s"}.\n`);
+      return 1;
+    }
+    process.stdout.write(`${result.projectDir}\n`);
+    return 0;
   }
 
   // --provenance-sources resolves BEFORE the program loads (tsgo needs the

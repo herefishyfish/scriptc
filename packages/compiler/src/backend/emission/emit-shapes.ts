@@ -5,7 +5,7 @@
  * VtSlot) the emitter builds up front; emission ORDER is part of the C. */
 import type { CEmitter } from "./emitter.js";
 import type { IrFunction } from "../../ir/nodes.js";
-import { IrClassDef, IrType, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, isRefCounted, mapOf, STRING } from "../../ir/nodes.js";
+import { IrClassDef, IrType, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, isAndroidObjectType, isRefCounted, mapOf, STRING } from "../../ir/nodes.js";
 import { mangleClassGcFree, mangleClassNew, mangleClassRelease, mangleClassReleaseDirect, mangleClassRetain, mangleClassStruct, mangleClassTrace, mangleCtorThunk, mangleField, mangleFunction, mangleRecordGcFree, mangleRecordNew, mangleRecordRelease, mangleRecordRetain, mangleRecordStruct, mangleRecordTrace, mangleVtAdapter, mangleVtInstance, mangleVtStruct } from "../mangle.js";
 import { boxKindC, cDecl, cType, elemKindC, mapValKindC, releaseCallC, vAdapters } from "./emit-types.js";
 
@@ -753,7 +753,11 @@ export interface ClassMeta {
     // whose declaration and every use compile to runtime traps): no
     // instance can ever exist, so the box is an inert placeholder — its
     // RC adapters were never emitted and must not be referenced.
-    if (t.kind === "object" && !E.classMeta.has(t.className)) {
+    if (
+      t.kind === "object" &&
+      !isAndroidObjectType(t) &&
+      !E.classMeta.has(t.className)
+    ) {
       return `scr_box_new(SCR_BOX_F64) /* ${t.className}: uncollected class, all uses trap */`;
     }
     if (

@@ -83,6 +83,12 @@ const who = process.argv.length > 2 ? process.argv[2] : "world";
 
 ## Tooling gaps
 
+- The Android target is synchronous and UI-thread-only. Constructors and
+  instance calls resolve through NativeScript-generated Android metadata, with
+  generic JNI dispatch for object, string, boolean, number, and zero-argument
+  void callback parameters. Static members, fields, arrays, richer callback
+  signatures, async/promise event-loop integration, and background-thread JNI
+  attachment are not implemented yet.
 - `scriptc run` does not forward extra CLI arguments to the program — `build` and invoke the binary directly.
 - Native FFI is a direct, manifest-declared C ABI link surface. It does not yet support callbacks, variadic calls, structs by value, owned pointer/string/byte returns, runtime dynamic-library loading, or library-mode builds. See [Native FFI](/ffi).
 - Numbers are JS-exact f64 everywhere. Integer inference and ownership analysis — the systems-language performance ceiling — are roadmap, not shipped.

@@ -2304,6 +2304,71 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
         };
         const fn = e.fn;
         switch (fn) {
+          case "android.currentActivity":
+            return finish("scr_android_current_activity()");
+          case "android.staticField": {
+            const fieldArgs = `${arg(0)}, ${arg(1)}, ${arg(2)}`;
+            if (e.type.kind === "object") {
+              return finish(`scr_android_static_object(${fieldArgs})`);
+            }
+            if (e.type.kind === "string") {
+              return finish(`scr_android_static_string(${fieldArgs})`);
+            }
+            if (e.type.kind === "bool") {
+              return finish(`scr_android_static_bool(${fieldArgs})`);
+            }
+            return finish(`scr_android_static_number(${fieldArgs})`);
+          }
+          case "android.construct":
+          case "android.call": {
+            const prefix = fn === "android.construct" ? 2 : 4;
+            const values = args.slice(prefix);
+            const arr = `sc_t${E.tempCounter++}`;
+            E.line(`ScrAndroidArg ${arr}[${Math.max(values.length, 1)}];`);
+            values.forEach((value, i) => {
+              const source = e.args[prefix + i]!;
+              switch (source.type.kind) {
+                case "object":
+                  E.line(`${arr}[${i}].tag = SCR_ANDROID_ARG_OBJECT; ${arr}[${i}].value.object = ${value.name};`);
+                  break;
+                case "string":
+                  E.line(`${arr}[${i}].tag = SCR_ANDROID_ARG_STRING; ${arr}[${i}].value.string = ${value.name};`);
+                  break;
+                case "bool":
+                  E.line(`${arr}[${i}].tag = SCR_ANDROID_ARG_BOOL; ${arr}[${i}].value.boolean = ${value.name};`);
+                  break;
+                case "f64":
+                  E.line(`${arr}[${i}].tag = SCR_ANDROID_ARG_NUMBER; ${arr}[${i}].value.number = ${value.name};`);
+                  break;
+                case "func":
+                  E.line(`${arr}[${i}].tag = SCR_ANDROID_ARG_CALLBACK; ${arr}[${i}].value.callback = ${value.name};`);
+                  break;
+                default:
+                  throw new Error(`${fn} arg of type ${source.type.kind}`);
+              }
+            });
+            if (fn === "android.construct") {
+              return finish(
+                `scr_android_construct(${arg(0)}, ${arg(1)}, ${values.length}, ${arr})`,
+              );
+            }
+            const callArgs =
+              `${arg(0)}, ${arg(1)}, ${arg(2)}, ${arg(3)}, ` +
+              `${values.length}, ${arr}`;
+            if (e.type.kind === "void") {
+              return finish(`scr_android_call_void(${callArgs})`);
+            }
+            if (e.type.kind === "object") {
+              return finish(`scr_android_call_object(${callArgs})`);
+            }
+            if (e.type.kind === "string") {
+              return finish(`scr_android_call_string(${callArgs})`);
+            }
+            if (e.type.kind === "bool") {
+              return finish(`scr_android_call_bool(${callArgs})`);
+            }
+            return finish(`scr_android_call_number(${callArgs})`);
+          }
           case "island.eval":
             // --dynamic builds only (the frontend fences the intrinsic, so
             // scr_island_eval is always linked when this emits). Borrows

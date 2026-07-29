@@ -4,7 +4,7 @@
  * functions of IrType/values — every emission module leans on these, so they
  * live in ONE place with no emitter state. */
 import type { IrType } from "../../ir/nodes.js";
-import { RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES } from "../../ir/nodes.js";
+import { isAndroidObjectType, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES } from "../../ir/nodes.js";
 import {
   mangleClassRelease,
   mangleClassRetain,
@@ -81,6 +81,7 @@ export function cType(t: IrType): string {
       // ONE struct type for every class (the fields are class-independent).
       return "ScrClassObj *";
     case "object":
+      if (isAndroidObjectType(t)) return "ScrAndroidRef *";
       // Runtime-provided error classes share the runtime's ScrError struct
       // (all four builtins have the same layout; user subclasses embed it
       // as their emitted struct's prefix).
@@ -179,6 +180,7 @@ export function retainCallC(type: IrType, expr: string): string {
       // A no-op on the immortal static — kept for ownership uniformity.
       return `scr_classobj_retain(${expr})`;
     case "object":
+      if (isAndroidObjectType(type)) return `scr_android_ref_retain(${expr})`;
       if (RUNTIME_ERROR_CLASSES.has(type.className)) return `scr_error_retain(${expr})`;
       if (type.className === RUNTIME_EMITTER_CLASS) return `scr_emitter_retain(${expr})`;
       if (RUNTIME_STREAM_CLASSES.has(type.className)) return `scr_stream_retain(${expr})`;
@@ -257,6 +259,7 @@ export function releaseCallC(type: IrType, expr: string): string {
     case "classval":
       return `scr_classobj_release(${expr})`;
     case "object":
+      if (isAndroidObjectType(type)) return `scr_android_ref_release(${expr})`;
       if (RUNTIME_ERROR_CLASSES.has(type.className)) return `scr_error_release(${expr})`;
       if (type.className === RUNTIME_EMITTER_CLASS) return `scr_emitter_release(${expr})`;
       if (RUNTIME_STREAM_CLASSES.has(type.className)) return `scr_stream_release(${expr})`;
@@ -415,6 +418,9 @@ export function vAdapters(t: IrType): { retain: string; release: string } {
     case "union":
       return { retain: "scr_union_retain_v", release: "scr_union_release_v" };
     case "object":
+      if (isAndroidObjectType(t)) {
+        return { retain: "scr_android_ref_retain_v", release: "scr_android_ref_release_v" };
+      }
       if (RUNTIME_ERROR_CLASSES.has(t.className)) {
         return { retain: "scr_error_retain_v", release: "scr_error_release_v" };
       }

@@ -5,7 +5,7 @@
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { lowerGenMethodCall } from "./lower-generators.js";
-import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrExpr, IrFunction, IrLocal, IrParam, IrStmt, IrType, JSVAL, STRING, SYMBOL_T, SrcLoc, UNDEFINED_T, VOID, arrayOf, canBoxFuncIntoDyn, canConvertToDyn, canDynCheckTo, canMarshalTypedFuncIntoIsland, funcOf, isUnitType, shapeHasAccessorSlots, typeEquals } from "../../ir/nodes.js";
+import { androidJavaClass, BOOL, BYTES_U8, CAUGHT, DYN, F64, IrExpr, IrFunction, IrLocal, IrParam, IrStmt, IrType, JSVAL, STRING, SYMBOL_T, SrcLoc, UNDEFINED_T, VOID, arrayOf, canBoxFuncIntoDyn, canConvertToDyn, canDynCheckTo, canMarshalTypedFuncIntoIsland, funcOf, isUnitType, shapeHasAccessorSlots, typeEquals } from "../../ir/nodes.js";
 import type { IrFfiImport } from "../../ir/nodes.js";
 import { isJsSourceFile, locOf } from "../program.js";
 import { isGenericCallableMemberType, typeKey } from "../types.js";
@@ -27,6 +27,7 @@ import { ambientNsRootOf, ambientUndefReadType, ambientUndefVarRootOf, ambientUn
 import { declSymbolOf } from "./lower-modules.js";
 import { expandoMemberRead } from "./lower-expando.js";
 import { npmStaticPackageOfPath } from "../npm-static.js";
+import { getAndroidMetadata } from "../../android/metadata.js";
 
 /** How a parameter participates in CALL-SITE COMPLETION (the frontend
  * completes every call to the one full signature, so the IR and backends
@@ -2724,6 +2725,70 @@ export function lowerFfiCall(L: Lowerer, expr: ts.CallExpression): IrExpr | null
 
 export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
     const loc = locOf(expr);
+
+    if (
+      L.targetPlatform === "android" &&
+      ts.isPropertyAccessExpression(expr.expression) &&
+      !expr.questionDotToken &&
+      !expr.expression.questionDotToken
+    ) {
+      const access = expr.expression;
+      const javaClass = androidJavaClass(L.mapTypeOf(L.typeOf(access.expression)) ?? VOID);
+      if (javaClass !== null) {
+        if (expr.arguments.some(ts.isSpreadElement)) {
+          L.noLowering(`${javaClass}.${access.name.text} spread call`, expr);
+        }
+        const receiver = L.lowerExpr(access.expression);
+        const args = expr.arguments.map((arg) => L.lowerExpr(arg));
+        for (const arg of args) {
+          if (
+            arg.type.kind === "func" &&
+            (arg.type.params.length !== 0 || arg.type.ret.kind !== "void")
+          ) {
+            L.noLowering(
+              `${javaClass}.${access.name.text} callback with parameters or a return value`,
+              expr,
+            );
+          }
+        }
+        const resultType = L.mapTypeOf(L.typeOf(expr));
+        if (resultType === null) {
+          L.noLowering(`${javaClass}.${access.name.text} Android return type`, expr);
+        }
+        let method;
+        try {
+          method = getAndroidMetadata().resolveInstanceMethod(
+            javaClass,
+            access.name.text,
+            args.map((arg) => arg.type),
+          );
+        } catch (error) {
+          L.noLowering(
+            error instanceof Error ? error.message : `${javaClass}.${access.name.text}`,
+            expr,
+          );
+        }
+        const lit = (value: string): IrExpr => ({
+          kind: "strLit",
+          value,
+          type: STRING,
+          loc,
+        });
+        return {
+          kind: "libCall",
+          fn: "android.call",
+          args: [
+            receiver,
+            lit(method!.owner),
+            lit(method!.name),
+            lit(method!.descriptor),
+            ...args,
+          ],
+          type: resultType!,
+          loc,
+        };
+      }
+    }
 
     // A call whose chain ROOTS at an ambient-undefined name (`declare
     // const value: Y | undefined; value?.foo("a")`, `declare function

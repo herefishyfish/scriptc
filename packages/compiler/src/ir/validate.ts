@@ -18,7 +18,7 @@ import type {
   IrUnionDef,
   SrcLoc,
 } from "./nodes.js";
-import { arrayOf, BOOL, BYTES_U8, bytesOf, canAdaptDynFuncTo, canConvertToDyn, canExitIslandToType, canMarshalIntoIsland, canMarshalTypedFuncIntoIsland, CHILD_T, CHILDSTREAM_T, DGRAMSOCK_T, DYN, DYN_HANDLE_KINDS, F64, FSWATCHER_T, HTTP2SESSION_T, HTTP2STREAM_T, HTTPCLIENTREQ_T, HTTPREQ_T, HTTPRES_T, islandPromisePayloadTag, isJsonSafeType, isRefCounted, isSupportedIndexValue, isSupportedMapKey, isSupportedMapValue, isSupportedSetElem, isUnitType, jsOpResultKind, JSVAL, NETSERVER_T, NETSOCKET_T, PROCSTREAM_T, REF_TRUTHY_KINDS, REGEX, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, SEARCH_PARAMS_T, SECURECTX_T, SPAWNRES_T, STATS_T, STRING, SYMBOL_T, TESTCTX_T, typeEquals, typeKey, unionFuncSetArmsOk, URL_T, VOID } from "./nodes.js";
+import { androidObjectType, arrayOf, BOOL, BYTES_U8, bytesOf, canAdaptDynFuncTo, canConvertToDyn, canExitIslandToType, canMarshalIntoIsland, canMarshalTypedFuncIntoIsland, CHILD_T, CHILDSTREAM_T, DGRAMSOCK_T, DYN, DYN_HANDLE_KINDS, F64, FSWATCHER_T, HTTP2SESSION_T, HTTP2STREAM_T, HTTPCLIENTREQ_T, HTTPREQ_T, HTTPRES_T, islandPromisePayloadTag, isAndroidObjectType, isJsonSafeType, isRefCounted, isSupportedIndexValue, isSupportedMapKey, isSupportedMapValue, isSupportedSetElem, isUnitType, jsOpResultKind, JSVAL, NETSERVER_T, NETSOCKET_T, PROCSTREAM_T, REF_TRUTHY_KINDS, REGEX, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, SEARCH_PARAMS_T, SECURECTX_T, SPAWNRES_T, STATS_T, STRING, SYMBOL_T, TESTCTX_T, typeEquals, typeKey, unionFuncSetArmsOk, URL_T, VOID } from "./nodes.js";
 
 /** Per-method signature for strIntrinsic: `argTypes` lists every argument
  * position (optional ones included); `minArgs` is how many may be omitted
@@ -83,6 +83,15 @@ export const REGEX_INTRINSIC_SIGS: Record<
  * the libCall case checks it specially, like process.envGet's result.
  * Exported for the frontend's lib-boundary pass (lib-boundary.ts). */
 export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result: IrType }> = {
+  "android.currentActivity": {
+    argTypes: [],
+    result: androidObjectType("android.app.Activity"),
+  },
+  // Variable tails and program-dependent Android result classes are checked
+  // by the dedicated libCall validation below.
+  "android.construct": { argTypes: [STRING, STRING], result: VOID },
+  "android.call": { argTypes: [null, STRING, STRING, STRING], result: VOID },
+  "android.staticField": { argTypes: [STRING, STRING, STRING], result: VOID },
   "island.eval": { argTypes: [STRING], result: STRING },
   "island.import": { argTypes: [STRING, STRING, STRING], result: JSVAL },
   "island.importDyn": { argTypes: [STRING], result: JSVAL },
@@ -1384,7 +1393,9 @@ export function validateModule(mod: IrModule): IrValidationError[] {
   const namesUndeclared = (t: IrType, seen: Set<string>): string | null => {
     switch (t.kind) {
       case "object":
-        return classesByName.has(t.className) ? null : t.className;
+        return isAndroidObjectType(t) || classesByName.has(t.className)
+          ? null
+          : t.className;
       case "array":
       case "set":
         return namesUndeclared(t.elem, seen);
@@ -3357,6 +3368,7 @@ function validateFunction(
         // (the optional chunk/cb tail), and unpipe (the optional
         // destination) admit a longer list the same way.
         const variadic =
+          e.fn === "android.construct" || e.fn === "android.call" ||
           e.fn === "emitter.emit" ||
           e.fn === "readable.new" || e.fn === "writable.new" ||
           e.fn === "duplex.new" || e.fn === "transform.new" ||
@@ -3383,6 +3395,54 @@ function validateFunction(
           const want = sig.argTypes[i];
           if (want) expectType(a, want, `libCall ${e.fn} arg ${i}`);
         });
+        if (
+          e.fn === "android.construct" ||
+          e.fn === "android.call" ||
+          e.fn === "android.staticField"
+        ) {
+          const prefix = e.fn === "android.construct" ? 2 : 4;
+          if (e.fn === "android.construct" && !isAndroidObjectType(e.type)) {
+            err(`libCall android.construct must return an Android object`, e.loc);
+          }
+          if (e.fn === "android.call") {
+            if (!isAndroidObjectType(e.args[0]?.type ?? VOID)) {
+              err(`libCall android.call receiver must be an Android object`, e.loc);
+            }
+            const supportedResult =
+              e.type.kind === "void" || e.type.kind === "string" ||
+              e.type.kind === "bool" || e.type.kind === "f64" ||
+              isAndroidObjectType(e.type);
+            if (!supportedResult) {
+              err(`libCall android.call has unsupported ${e.type.kind} result`, e.loc);
+            }
+          }
+          if (e.fn === "android.staticField") {
+            const supportedResult =
+              e.type.kind === "string" || e.type.kind === "bool" ||
+              e.type.kind === "f64" || isAndroidObjectType(e.type);
+            if (!supportedResult) {
+              err(`libCall android.staticField has unsupported ${e.type.kind} result`, e.loc);
+            }
+            break;
+          }
+          for (let i = prefix; i < e.args.length; i++) {
+            const type = e.args[i]!.type;
+            const supported =
+              type.kind === "string" || type.kind === "bool" ||
+              type.kind === "f64" || type.kind === "func" ||
+              isAndroidObjectType(type);
+            if (!supported) {
+              err(`libCall ${e.fn} arg ${i} has unsupported ${type.kind} type`, e.loc);
+            }
+            if (
+              type.kind === "func" &&
+              (type.params.length !== 0 || type.ret.kind !== "void")
+            ) {
+              err(`libCall ${e.fn} callback arg ${i} must be () => void`, e.loc);
+            }
+          }
+          break;
+        }
         if (e.fn === "string.fromCharCode") {
           // One packed f64[] or one bytes value (the spread form).
           const t = e.args[0]?.type;

@@ -1,5 +1,6 @@
 packages:
   - "packages/*"
+  - "android"
 minimumReleaseAgeExclude:
   - "vercel@58.1.0"
 allowBuilds:

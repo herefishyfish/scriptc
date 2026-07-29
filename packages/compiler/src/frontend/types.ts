@@ -1,6 +1,7 @@
 import * as ts from "./ts7/adapter.js";
+import { getAndroidMetadata } from "../android/metadata.js";
 import type { IrRecordShape, IrType, IrUnionDef } from "../ir/nodes.js";
-import { arrayOf, BOOL, bytesOf, canConvertToDyn, CHILD_T, DYN, F64, funcOf, isSupportedIndexValue, isSupportedMapKey, isSupportedMapValue, isSupportedSetElem, isUnitType, JSVAL, mapOf, NULL_T, PROCSTREAM_T, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, setOf, STRING, SYMBOL_T, typeEquals, typeKey, UNDEFINED_T, VOID } from "../ir/nodes.js";
+import { androidObjectType, arrayOf, BOOL, bytesOf, canConvertToDyn, CHILD_T, DYN, F64, funcOf, isSupportedIndexValue, isSupportedMapKey, isSupportedMapValue, isSupportedSetElem, isUnitType, JSVAL, mapOf, NULL_T, PROCSTREAM_T, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, setOf, STRING, SYMBOL_T, typeEquals, typeKey, UNDEFINED_T, VOID } from "../ir/nodes.js";
 
 import { isJsSourceFile, isNodeTypesPath } from "./program.js";
 import { accessorSlotProp } from "../ir/nodes.js";
@@ -534,6 +535,9 @@ export interface TypeMapperCtx {
   /** --dynamic: `any` maps to the island handle type (jsval). Off, `any`
    * stays unmapped and the requires-dynamic diagnostic fires per site. */
   dynamic: boolean;
+  /** Platform-specific opaque type mappings. Only the Android target maps
+   * the shipped android.* declaration surface to JNI references. */
+  targetPlatform?: string;
   /** True for files the Lowerer actually compiles (its module order). A
    * class type can reach the entry through the TYPE world alone — a jsdoc
    * `typeof import('./mod')` over a module never imported at value level
@@ -701,6 +705,31 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   }
   const widened = checker.getBaseTypeOfLiteralType(type);
   const flags = widened.flags;
+
+  if (ctx.targetPlatform === "android") {
+    const symbol = widened.getSymbol();
+    if (symbol) {
+      for (const decl of checker.declarationsOf(symbol)) {
+        const parts: string[] = [symbol.name];
+        let parent: ts.Node | undefined = decl.parent;
+        while (parent) {
+          if (ts.isModuleDeclaration(parent)) {
+            if (!ts.isIdentifier(parent.name)) break;
+            parts.push(parent.name.text);
+          }
+          parent = parent.parent;
+        }
+        parts.reverse();
+        const javaName = parts.join(".");
+        // NativeScript declaration packages cover android.*, java.*,
+        // androidx.*, and arbitrary plugin namespaces. Metadata provenance,
+        // rather than the declaration file's package, is the authority.
+        if (parts.length >= 2 && getAndroidMetadata().hasType(javaName)) {
+          return androidObjectType(javaName);
+        }
+      }
+    }
+  }
 
   if (flags & ts.TypeFlags.Number) return F64;
   if (flags & ts.TypeFlags.String) return STRING;
