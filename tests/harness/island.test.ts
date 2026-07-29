@@ -245,15 +245,15 @@ main();
     expect(r.stdout).toBe("RangeError\n");
   });
 
-  test("a never-observed island rejection reports at loop exit and exits 1", async () => {
+  test("a never-observed island rejection reports at its checkpoint and exits 1", async () => {
     // The island's JS_SetHostPromiseRejectionTracker ledger joins the
     // static promise ledger's report — same line shape ("Unhandled promise
     // rejection: <String(reason)>", an Error reason rendering name:
     // message), same exit code 1. scriptc-only: Node's stderr for this
     // wears ERR_UNHANDLED_REJECTION clothing; the LINE is ours to pin.
-    // The async main gives the program a loop turn (the report runs at
-    // loop exit — a program with no async/timers/embedded modules never
-    // runs the loop, and its island promise machinery is dormant anyway).
+    // The async main gives the program a loop turn (a program with no
+    // async/timers/embedded modules never runs the loop, and its island
+    // promise machinery is dormant anyway).
     const r = await compileAndRun(
       "island-unhandled-rejection",
       `async function main(): Promise<void> {

@@ -10,7 +10,6 @@ These are rejected at compile time with an `SC` code, a code frame, and usually 
 
 - `var` declarations, and loose equality `==`/`!=` (they need dynamic coercion semantics; use `let`/`const` and `===`).
 - Labeled `break`/`continue`, and jumps crossing a `finally` block (`return` through `finally` is supported).
-- Top-level `await` — wrap it in an `async function main()` and call it.
 - Generic classes, generic methods, and generic arrows — only top-level generic function declarations monomorphize.
 - Generic functions and stdlib methods used as *values* (`const f = id`, `const g = Math.floor`) — call them directly.
 
@@ -78,6 +77,7 @@ const who = process.argv.length > 2 ? process.argv[2] : "world";
 - **The island is quickjs-ng, not V8** — correct, but slower for CPU-bound dependency code. The win is startup, size, memory, deployment shape.
 - **The island's Node builtins are shims** — reimplementations, reported per-builtin in the coverage report, not the real modules.
 - **Island microtask interleaving**: static fibers drain first, then the engine's jobs at loop quiescence — a static `await` racing a package promise resolves in a documented, deterministic order that can differ from Node's interleaving.
+- **Top-level `await` in embedded ESM packages** is not supported yet. It does compile in your program's own ESM graph and in npm packages compiled through `--npm-static`; the remaining limit is package code running inside the `--dynamic` island.
 - **`--npm-static` and `--provenance-sources` are experimental** — see [npm Dependencies](/dependencies) for the maturity notes.
 - **Cross-compiled `--dynamic` binaries are not supported yet** — the engine archive is host-native today.
 

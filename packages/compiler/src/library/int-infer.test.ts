@@ -58,7 +58,7 @@ const sink = (name: string): IrFunction => ({
 /** A module holding the case function plus the two declared sinks. */
 function caseModule(params: string[], locals: string[], body: IrStmt[]): IrModule {
   return {
-    irVersion: 2,
+    irVersion: 3,
     sourceFile: "corpus.ts",
     functions: [
       sink("send"),

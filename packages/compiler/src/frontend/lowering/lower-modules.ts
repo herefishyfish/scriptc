@@ -11,7 +11,7 @@ import { isJsSourceFileName, isRelativeSpecifier } from "../shared.js";
 import { canonicalBuiltinModule, cjsExportAssignmentOf, cjsExportDiscardReason, isCjsJsFile, isJsSourceFile, isRequireStatement, locOf, makeCycleAdmission, orderedImportsOf, resolveImport, resolveNpmImport } from "../program.js";
 import type { CycleEdge } from "../program.js";
 import { invalidJsonModuleDiag, npmEmbedFailedDiag, requiresDynamicImportDiag } from "../../diagnostics/diagnostic.js";
-import { BOOL, DYN, IrClassDef, IrExpr, IrFunction, IrGlobal, IrRecordShape, IrStmt, IrUnionDef, JSVAL, RUNTIME_ERROR_CLASSES, STRING, SrcLoc, VOID, arrayOf, canConvertToDyn, isUnitType } from "../../ir/nodes.js";
+import { BOOL, DYN, IrClassDef, IrExpr, IrFunction, IrGlobal, IrRecordShape, IrStmt, IrType, IrUnionDef, JSVAL, RUNTIME_ERROR_CLASSES, STRING, SrcLoc, VOID, arrayOf, canConvertToDyn, isUnitType } from "../../ir/nodes.js";
 import { ENTRY_NAME, PoisonError, boundIdentifiersOf, dynFallbackType, dynUndefinedExpr, importCallHandleType, newFnCtx, uncheckedOverloadHandleCall } from "./lowerer.js";
 import { builtinMemberRequireDecl, builtinNamespaceDestructureModuleOf, createRequireBindingDecl, createRequireNamespaceDecl, createRequireSpecOf, isPromisifyCall } from "./lower-builtins.js";
 import { bindingContextualGenericFnNodeOf, bindingGenericFnAliasInfoOf, bindingGenericFnInfoOf, bindingGenericFnNodeOf, deadUnmappableBinding, implicitLocalFnInfoOf, implicitLocalFnNodeOf, nullishGenericBindingUnitOf } from "./lower-calls.js";
@@ -1691,10 +1691,14 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
    * the body. Top-level var statements assign the pre-registered globals
    * instead of declaring locals. */
   export function lowerFileInit(L: Lowerer, sf: ts.SourceFile, stmts: ts.Statement[], name: string): IrFunction {
-    L.fnStack.push(newFnCtx(false, null, null, VOID));
+    const isAsync = L.asyncInitFiles.has(sf);
+    const ctx = newFnCtx(false, null, null, VOID);
+    ctx.isAsync = isAsync;
+    L.fnStack.push(ctx);
     try {
       const loc0: SrcLoc = { file: sf.fileName, start: 0, end: 0 };
       const header: IrStmt[] = [];
+      const asyncDeps: { completionId: string; loc: SrcLoc; cycleInternal: boolean }[] = [];
       const guardId = L.moduleGuardOf.get(sf);
       if (guardId !== undefined) {
         header.push({
@@ -1726,13 +1730,99 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
           const depInit = L.initNameOf.get(dep);
           if (depInit !== undefined) {
             const loc = locOf(stmt);
-            header.push({
-              kind: "exprStmt",
-              expr: { kind: "call", callee: depInit, args: [], type: VOID, loc },
+            const depAsync = L.asyncInitFiles.has(dep);
+            if (depAsync && !isAsync) {
+              L.unsupported(
+                "SC1090",
+                stmt,
+                `loading '${dep.fileName}' from a CommonJS module ` +
+                  "(the required ES-module graph uses top-level await; use import() instead)",
+              );
+            }
+            const call: IrExpr = {
+              kind: "call",
+              callee: depInit,
+              args: [],
+              type: depAsync ? { kind: "promise", inner: VOID } : VOID,
               loc,
-            });
+            };
+            if (depAsync) {
+              // Start every dependency in source order before waiting for
+              // any of them. ECMAScript's module evaluator continues into
+              // later sibling dependencies while an earlier one is
+              // suspended; the importer body waits for all of them.
+              const p = L.declareHiddenLocal("%depInit", { kind: "promise", inner: VOID });
+              header.push({ kind: "varDecl", localId: p.id, init: call, loc });
+              const sfCycle = L.asyncCycleRepresentativeOf.get(sf);
+              const depCycle = L.asyncCycleRepresentativeOf.get(dep);
+              const cycleInternal = sfCycle !== undefined && sfCycle === depCycle;
+              // An importer outside the requested member's SCC waits for
+              // the SCC's RUNTIME root, not merely that member's promise.
+              // Another earlier sibling can already have entered the cycle
+              // through a different member; a non-root member may complete
+              // while the root remains suspended. The eager spawn above has
+              // published the root by the time it returns. Internal edges
+              // keep the member promise: their guard-hit completion is what
+              // breaks recursive evaluation without an await hop.
+              const completionId =
+                !cycleInternal && depCycle !== undefined
+                  ? L.asyncCyclePromiseOf.get(dep)!
+                  : p.id;
+              asyncDeps.push({
+                completionId,
+                loc,
+                cycleInternal,
+              });
+            } else {
+              header.push({ kind: "exprStmt", expr: call, loc });
+            }
           }
         }
+      }
+      if (asyncDeps.length === 1) {
+        const dep = asyncDeps[0]!;
+        const promiseT: IrType = { kind: "promise", inner: VOID };
+        const value: IrExpr = {
+          kind: "varRef",
+          localId: dep.completionId,
+          type: promiseT,
+          loc: dep.loc,
+        };
+        header.push({
+          kind: "exprStmt",
+          expr: dep.cycleInternal
+            ? { kind: "intrinsic", name: "module.await", args: [value], type: VOID, loc: dep.loc }
+            : { kind: "awaitExpr", value, type: VOID, loc: dep.loc },
+          loc: dep.loc,
+        });
+      } else if (asyncDeps.length > 1) {
+        const promiseT: IrType = { kind: "promise", inner: VOID };
+        const loc = asyncDeps[0]!.loc;
+        const entries: IrExpr = {
+          kind: "arrayLit",
+          elems: asyncDeps.map((dep) => ({
+            kind: "varRef",
+            localId: dep.completionId,
+            type: promiseT,
+            loc: dep.loc,
+          })),
+          type: arrayOf(promiseT),
+          loc,
+        };
+        const all: IrExpr = {
+          kind: "intrinsic",
+          name: "promise.all",
+          args: [entries],
+          type: promiseT,
+          loc,
+        };
+        header.push({
+          kind: "exprStmt",
+          expr: asyncDeps.every((dep) => dep.cycleInternal)
+            ? { kind: "intrinsic", name: "module.await", args: [all], type: VOID, loc }
+            : { kind: "awaitExpr", value: all, type: VOID, loc },
+          loc,
+        });
       }
       // Module-scope `var` hoisting: undefined-armed var globals hold the
       // interned undefined from module entry (before any body statement —
@@ -1796,7 +1886,19 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
         at++;
       }
       const loc: SrcLoc = { file: sf.fileName, start: 0, end: 0 };
-      return { name, params: [], returnType: VOID, locals: L.ctx.locals, body, loc };
+      return {
+        name,
+        params: [],
+        returnType: VOID,
+        locals: L.ctx.locals,
+        body,
+        ...(isAsync ? { async: true as const } : {}),
+        ...(isAsync ? { asyncCacheGlobal: L.modulePromiseOf.get(sf)! } : {}),
+        ...(L.asyncCyclePromiseOf.has(sf)
+          ? { asyncCycleCacheGlobal: L.asyncCyclePromiseOf.get(sf)! }
+          : {}),
+        loc,
+      };
     } finally {
       L.fnStack.pop();
     }
@@ -1811,9 +1913,26 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
   export function buildMain(L: Lowerer): IrFunction {
     const loc: SrcLoc = { file: L.entry.fileName, start: 0, end: 0 };
     const entryInit = L.initNameOf.get(L.entry);
-    const body: IrStmt[] =
+    const isAsync = L.asyncInitFiles.has(L.entry);
+    const initCall: IrExpr | null =
       entryInit !== undefined
-        ? [{ kind: "exprStmt", expr: { kind: "call", callee: entryInit, args: [], type: VOID, loc }, loc }]
+        ? {
+            kind: "call",
+            callee: entryInit,
+            args: [],
+            type: isAsync ? { kind: "promise", inner: VOID } : VOID,
+            loc,
+          }
+        : null;
+    const body: IrStmt[] =
+      initCall !== null
+        ? [{
+            kind: "exprStmt",
+            expr: isAsync
+              ? { kind: "awaitExpr", value: initCall, type: VOID, loc }
+              : initCall,
+            loc,
+          }]
         : [];
     // Node's startup refusal (a resolution the graph carries that Node
     // rejects — preflight's Node-order resolution walk — or the module-
@@ -1838,5 +1957,13 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
         loc: crashLoc,
       });
     }
-    return { name: ENTRY_NAME, params: [], returnType: VOID, locals: [], body, loc };
+    return {
+      name: ENTRY_NAME,
+      params: [],
+      returnType: VOID,
+      locals: [],
+      body,
+      ...(isAsync ? { async: true as const } : {}),
+      loc,
+    };
   }

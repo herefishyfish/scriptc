@@ -2143,6 +2143,15 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
         return E.newTemp(e.type, `${E.caughtToDynHelper()}(${c.name})`);
       }
       case "intrinsic": {
+        if (e.name === "module.await") {
+          // The module evaluator's dependency wait: park only while the
+          // promise is pending. A settled dependency continues in this
+          // turn (no JavaScript-await hop); a rejection rethrows.
+          const p = E.emitExpr(e.args[0]!);
+          E.line(`scr_module_await(${p.name});${E.srcComment(e.loc)}`);
+          E.emitPendingCheck();
+          return { name: "", type: e.type };
+        }
         if (e.name === "promise.all") {
           // The runtime countdown combinator: a pre-sized values array
           // (filled per INPUT index by the per-kind store helper as
@@ -4841,14 +4850,14 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
           case "process.emitWarning":
             return finish(`scr_process_emit_warning(${arg(0)})`);
           case "process.onUnhandledRejection":
-            // The report at loop end dispatches the listeners.
+            // The completed-checkpoint report dispatches the listeners.
             E.usesTimers = true;
             return finish(`scr_process_on_unhandled_rejection(${arg(0)}, ${arg(1)})`);
           case "process.offUnhandledRejection":
             return finish(`scr_process_off_unhandled_rejection(${arg(0)})`);
           case "process.onRejectionHandled":
-            // Fires (if ever) during the loop-end report's listener
-            // dispatch — the loop must be live for the report to run.
+            // Fires after a reported promise gains a handler — the loop
+            // must be live for the checkpoint report to run.
             E.usesTimers = true;
             return finish(`scr_process_on_rejection_handled(${arg(0)}, ${arg(1)})`);
           case "process.offRejectionHandled":

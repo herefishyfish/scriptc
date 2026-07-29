@@ -724,6 +724,7 @@ export class CEmitter {
       }
       out.push(`}`, ``);
     }
+    const asyncEntry = this.fnByName.get(this.mod.entry)?.async === true;
     const hasAsync = this.mod.functions.some((f) => f.async);
     // Generator programs run the loop too (an empty pass when nothing is
     // pending): its exit accounting notes still-suspended generator
@@ -735,6 +736,17 @@ export class CEmitter {
     // drains the engine's job queue at quiescence, so npm-importing
     // programs always run the loop, like Node always runs its own.
     const usesIsland = embedded !== undefined && embedded.modules.length > 0;
+    // A pending module root normally selects Node's exit status 13, but
+    // an already-failed node:test run or an embedded process.exitCode has
+    // higher precedence. Keep this expression shared with the ordinary
+    // successful epilogue so both paths consult the same program verdict.
+    const usesNodeTest = moduleUsesNodeTest(this.mod);
+    const programExitUsesIsland = !usesNodeTest && usesIsland;
+    const programExitCode = usesNodeTest
+      ? "scr_test_exit_code()"
+      : usesIsland
+        ? "scr_island_exit_code()"
+        : "0";
     // Exit listeners can read MODULE GLOBALS directly (test/common's
     // runCallChecks over its mustCallChecks ledger — an interned top-level
     // closure, no capture boxes keeping anything alive), so they must run
@@ -763,10 +775,12 @@ export class CEmitter {
           return [];
       }
     });
-    const uncaught = (indent: string) => [
+    const uncaught = (indent: string, releaseTop = false) => [
       `${indent}if (scr_exc_pending()) {`,
       `${indent}  scr_exc_print_uncaught();`,
-      `${indent}  ${needsRelease ? `${runExitListeners}sc_release_globals(); ` : ""}${this.options.host === "android" ? "scr_android_shutdown(); " : ""}return 1;`,
+      `${indent}  ${releaseTop ? "scr_promise_release(sc_top); " : ""}` +
+        `${needsRelease ? `${runExitListeners}sc_release_globals(); ` : ""}` +
+        `${this.options.host === "android" ? "scr_android_shutdown(); " : ""}return 1;`,
       `${indent}}`,
     ];
     if (this.options.host === "android") {
@@ -895,19 +909,68 @@ export class CEmitter {
               `${embedded.edges.length > 0 ? "sc_npm_edges" : "NULL"}, ${embedded.edges.length});`,
           ]
         : []),
-      `  ${mangleFunction(this.mod.entry)}();`,
+      ...(asyncEntry
+        ? [`  ScrPromise *sc_top = ${mangleAsyncSpawn(this.mod.entry)}();`]
+        : [`  ${mangleFunction(this.mod.entry)}();`]),
       // Uncaught exception from top-level code: Node exits 1.
-      ...(this.mayThrow.has(this.mod.entry) ? uncaught("  ") : []),
+      ...(this.mayThrow.has(this.mod.entry) && !asyncEntry ? uncaught("  ") : []),
       // The event loop runs to exhaustion (microtasks before timers). A
       // throw escaping a timer callback and unhandled promise rejections
       // both exit 1, like Node.
       ...(hasAsync || hasGenerators || this.usesTimers || usesIsland
         ? [
-            `  scr_loop_run();`,
-            ...uncaught("  "),
+            `  bool sc_loop_rejection = scr_loop_run(${asyncEntry ? "sc_top" : "NULL"});`,
+            ...uncaught("  ", asyncEntry),
+            `  if (sc_loop_rejection) {`,
+            `    scr_discard_unhandled_rejections();`,
+            ...(asyncEntry ? [`    scr_promise_release(sc_top);`] : []),
+            `    ${needsRelease ? `${runExitListeners}sc_release_globals(); ` : ""}return 1;`,
+            `  }`,
+            ...(asyncEntry
+              ? [
+                  `  int sc_top_status = scr_promise_finish_top_level(sc_top);`,
+                  `  if (sc_top_status == 1) {`,
+                  // Earlier-checkpoint rejections were decided inside the
+                  // loop. The fatal module verdict suppresses unrelated
+                  // rejections from THIS checkpoint, exactly Node's order.
+                  `    scr_discard_unhandled_rejections();`,
+                  `    scr_promise_rethrow_top_level(sc_top);`,
+                  `    scr_promise_release(sc_top);`,
+                  `    scr_exc_print_uncaught();`,
+                  `    ${needsRelease ? `${runExitListeners}sc_release_globals(); ` : ""}return 1;`,
+                  `  }`,
+                  `  scr_promise_release(sc_top);`,
+                ]
+              : []),
             `  if (scr_report_unhandled_rejections()) {`,
             `    ${needsRelease ? `${runExitListeners}sc_release_globals(); ` : ""}return 1;`,
             `  }`,
+            ...(asyncEntry
+              ? [
+                  `  if (sc_top_status == 13) {`,
+                  `    int sc_exit_status = ${programExitCode};`,
+                  `    if (sc_exit_status == 0) sc_exit_status = sc_top_status;`,
+                  ...(programExitUsesIsland && runExitListeners !== ""
+                    ? [`    size_t sc_exit_code_version = scr_island_exit_code_version();`]
+                    : []),
+                  // finish_top_level initially notes 13; replace that hint
+                  // before exit listeners run when a higher-priority
+                  // verdict has already selected the process status.
+                  `    scr_exit_code_note(sc_exit_status);`,
+                  ...(runExitListeners !== "" ? [`    ${runExitListeners.trim()}`] : []),
+                  ...(programExitUsesIsland && runExitListeners !== ""
+                    ? [
+                        `    if (scr_island_exit_code_version() != sc_exit_code_version) {`,
+                        `      sc_exit_status = scr_island_exit_code();`,
+                        `      scr_exit_code_note(sc_exit_status);`,
+                        `    }`,
+                      ]
+                    : []),
+                  ...(needsRelease ? [`    sc_release_globals();`] : []),
+                  `    return sc_exit_status;`,
+                  `  }`,
+                ]
+              : []),
           ]
         : []),
       releaseGlobals,
@@ -918,11 +981,7 @@ export class CEmitter {
       // Island programs exit with process.exitCode when the embedded
       // graph set it (Node's implicit exit status: set it, return
       // normally, exit with it) — 0 when never set.
-      ...(moduleUsesNodeTest(this.mod)
-        ? [`  return scr_test_exit_code();`]
-        : usesIsland
-          ? [`  return scr_island_exit_code();`]
-          : [`  return 0;`]),
+      `  return ${programExitCode};`,
       `}`,
       ``,
     );

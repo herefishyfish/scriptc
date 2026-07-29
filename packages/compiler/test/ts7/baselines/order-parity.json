@@ -5288,6 +5288,158 @@
    ],
    "diags": []
   },
+  "<repo>/tests/corpus/2643-or-default-retag.ts": {
+   "order": [
+    "<repo>/tests/corpus/2643-or-default-retag.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2644-http-client-url-argument.ts": {
+   "order": [
+    "<repo>/tests/corpus/2644-http-client-url-argument.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2645-https-client-url-argument.ts": {
+   "order": [
+    "<repo>/tests/corpus/2645-https-client-url-argument.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2646-top-level-await.ts": {
+   "order": [
+    "<repo>/tests/corpus/2646-top-level-await.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2647-top-level-await-modules/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2647-top-level-await-modules/shared.ts",
+    "<repo>/tests/corpus/2647-top-level-await-modules/left.ts",
+    "<repo>/tests/corpus/2647-top-level-await-modules/sibling.ts",
+    "<repo>/tests/corpus/2647-top-level-await-modules/right.ts",
+    "<repo>/tests/corpus/2647-top-level-await-modules/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2648-top-level-await-rejection.ts": {
+   "order": [
+    "<repo>/tests/corpus/2648-top-level-await-rejection.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2649-top-level-await-pending.ts": {
+   "order": [
+    "<repo>/tests/corpus/2649-top-level-await-pending.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2650-top-level-await-self-import.ts": {
+   "order": [
+    "<repo>/tests/corpus/2650-top-level-await-self-import.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2651-top-level-await-pending-unhandled.ts": {
+   "order": [
+    "<repo>/tests/corpus/2651-top-level-await-pending-unhandled.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2652-top-level-await-dynamic/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2652-top-level-await-dynamic/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2653-top-level-await-rejection-stops-loop.ts": {
+   "order": [
+    "<repo>/tests/corpus/2653-top-level-await-rejection-stops-loop.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2654-top-level-await-unrelated-rejection.ts": {
+   "order": [
+    "<repo>/tests/corpus/2654-top-level-await-unrelated-rejection.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2655-top-level-await-cycle/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2655-top-level-await-cycle/b.ts",
+    "<repo>/tests/corpus/2655-top-level-await-cycle/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2656-top-level-await-cycle-order/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2656-top-level-await-cycle-order/a.ts",
+    "<repo>/tests/corpus/2656-top-level-await-cycle-order/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2657-top-level-await-cycle-dynamic/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2657-top-level-await-cycle-dynamic/b.ts",
+    "<repo>/tests/corpus/2657-top-level-await-cycle-dynamic/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2658-top-level-await-sync-completion/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2658-top-level-await-sync-completion/dep.ts",
+    "<repo>/tests/corpus/2658-top-level-await-sync-completion/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2659-top-level-await-dynamic-cycle/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2659-top-level-await-dynamic-cycle/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2660-top-level-await-cycle-rejection/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2660-top-level-await-cycle-rejection/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2661-top-level-await-dynamic-runtime-root/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2661-top-level-await-dynamic-runtime-root/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2662-top-level-await-cycle-external-wait/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2662-top-level-await-cycle-external-wait/b.ts",
+    "<repo>/tests/corpus/2662-top-level-await-cycle-external-wait/a.ts",
+    "<repo>/tests/corpus/2662-top-level-await-cycle-external-wait/waiter.ts",
+    "<repo>/tests/corpus/2662-top-level-await-cycle-external-wait/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2663-top-level-await-dependency-errors/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2663-top-level-await-dependency-errors/listener.ts",
+    "<repo>/tests/corpus/2663-top-level-await-dependency-errors/async-bad.ts",
+    "<repo>/tests/corpus/2663-top-level-await-dependency-errors/sync-bad.ts",
+    "<repo>/tests/corpus/2663-top-level-await-dependency-errors/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2664-top-level-await-same-checkpoint-rejection.ts": {
+   "order": [
+    "<repo>/tests/corpus/2664-top-level-await-same-checkpoint-rejection.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2665-top-level-await-unhandled-listener-liveness.ts": {
+   "order": [
+    "<repo>/tests/corpus/2665-top-level-await-unhandled-listener-liveness.ts"
+   ],
+   "diags": []
+  },
   "<repo>/tests/corpus/300-if-else.ts": {
    "order": [
     "<repo>/tests/corpus/300-if-else.ts"
@@ -6286,12 +6438,6 @@
   "<repo>/tests/diagnostics/assert-fences.ts": {
    "order": [
     "<repo>/tests/diagnostics/assert-fences.ts"
-   ],
-   "diags": []
-  },
-  "<repo>/tests/diagnostics/async-await.ts": {
-   "order": [
-    "<repo>/tests/diagnostics/async-await.ts"
    ],
    "diags": []
   },
@@ -7655,6 +7801,18 @@
   "<repo>/tests/fixtures/npm/cases/stream-shims/main.ts": {
    "order": [
     "<repo>/tests/fixtures/npm/cases/stream-shims/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/fixtures/npm/cases/top-level-await-pending-exit-code/main.ts": {
+   "order": [
+    "<repo>/tests/fixtures/npm/cases/top-level-await-pending-exit-code/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/fixtures/npm/cases/top-level-await-pending-exit-listener/main.ts": {
+   "order": [
+    "<repo>/tests/fixtures/npm/cases/top-level-await-pending-exit-listener/main.ts"
    ],
    "diags": []
   },

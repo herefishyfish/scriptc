@@ -6861,8 +6861,9 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
    * POSIX read never yields an empty data chunk, so EOF is the only way
    * to see one. Awaiting parks the fiber like any await, so timers and
    * other fibers interleave with the reads exactly as in Node; the loop
-   * variable is a fresh const Uint8Array binding per iteration. Only
-   * async-function bodies can host it (the await parks a fiber). */
+   * variable is a fresh const Uint8Array binding per iteration. Async
+   * function bodies and async module initializers can host it (the await
+   * parks their fiber). */
   function lowerForAwaitStdin(L: Lowerer, stmt: ts.ForOfStatement): IrStmt {
     if (!L.ctx.isAsync) {
       L.unsupported("SC1090", stmt, "top-level 'for await' (await outside async functions)");

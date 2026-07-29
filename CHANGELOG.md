@@ -6,6 +6,10 @@ All notable changes to scriptc will be documented in this file.
 
 <!-- release:start -->
 
+### Features
+
+- **Top-level `await` compiles across the program's ESM graph.** Module evaluation follows Node 24's dependency ordering, one-time promise caching, cycle rooting, rejection precedence, and unsettled-module exit status 13 in both the LLVM and C backends. Dynamic imports of compiled modules await the same evaluation verdict.
+
 ## 0.0.17
 
 ### Fixes

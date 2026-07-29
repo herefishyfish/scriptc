@@ -5551,16 +5551,13 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
       const SIGNALS: Record<string, number | undefined> = { SIGINT: 2, SIGTERM: 15 };
       const signo = event !== null ? own(SIGNALS, event) : undefined;
       // 'unhandledRejection': the listener crosses as a dyn function and
-      // the loop-end report dispatches it (reason, promise) per
+      // the completed-checkpoint report dispatches it (reason, promise) per
       // never-observed rejection instead of printing and exiting 1
-      // (scr_async.c; the end-of-turn timing is a SEMANTICS.md
-      // divergence). `once` auto-removes after one delivery and
+      // (scr_async.c). `once` auto-removes after one delivery and
       // `off`/`removeListener` remove by closure identity — the warning
       // registry's story. 'rejectionHandled' is the sibling registry:
-      // under the loop-exhaustion model its ONE firing window is a
-      // handler attached during an unhandledRejection listener (earlier
-      // handling never enters the report at all — the same documented
-      // divergence), dispatched synchronously with the promise.
+      // a handler attached after delivery fires it once, synchronously
+      // with the promise.
       if (event === "unhandledRejection" || event === "rejectionHandled") {
         if (!ts.isExpressionStatement(call.parent)) {
           L.unsupported(

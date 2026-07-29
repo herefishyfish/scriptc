@@ -1121,7 +1121,10 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
     if (ts.isNewExpression(expr)) return L.lowerNew(expr);
     if (ts.isAwaitExpression(expr)) {
       if (!L.ctx.isAsync) {
-        // tsc allows top-level await in ESNext modules; we don't (yet).
+        // A tsc-clean occurrence here is outside both an async function
+        // and an async module initializer. CommonJS/script files are
+        // normally rejected by tsc before lowering; keep the defensive
+        // boundary for malformed/upstream ASTs.
         L.unsupported("SC1090", expr, "top-level await (await outside async functions)");
       }
       const value = L.lowerExpr(expr.expression);

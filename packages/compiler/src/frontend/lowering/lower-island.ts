@@ -364,7 +364,12 @@ import { PoisonError, newFnCtx, own } from "./lowerer.js";
     }
     const promiseCtor: IrExpr = { kind: "jsOp", op: "globalGet", name: "Promise", args: [], type: JSVAL, loc };
     const resolved: IrExpr = { kind: "jsOp", op: "callMethod", name: "resolve", args: [promiseCtor], type: JSVAL, loc };
-    const builderFn: IrType & { kind: "func" } = { kind: "func", params: [], ret: JSVAL };
+    const builderAsync = dep !== null && L.asyncInitFiles.has(dep);
+    const builderFn: IrType & { kind: "func" } = {
+      kind: "func",
+      params: [],
+      ret: builderAsync ? { kind: "promise", inner: JSVAL } : JSVAL,
+    };
     const marshaled: IrExpr = {
       kind: "jsMarshal",
       value: { kind: "closure", fnName: builder, captures: [], type: builderFn, loc },
@@ -390,15 +395,56 @@ import { PoisonError, newFnCtx, own } from "./lowerer.js";
     const rawTag = L.fileTag.get(dep) ?? "";
     const name = `%dynns.${rawTag === "" ? "e." : rawTag.replace(/^%/, "")}`;
     L.dynNsBuilders.set(dep, name);
-    L.fnStack.push(newFnCtx(true, null, null, JSVAL));
+    const isAsync = L.asyncInitFiles.has(dep);
+    const fnCtx = newFnCtx(true, null, null, JSVAL);
+    fnCtx.isAsync = isAsync;
+    L.fnStack.push(fnCtx);
     try {
       const body: IrStmt[] = [];
-      if (dep !== L.entry) {
-        body.push({
-          kind: "exprStmt",
-          expr: { kind: "call", callee: initName, args: [], type: VOID, loc },
+      // A synchronous entry has no run-once guard, so its historical
+      // self-import path must not call %init again. An ASYNC entry does
+      // have the stronger evaluation-promise cache: awaiting that cached
+      // promise is essential for top-level `await import("./self")`,
+      // which deadlocks (and ultimately exits 13) in Node rather than
+      // exposing a half-evaluated namespace.
+      if (dep !== L.entry || isAsync) {
+        const call: IrExpr = {
+          kind: "call",
+          callee: initName,
+          args: [],
+          type: isAsync ? { kind: "promise", inner: VOID } : VOID,
           loc,
-        });
+        };
+        const cyclePromiseId = L.asyncCyclePromiseOf.get(dep);
+        if (isAsync && cyclePromiseId !== undefined) {
+          // Starting the REQUESTED member matters for dynamically-only
+          // cycles: build-time discovery may have encountered another
+          // member first, but Node roots evaluation at the first module
+          // actually imported at runtime. The spawn wrapper publishes
+          // that outermost promise in the SCC's shared slot after eager
+          // recursive spawning returns. Discard the member promise here
+          // and await the shared root before exposing any namespace.
+          body.push({ kind: "exprStmt", expr: call, loc });
+          const promiseT: IrType = { kind: "promise", inner: VOID };
+          body.push({
+            kind: "exprStmt",
+            expr: {
+              kind: "awaitExpr",
+              value: { kind: "varRef", localId: cyclePromiseId, type: promiseT, loc },
+              type: VOID,
+              loc,
+            },
+            loc,
+          });
+        } else {
+          body.push({
+            kind: "exprStmt",
+            expr: isAsync
+              ? { kind: "awaitExpr", value: call, type: VOID, loc }
+              : call,
+            loc,
+          });
+        }
       }
       // Node sorts module-namespace keys (code-unit order); tsc erases
       // type-only exports, so only VALUE exports appear.
@@ -427,6 +473,7 @@ import { PoisonError, newFnCtx, own } from "./lowerer.js";
         locals: ctx.locals,
         captures: ctx.captures ?? [],
         body,
+        ...(isAsync ? { async: true as const } : {}),
         loc,
       });
     } finally {

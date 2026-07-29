@@ -10,9 +10,9 @@ import { MAY_THROW_BYTES_METHODS, MAY_THROW_LIB_FNS } from "../../ir/nodes.js";
  * a closure is ever made over may throw (the callee of an indirect call is
  * unknown, but it must be a closure target of this whole-program module).
  * Fixpoint over the call graph; runtime traps (array OOB etc.) are aborts,
- * not exceptions, so intrinsics never contribute — EXCEPT throwing library
- * calls: a `libCall` in MAY_THROW_LIB_FNS (the fs.* surface) raises a
- * catchable error on failure and seeds the fixpoint like a `throw`. */
+ * not exceptions, so most intrinsics never contribute. The module evaluator's
+ * internal await and throwing library calls are the exceptions: both can
+ * surface a catchable rejection/error and seed the fixpoint like a `throw`. */
 export function computeMayThrow(mod: IrModule): { fns: Set<string>; indirect: boolean } {
   interface Facts {
     throws: boolean;
@@ -106,6 +106,11 @@ export function computeMayThrow(mod: IrModule): { fns: Set<string>; indirect: bo
         case "awaitUnionExpr":
           // Awaiting a rejected promise re-throws into the awaiter.
           f.throws = true;
+          break;
+        case "intrinsic":
+          // Module dependency evaluation has await's rejection behavior,
+          // while deliberately avoiding await's extra settled-promise turn.
+          if (rec["name"] === "module.await") f.throws = true;
           break;
         case "yieldExpr":
           // A consumer .throw() surfaces at the yield (and .return()'s

@@ -267,14 +267,14 @@ void scr_island_set_netmod(void (*attach)(void *jsctx, void *host_obj), void (*t
  * false when a promise rejects with no reaction attached (tracked here,
  * promise and reason retained), is_handled == true when a handler is
  * attached to it later (the rescission: unlinked and freed — a
- * handled-later rejection never reports). At loop exit the ledger joins
- * scr_report_unhandled_rejections through the hook registered at boot:
- * the FIRST never-observed rejection prints in the static runtime's exact
- * voice ("Unhandled promise rejection: <String(reason)>", stderr, exit 1
- * — an Error reason renders "name: message" through its toString, same
- * as the static ledger). Retaining the promise value keeps its identity
- * stable for the rescission (the engine cannot recycle the object while
- * the ledger holds it). */
+ * handled-later rejection never reports). At the completed microtask
+ * checkpoint the ledger joins scr_report_unhandled_rejections through
+ * the hook registered at boot: the FIRST never-observed rejection prints
+ * in the static runtime's exact voice ("Unhandled promise rejection:
+ * <String(reason)>", stderr, exit 1 — an Error reason renders "name:
+ * message" through its toString, same as the static ledger). Retaining
+ * the promise value keeps its identity stable for the rescission (the
+ * engine cannot recycle the object while the ledger holds it). */
 typedef struct IslRejection {
   JSValue promise; /* owned; identity for the rescission */
   JSValue reason;  /* owned */
@@ -555,10 +555,13 @@ static void isl_init(void) {
    * progress exactly where Node runs its microtasks. */
   scr_loop_set_io(isl_io_pending, isl_io_poll);
   /* Unhandled island rejections: tracked as they happen (and rescinded
-   * when handled later), reported at loop exit through the SAME report the
-   * static promise ledger uses — one voice, exit 1, like Node. */
+   * when handled later), reported at the same completed microtask
+   * checkpoint as the static promise ledger — one voice, exit 1, like
+   * Node. The report hook drains engine jobs first so a same-checkpoint
+   * handler attachment gets its chance to rescind. */
   JS_SetHostPromiseRejectionTracker(isl_rt, isl_rejection_tracker, NULL);
-  scr_loop_set_island_rejections(isl_report_rejections);
+  scr_loop_set_island_rejections(isl_report_rejections,
+                                 scr_island_drain_jobs);
   /* Armed island timers (AbortSignal.timeout) cap the loop's idle sleep
    * so they fire on time while the poller waits on socket readiness —
    * without keeping the loop alive by themselves (Node's unref'd timer).
@@ -2743,8 +2746,10 @@ static JSValue isl_host_exit(JSContext *ctx, JSValueConst this_val, int argc,
  * mirrored here by the shim's setter, read by the emitted main after the
  * loop drains — Node's a-program-that-sets-it-and-returns contract. */
 static int isl_exit_code = 0;
+static size_t isl_exit_code_version = 0;
 
 int scr_island_exit_code(void) { return isl_exit_code; }
+size_t scr_island_exit_code_version(void) { return isl_exit_code_version; }
 
 static JSValue isl_host_set_exit_code(JSContext *ctx, JSValueConst this_val,
                                       int argc, JSValueConst *argv) {
@@ -2753,6 +2758,7 @@ static JSValue isl_host_set_exit_code(JSContext *ctx, JSValueConst this_val,
   int32_t code = 0;
   JS_ToInt32(ctx, &code, argv[0]);
   isl_exit_code = code;
+  isl_exit_code_version++;
   return JS_UNDEFINED;
 }
 

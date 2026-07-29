@@ -106,7 +106,7 @@ struct ScrPromise {
   size_t ncbs, cbs_cap;
   /* Unhandled-rejection tracking: set when rejected, cleared on await. */
   bool rejection_observed;
-  /* Set when the loop-end report delivered THIS promise to
+  /* Set when the checkpoint report delivered THIS promise to
    * 'unhandledRejection' listeners — a handler attached after that is
    * Node's 'rejectionHandled' moment (scr_prom_observe below). */
   bool reported_unhandled;
@@ -193,7 +193,7 @@ ScrPromise *scr_promise_new(void) {
 
 /* The 'rejectionHandled' hook (scr_async_dyn.c installs it at listener
  * registration — the scr_urj_deliver_fn pattern, so listener-free
- * binaries keep their size class): called when a promise the loop-end
+ * binaries keep their size class): called when a promise the checkpoint
  * report already delivered as unhandled gains a handler. */
 void (*scr_rjh_notify_fn)(ScrPromise *p) = NULL;
 
@@ -212,12 +212,15 @@ static void scr_prom_observe(ScrPromise *p) {
 }
 
 /* The attach-time handled mark (scr_async_dyn.c's dyn then/catch with a
- * rejection handler): Node marks a rejection handled at ATTACH, not when
- * the reaction runs — and the loop-exhaustion window (a .catch inside an
- * 'unhandledRejection' listener) has no later fiber turn whose await
- * could observe it. */
+ * rejection handler, plus the module loader's ownership of every module
+ * evaluation promise): Node marks a promise handled at ATTACH, including
+ * while it is still pending, not when a later reaction runs. The pending
+ * mark is essential for a module dependency whose importer aborts while
+ * evaluating a later sibling — the loader still owns that dependency's
+ * eventual rejection, so it must never surface as an unrelated unhandled
+ * rejection. */
 void scr_promise_mark_handled(ScrPromise *p) {
-  if (p->state == SCR_PROM_REJECTED) scr_prom_observe(p);
+  scr_prom_observe(p);
 }
 
 ScrPromise *scr_promise_retain(ScrPromise *p) {
@@ -1229,24 +1232,31 @@ static void scr_await_yield(void) {
  * turn — the same hop a settled promise takes. */
 void scr_await_hop(void) { scr_await_yield(); }
 
-/* Await result extraction. Rejection re-throws into the awaiter (payload
- * RETAINED, not moved — a promise can be awaited more than once). */
+/* Copies a rejection into the active execution context's exception cell.
+ * The payload is RETAINED, not moved — a promise can be awaited more than
+ * once, and the executable's top-level completion probe consumes the same
+ * settlement from the main stack after the loop drains. */
+static void scr_promise_rethrow(ScrPromise *p) {
+  switch (p->payload_kind) {
+  case SCR_EXC_F64: scr_throw_f64(p->f64); break;
+  case SCR_EXC_BOOL: scr_throw_bool(p->b); break;
+  case SCR_EXC_STR: scr_throw_str(scr_str_retain((ScrStr *)p->payload)); break;
+  case SCR_EXC_REF: scr_throw_ref(p->retain_fn(p->payload), p->retain_fn, p->release_fn, p->trace_fn); break;
+  case SCR_EXC_OBJ: scr_throw_obj(p->retain_fn(p->payload), p->retain_fn, p->release_fn, p->trace_fn); break;
+  case SCR_EXC_NONE:
+  case SCR_EXC_GENRET: /* unreachable: the sentinel never settles a promise */
+    scr_throw_str(scr_str_new("undefined", 9));
+    break;
+  }
+}
+
+/* Await result extraction. Rejection re-throws into the awaiter. */
 static bool scr_await_settled(ScrPromise *p) {
   if (p->state != SCR_PROM_PENDING) scr_await_yield();
   while (p->state == SCR_PROM_PENDING) scr_await_park(p);
   scr_prom_observe(p);
   if (p->state == SCR_PROM_REJECTED) {
-    switch (p->payload_kind) {
-    case SCR_EXC_F64: scr_throw_f64(p->f64); break;
-    case SCR_EXC_BOOL: scr_throw_bool(p->b); break;
-    case SCR_EXC_STR: scr_throw_str(scr_str_retain((ScrStr *)p->payload)); break;
-    case SCR_EXC_REF: scr_throw_ref(p->retain_fn(p->payload), p->retain_fn, p->release_fn, p->trace_fn); break;
-    case SCR_EXC_OBJ: scr_throw_obj(p->retain_fn(p->payload), p->retain_fn, p->release_fn, p->trace_fn); break;
-    case SCR_EXC_NONE:
-    case SCR_EXC_GENRET: /* unreachable: the sentinel never settles a promise */
-      scr_throw_str(scr_str_new("undefined", 9));
-      break;
-    }
+    scr_promise_rethrow(p);
     return false;
   }
   return true;
@@ -1263,6 +1273,32 @@ void *scr_await_ref(ScrPromise *p) {
 }
 void scr_await_void(ScrPromise *p) { scr_await_settled(p); }
 
+/* ECMAScript's INTERNAL module-dependency wait. Unlike a user-authored
+ * await, an already-completed dependency does not introduce a promise-job
+ * hop: the evaluator continues synchronously into the importer. A pending
+ * dependency still parks this module fiber, and rejection propagates into
+ * it exactly like an ordinary await. */
+void scr_module_await(ScrPromise *p) {
+  while (p->state == SCR_PROM_PENDING) scr_await_park(p);
+  scr_prom_observe(p);
+  if (p->state == SCR_PROM_REJECTED) scr_promise_rethrow(p);
+}
+
+int scr_promise_finish_top_level(ScrPromise *p) {
+  if (p->state == SCR_PROM_PENDING) {
+    /* ECMAScript module evaluation is still pending, but Node's ref'd
+     * event-loop work is exhausted. Node exits with its dedicated
+     * unsettled-top-level-await status. */
+    scr_exit_code_note(13);
+    return 13;
+  }
+  scr_prom_observe(p);
+  return p->state == SCR_PROM_REJECTED ? 1 : 0;
+}
+
+void scr_promise_rethrow_top_level(ScrPromise *p) {
+  if (p->state == SCR_PROM_REJECTED) scr_promise_rethrow(p);
+}
 
 
 
@@ -1704,7 +1740,7 @@ void scr_loop_set_stream(bool (*pending)(void), void (*dispatch)(void)) {
  * microtask checkpoints between macrotasks). */
 bool scr_loop_has_ready(void) { return scr_ready_len > 0; }
 
-void scr_loop_run(void) {
+bool scr_loop_run(ScrPromise *top_level) {
   /* The FIRST checkpoint after the synchronous main body runs promise
    * jobs BEFORE the first tick drain: Node's main-module evaluation is
    * itself awaited (the runMain continuation is a microtask queued after
@@ -1712,7 +1748,9 @@ void scr_loop_run(void) {
    * scheduled during the body exactly once, at startup — differentially
    * pinned. Every later checkpoint drains ticks first. */
   bool first_checkpoint = true;
+  bool rejection_failed = false;
   for (;;) {
+    if (top_level != NULL && top_level->state == SCR_PROM_REJECTED) break;
     /* process.nextTick callbacks BEFORE promise jobs (Node's checkpoint
      * order): the tick queue to exhaustion, then the microtask queue to
      * exhaustion, and back while either has work — a microtask's
@@ -1733,7 +1771,7 @@ void scr_loop_run(void) {
         } else {
           raw(); /* one stream tick, FIFO with the user ticks around it */
         }
-        if (scr_exc_pending()) return;
+        if (scr_exc_pending()) return false;
       }
     }
     /* Microtasks to exhaustion (Node: promise jobs before timers). */
@@ -1743,7 +1781,26 @@ void scr_loop_run(void) {
       scr_resume_fiber(f);
     }
     first_checkpoint = false;
+    /* The ESM loader observes a rejected entry evaluation at a promise-job
+     * checkpoint and terminates before later ref'd timers or I/O can run.
+     * Wait until this checkpoint's ready queue is drained — the root's
+     * rejection handler is itself promise-job ordered — then leave through
+     * the normal teardown below. A fulfilled root deliberately does not
+     * stop the loop. */
+    if (top_level != NULL && top_level->state == SCR_PROM_REJECTED) break;
     if (scr_nt_head != NULL) continue;
+    /* Node decides unhandled rejections at the END of each complete
+     * nextTick/microtask checkpoint, before advancing to timers or I/O.
+     * A rejected executable module root wins over OTHER rejections from
+     * this same checkpoint (the root check above); rejections from an
+     * earlier checkpoint have already delivered here. Handled listeners
+     * may enqueue more jobs or ref'd work, so return to the checkpoint
+     * head instead of declaring the loop exhausted underneath them. */
+    if (scr_report_unhandled_rejections()) {
+      rejection_failed = true;
+      break;
+    }
+    if (scr_ready_len > 0 || scr_nt_head != NULL || scr_nunhandled > 0) continue;
     /* Quiescent between turns (microtasks drained, nothing running):
      * collect any cycles the turn left behind. No-op on an empty buffer. */
     scr_collect_cycles();
@@ -1754,7 +1811,7 @@ void scr_loop_run(void) {
      * so those drain first. */
     if (scr_stream_dispatch_fn != NULL) {
       scr_stream_dispatch_fn();
-      if (scr_exc_pending()) return; /* uncaught throw in a listener */
+      if (scr_exc_pending()) return false; /* uncaught throw in a listener */
       if (scr_ready_len > 0) continue;
       if (scr_stream_pending_fn != NULL && scr_stream_pending_fn()) continue;
     }
@@ -1765,7 +1822,7 @@ void scr_loop_run(void) {
      * microtasks — restart the turn so those drain first. */
     if (scr_events_dispatch_fn != NULL) {
       scr_events_dispatch_fn();
-      if (scr_exc_pending()) return; /* uncaught throw in a listener */
+      if (scr_exc_pending()) return false; /* uncaught throw in a listener */
       if (scr_ready_len > 0) continue;
     }
     /* Net dispatch (scr_net.c, when linked): accepts, arrived data,
@@ -1774,7 +1831,7 @@ void scr_loop_run(void) {
      * microtasks — restart the turn so those drain first. */
     if (scr_net_dispatch_fn != NULL) {
       scr_net_dispatch_fn();
-      if (scr_exc_pending()) return; /* uncaught throw in a listener */
+      if (scr_exc_pending()) return false; /* uncaught throw in a listener */
       if (scr_ready_len > 0) continue;
     }
     /* Dgram dispatch (scr_dgram.c, when linked): arrived datagrams and
@@ -1782,7 +1839,7 @@ void scr_loop_run(void) {
      * dns.lookup callbacks) fire now — the net hook's exact station. */
     if (scr_dgram_dispatch_fn != NULL) {
       scr_dgram_dispatch_fn();
-      if (scr_exc_pending()) return; /* uncaught throw in a listener */
+      if (scr_exc_pending()) return false; /* uncaught throw in a listener */
       if (scr_ready_len > 0) continue;
     }
     /* Watch dispatch (scr_watch.c, when linked): file events queued on
@@ -1790,7 +1847,7 @@ void scr_loop_run(void) {
      * net hook's exact station. */
     if (scr_watch_dispatch_fn != NULL) {
       scr_watch_dispatch_fn();
-      if (scr_exc_pending()) return; /* uncaught throw in a listener */
+      if (scr_exc_pending()) return false; /* uncaught throw in a listener */
       if (scr_ready_len > 0) continue;
     }
     /* Reap spawned children and fire their listeners (before timers,
@@ -1817,7 +1874,7 @@ void scr_loop_run(void) {
           (scr_watch_pending_fn != NULL && scr_watch_pending_fn());
       if (held) {
         scr_children_poll();
-        if (scr_exc_pending()) return; /* uncaught throw in a listener */
+        if (scr_exc_pending()) return false; /* uncaught throw in a listener */
         if (scr_ready_len > 0) continue;
       }
     }
@@ -2018,7 +2075,7 @@ void scr_loop_run(void) {
         scr_closure_release(t.cb);
       }
       scr_firing_id = 0;
-      if (scr_exc_pending()) return; /* uncaught throw in a callback: main handles it */
+      if (scr_exc_pending()) return false; /* uncaught throw in a callback: main handles it */
       if (scr_ready_len > 0) break; /* drain microtasks before more timers */
     }
     /* The check phase: immediates queued BEFORE this phase started run
@@ -2042,12 +2099,13 @@ void scr_loop_run(void) {
         }
         ((void (*)(ScrClosure *))cb->fn)(cb);
         scr_closure_release(cb);
-        if (scr_exc_pending()) return; /* uncaught throw: main handles it */
+        if (scr_exc_pending()) return false; /* uncaught throw: main handles it */
         while (scr_ready_len > 0) {
           ScrFiber *f = scr_ready[scr_ready_head++];
           scr_ready_len--;
           scr_resume_fiber(f);
         }
+        if (top_level != NULL && top_level->state == SCR_PROM_REJECTED) break;
       }
       /* Fully drained: reset the cursor so the array reuses its slots. */
       if (scr_immediates_head == scr_nimmediates) {
@@ -2056,12 +2114,11 @@ void scr_loop_run(void) {
       }
     }
   }
-  /* Normal exit can now leave UNREF'd timers armed in the heap (the loop
-   * stopped keeping itself alive for them, Node's unref semantics) — they
-   * never fire, so release their closures here or the RC audit counts them
-   * as leaks. Timers left on the uncaught/unhandled paths (the loop
-   * `return`s above, skipping this) are covered by the abandoned-fiber
-   * audit skip. */
+  /* Exit can now leave UNREF'd timers armed in the heap (ordinary
+   * exhaustion, a fatal module root, or an unhandled rejection). They
+   * never fire, so release their closures here or the RC audit counts
+   * them as leaks. Uncaught callback throws still return above for main
+   * to report through the existing exceptional teardown path. */
   scr_timers_teardown();
   /* Same story for unref'd children the loop never reaped: release the
    * registry's references (their listeners never fire — the process is
@@ -2069,6 +2126,7 @@ void scr_loop_run(void) {
   scr_children_teardown();
   scr_fibers_abandoned = scr_fibers_live;
   scr_note_abandoned_fibers(scr_fibers_abandoned);
+  return rejection_failed;
 }
 
 /* The island's half of the unhandled-rejection report (scr_island.c
@@ -2077,21 +2135,18 @@ void scr_loop_run(void) {
  * first-unhandled-rejection death. Returns whether the island had any.
  * Static builds never set it. */
 static bool (*scr_island_rejections_fn)(bool print) = NULL;
+static int (*scr_island_jobs_drain_fn)(void) = NULL;
 
-void scr_loop_set_island_rejections(bool (*fn)(bool print)) {
+void scr_loop_set_island_rejections(bool (*fn)(bool print),
+                                    int (*drain_jobs)(void)) {
   scr_island_rejections_fn = fn;
+  scr_island_jobs_drain_fn = drain_jobs;
 }
 
 /* ── process.on('unhandledRejection') ─────────────────────────────────
- * dyn listeners called per never-observed rejection instead of the
- * default report below. Node fires the event at end-of-turn; the
- * compiled runtime fires at loop exhaustion, where the ledger is
- * decided — the same values, later (SEMANTICS.md; mustCall-style
- * assertions and reason identity observe no difference, cross-turn
- * interleaving would). A registered listener suppresses the report and
- * the exit-1, exactly Node's handled-event contract. */
-
-
+ * Dyn listeners are called per never-observed rejection at the completed
+ * nextTick/microtask checkpoint. A registered listener suppresses the
+ * default report and exit 1, exactly Node's handled-event contract. */
 
 /* The unhandled-rejection LISTENER hook (scr_async_dyn.c installs it at
  * registration — the loop-hook pattern, so listener-free binaries keep
@@ -2099,11 +2154,25 @@ void scr_loop_set_island_rejections(bool (*fn)(bool print)) {
  * listener threw (the uncaught crash path). */
 bool (*scr_urj_deliver_fn)(ScrPromise *p) = NULL;
 
-/* Unhandled rejections at loop end: Node prints an error and exits 1. */
+/* Unhandled rejections at a completed nextTick/microtask checkpoint:
+ * Node prints an error and exits 1 when no listener handles the event.
+ * Snapshot the ledger: a listener can reject another promise, but that
+ * new rejection belongs to the NEXT checkpoint rather than this report. */
 bool scr_report_unhandled_rejections(void) {
+  /* Static fibers drain before engine jobs in this runtime's documented
+   * island ordering. Complete BOTH halves of that microtask checkpoint
+   * before deciding either rejection ledger; engine reactions can attach
+   * a handler to a rejection that would otherwise look unhandled here.
+   * A host callback can wake a static fiber/tick, in which case the loop
+   * must drain that work before reporting too. */
+  if (scr_island_jobs_drain_fn != NULL) {
+    scr_island_jobs_drain_fn();
+    if (scr_ready_len > 0 || scr_nt_head != NULL) return false;
+  }
   bool any = false;
   bool crashed = false;
-  for (size_t i = 0; i < scr_nunhandled; i++) {
+  size_t report_count = scr_nunhandled;
+  for (size_t i = 0; i < report_count; i++) {
     ScrPromise *p = scr_maybe_unhandled[i];
     if (p->state == SCR_PROM_REJECTED && !p->rejection_observed && !crashed) {
       if (scr_urj_deliver_fn != NULL) {
@@ -2145,7 +2214,12 @@ bool scr_report_unhandled_rejections(void) {
     }
     scr_promise_release(p);
   }
-  scr_nunhandled = 0;
+  size_t remaining = scr_nunhandled - report_count;
+  if (remaining > 0) {
+    memmove(scr_maybe_unhandled, scr_maybe_unhandled + report_count,
+            remaining * sizeof *scr_maybe_unhandled);
+  }
+  scr_nunhandled = remaining;
   if (crashed) {
     scr_exc_print_uncaught();
     scr_exit_code_note(1);
@@ -2155,18 +2229,20 @@ bool scr_report_unhandled_rejections(void) {
     bool island = scr_island_rejections_fn(!any);
     any = any || island;
   }
-  /* An 'unhandledRejection' listener can spawn fibers the exhausted loop
-   * will never run (a .catch attach mints a reaction fiber): they are
-   * abandoned by construction — re-note them so the RC audit's skip
-   * covers their parked state, exactly the loop-teardown accounting. */
-  if (scr_fibers_live > scr_fibers_abandoned) {
-    scr_fibers_abandoned = scr_fibers_live;
-    scr_note_abandoned_fibers(scr_fibers_abandoned);
-  }
   /* main returns 1 on a reported rejection — the 'exit' listeners (atexit)
    * must see that code, like Node's. */
   if (any) scr_exit_code_note(1);
   return any;
+}
+
+/* A fatal executable-module rejection suppresses unrelated rejections
+ * created in the SAME checkpoint. Drop their retained ledger references
+ * without delivering process events or a competing default report. */
+void scr_discard_unhandled_rejections(void) {
+  for (size_t i = 0; i < scr_nunhandled; i++) {
+    scr_promise_release(scr_maybe_unhandled[i]);
+  }
+  scr_nunhandled = 0;
 }
 
 /* ── new Promise(executor) ────────────────────────────────────────────── */

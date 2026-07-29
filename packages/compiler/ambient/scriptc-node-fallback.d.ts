@@ -250,10 +250,10 @@ declare var process: {
    * deprecation sites dispatch synchronously (SEMANTICS.md). */
   on(event: "warning", listener: (warning: Error & { code?: string }) => void): void;
   /* 'unhandledRejection' — dispatched per never-observed rejection at
-   * loop end (reason, promise), suppressing the default report.
-   * 'rejectionHandled' — the sibling event: under the loop-exhaustion
-   * model its one firing window is a handler attached during an
-   * unhandledRejection listener (promise payload, Node's shape). */
+   * the completed nextTick/microtask checkpoint (reason, promise),
+   * suppressing the default report. 'rejectionHandled' — the sibling
+   * event, fired once when a delivered promise later gains a handler
+   * (promise payload, Node's shape). */
   on(event: "unhandledRejection", listener: (reason: unknown, promise: unknown) => void): void;
   on(event: "rejectionHandled", listener: (promise: unknown) => void): void;
   once(event: "SIGINT" | "SIGTERM", listener: () => void): void;

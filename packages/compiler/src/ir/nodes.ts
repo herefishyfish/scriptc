@@ -694,7 +694,7 @@ export function isRefCounted(t: IrType): boolean {
 
 export interface IrModule {
   /** Bumped on any breaking IR change; serialize.ts refuses mismatches. */
-  irVersion: 2;
+  irVersion: 3;
   sourceFile: string;
   functions: IrFunction[];
   /** Class shapes. Constructors and methods are ordinary module functions
@@ -1060,6 +1060,17 @@ export interface IrFunction {
   /** Async: the body runs on a fiber; `returnType` is the INNER type T (a
    * `return v` fulfills with v) while call sites receive Promise<T>. */
   async?: true;
+  /** Async module initializers only: a module-global Promise<T> slot where
+   * the spawn wrapper caches its first evaluation promise. Every later
+   * static/dynamic import receives that same promise, including while the
+   * first evaluation is suspended. */
+  asyncCacheGlobal?: string;
+  /** Async cyclic module initializers only: the SCC's shared Promise<T>
+   * slot. Eager recursive spawning writes member promises from the inside
+   * out, so the member that actually initiated evaluation writes last and
+   * becomes the runtime cycle root. Dynamic imports wait on this shared
+   * completion verdict instead of a build-time-selected member. */
+  asyncCycleCacheGlobal?: string;
   /** Generator (`function*`): the body runs on a fiber created SUSPENDED
    * (nothing runs until the first `.next()`); `returnType` is the
    * generator's TReturn (VOID when it carries no value — `return;`
@@ -3670,7 +3681,7 @@ export type IrLibFn =
   | "process.offWarning"
   | "process.emitWarning"
   /** process.on/once('unhandledRejection', fn): registers a dyn listener
-   * the loop-end report dispatches per never-observed rejection —
+   * the checkpoint report dispatches per never-observed rejection —
    * (reason, promise) — instead of printing and exiting 1 (scr_async.c).
    * The bool second arg is `once` (auto-removed after one delivery,
    * Node's once); off/removeListener remove by closure identity, the
@@ -3679,12 +3690,9 @@ export type IrLibFn =
   | "process.onUnhandledRejection"
   | "process.offUnhandledRejection"
   /** process.on/once/off('rejectionHandled', fn): the sibling registry.
-   * Under the loop-exhaustion rejection model the event has exactly ONE
-   * firing window — a handler attached DURING an unhandledRejection
-   * listener (Node's other windows, later turns, don't exist here: a
-   * rejection handled before exhaustion never enters the report at all —
-   * the documented end-of-turn divergence). Dispatch is synchronous at
-   * the attach, with the promise, Node's payload. */
+   * A handler attached after unhandledRejection delivery fires the event
+   * once. Dispatch is synchronous at the attach, with the promise,
+   * Node's payload. */
   | "process.onRejectionHandled"
   | "process.offRejectionHandled"
   /** The Number statics with a static C implementation (scr_lib.c): one
@@ -4752,7 +4760,7 @@ export type IrExpr =
    * frontend returns them as-is, the spec's native-promise identity;
    * thenables and promise-armed unions fence); the backend mints a fresh
    * promise and fulfills it immediately per the inner kind. */
-  | { kind: "intrinsic"; name: "console.log" | "console.error" | "promise.race" | "promise.all" | "promise.reject" | "promise.resolve"; args: IrExpr[]; type: IrType; loc: SrcLoc }
+  | { kind: "intrinsic"; name: "console.log" | "console.error" | "promise.race" | "promise.all" | "promise.reject" | "promise.resolve" | "module.await"; args: IrExpr[]; type: IrType; loc: SrcLoc }
   /** Standard-library call (`process` members, node:fs functions). `fn` is a
    * closed union; arg/result types are fixed per member (validated against
    * LIB_FN_SIGS). Property READS (`process.argv`, `process.platform`) are

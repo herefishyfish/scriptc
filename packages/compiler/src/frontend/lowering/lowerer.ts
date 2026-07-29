@@ -66,6 +66,7 @@ import {
   isNodeEsmFile,
   isNodeTypesPath,
   locOf,
+  orderedImportsOf,
   overridesDtsPath,
   npmStaticDepSf7,
   requireSpecOf,
@@ -1034,6 +1035,30 @@ export class Lowerer {
    * none — %main calls it exactly once (a dependency edge back to the
    * entry would be a fenced cycle). */
   readonly moduleGuardOf = new Map<ts.SourceFile, string>();
+  /** Files whose module evaluation is asynchronous: direct top-level
+   * await/for-await modules plus their static ESM importers. Their %init
+   * bodies run on fibers and every async dependency edge awaits the
+   * dependency promise before the importer body starts. Synchronous files
+   * stay synchronous — adding even an already-settled await would insert
+   * an observable microtask hop. */
+  readonly asyncInitFiles = new Set<ts.SourceFile>();
+  /** Async module → its cached evaluation-promise global. The emitted
+   * spawn wrapper fills this on first evaluation and returns a retained
+   * reference on cache hits, matching Node's one ModuleJob promise per
+   * module even across diamonds and concurrent dynamic imports. */
+  readonly modulePromiseOf = new Map<ts.SourceFile, string>();
+  /** Async import-cycle member → the cycle's deterministic graph
+   * representative. Used to recognize internal SCC edges; this is NOT
+   * necessarily the runtime evaluation root, because a dynamically-only
+   * cycle can first be entered through any member. */
+  readonly asyncCycleRepresentativeOf = new Map<ts.SourceFile, ts.SourceFile>();
+  /** Async import-cycle member → the shared completion-promise global for
+   * its SCC. Every member's spawn wrapper temporarily publishes its own
+   * promise while eager recursive evaluation unwinds; the outermost
+   * wrapper (the member actually requested first at runtime) writes last
+   * and therefore becomes the cycle's evaluation root. Dynamic imports
+   * wait on this shared verdict rather than a build-time-selected member. */
+  readonly asyncCyclePromiseOf = new Map<ts.SourceFile, string>();
   /** Record-shape interner: canonical (name-sorted) field list → shapeId.
    * Threaded into every mapType call; its `shapes` array becomes
    * IrModule.records. */
@@ -1592,6 +1617,114 @@ export class Lowerer {
       this.moduleGuardOf.set(fp.sf, id);
       this.globalsList.push({ id, name: "%loaded", type: BOOL, mutable: true });
     }
+
+    // A module is intrinsically async when an await/for-await occurs
+    // outside every nested function-like boundary. Then propagate that
+    // status backwards through STATIC ESM edges: Node does not start an
+    // importer's body until each async dependency has completed. CJS
+    // import/require edges deliberately do not propagate — Node refuses
+    // require(esm) when the graph contains top-level await, and the call
+    // sites below keep that as a named unsupported boundary.
+    for (const fp of parts) {
+      let found = false;
+      ts.walkPreorder(fp.sf, (node) => {
+        if (node !== fp.sf && ts.isFunctionLike(node)) return "skip";
+        if (
+          ts.isAwaitExpression(node) ||
+          (ts.isForOfStatement(node) && node.awaitModifier !== undefined)
+        ) {
+          found = true;
+          return "stop";
+        }
+        return undefined;
+      });
+      if (found) this.asyncInitFiles.add(fp.sf);
+    }
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const fp of parts) {
+        if (this.asyncInitFiles.has(fp.sf) || !isNodeEsmFile(fp.sf)) continue;
+        if (orderedImportsOf(this.program, fp.sf).some(({ dep }) => dep !== null && this.asyncInitFiles.has(dep))) {
+          this.asyncInitFiles.add(fp.sf);
+          changed = true;
+        }
+      }
+    }
+    for (const fp of parts) {
+      if (!this.asyncInitFiles.has(fp.sf)) continue;
+      const rawTag = this.fileTag.get(fp.sf) ?? "";
+      const tag = rawTag === "" ? "e." : rawTag.replace(/^%/, "");
+      const id = `%g.${tag}%initPromise`;
+      this.modulePromiseOf.set(fp.sf, id);
+      this.globalsList.push({
+        id,
+        name: "%initPromise",
+        type: { kind: "promise", inner: VOID },
+        mutable: true,
+      });
+    }
+
+    const orderIndex = new Map(parts.map((fp, i) => [fp.sf, i] as const));
+    const partSet = new Set(parts.map((fp) => fp.sf));
+    const staticDeps = (sf: ts.SourceFile): ts.SourceFile[] =>
+      orderedImportsOf(this.program, sf)
+        .map(({ dep }) => dep)
+        .filter((dep): dep is ts.SourceFile => dep !== null && dep !== sf && partSet.has(dep));
+
+    // Tarjan SCCs over the same static graph. The last postorder member is
+    // a deterministic COMPONENT representative for internal-edge tests
+    // and global naming. The runtime evaluation root can differ: a cycle
+    // reached only through import() starts at whichever member is actually
+    // requested first, not whichever import() site preflight discovered
+    // first. The shared cycle-promise slot below is filled by the emitted
+    // spawn wrappers so it records that runtime choice.
+    let nextIndex = 0;
+    const indexOf = new Map<ts.SourceFile, number>();
+    const lowOf = new Map<ts.SourceFile, number>();
+    const stack: ts.SourceFile[] = [];
+    const onStack = new Set<ts.SourceFile>();
+    const visit = (sf: ts.SourceFile): void => {
+      const at = nextIndex++;
+      indexOf.set(sf, at);
+      lowOf.set(sf, at);
+      stack.push(sf);
+      onStack.add(sf);
+      for (const dep of staticDeps(sf)) {
+        if (!indexOf.has(dep)) {
+          visit(dep);
+          lowOf.set(sf, Math.min(lowOf.get(sf)!, lowOf.get(dep)!));
+        } else if (onStack.has(dep)) {
+          lowOf.set(sf, Math.min(lowOf.get(sf)!, indexOf.get(dep)!));
+        }
+      }
+      if (lowOf.get(sf) !== indexOf.get(sf)) return;
+      const component: ts.SourceFile[] = [];
+      for (;;) {
+        const member = stack.pop()!;
+        onStack.delete(member);
+        component.push(member);
+        if (member === sf) break;
+      }
+      if (component.length < 2 || !component.some((member) => this.asyncInitFiles.has(member))) return;
+      const root = component.reduce((a, b) => orderIndex.get(a)! > orderIndex.get(b)! ? a : b);
+      const rawTag = this.fileTag.get(root) ?? "";
+      const tag = rawTag === "" ? "e." : rawTag.replace(/^%/, "");
+      const cyclePromiseId = `%g.${tag}%cyclePromise`;
+      this.globalsList.push({
+        id: cyclePromiseId,
+        name: "%cyclePromise",
+        type: { kind: "promise", inner: VOID },
+        mutable: true,
+      });
+      for (const member of component) {
+        if (this.asyncInitFiles.has(member)) {
+          this.asyncCycleRepresentativeOf.set(member, root);
+          this.asyncCyclePromiseOf.set(member, cyclePromiseId);
+        }
+      }
+    };
+    for (const fp of parts) if (!indexOf.has(fp.sf)) visit(fp.sf);
   }
 
   /** The lowering of a CommonJS `require("./local")` occurrence: a call of
@@ -1614,6 +1747,13 @@ export class Lowerer {
       ? resolveImport(this.program, node.getSourceFile(), spec)
       : npmStaticDepSf7(this.program, node.getSourceFile(), spec);
     if (!dep || dep.fileName.endsWith(".json")) return null;
+    if (this.asyncInitFiles.has(dep)) {
+      this.unsupported(
+        "SC1090",
+        node,
+        `require() of '${spec}' (its ES-module graph uses top-level await; use import() instead)`,
+      );
+    }
     const initName = this.initNameOf.get(dep);
     if (initName === undefined) return null;
     const loc = locOf(node);
@@ -1853,7 +1993,7 @@ export class Lowerer {
       this.diags.length > 0
         ? null
         : {
-            irVersion: 2,
+            irVersion: 3,
             sourceFile: this.entry.fileName,
             functions,
             classes: artifacts.classes,
