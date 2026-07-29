@@ -12,6 +12,7 @@ const fixtures = join(
   "fixtures",
   "android-target",
 );
+const repositoryRoot = join(fixtures, "..", "..", "..");
 
 afterAll(() => {
   rmSync(root, { recursive: true, force: true });
@@ -101,6 +102,20 @@ describe("Android target", () => {
     }
   });
 
+  test("folds NativeScript platform globals for Android", async () => {
+    const result = await compileAndroid(join(fixtures, "platform.ts"), {
+      outDir: join(root, "platform-project"),
+    });
+    if (!result.ok) {
+      throw new Error(
+        result.diagnostics.map((d) => `${d.code}: ${d.message}`).join("\n"),
+      );
+    }
+    const generatedC = readFileSync(result.cPath, "utf8");
+    expect(generatedC).not.toContain("global.undefRead");
+    expect(generatedC).not.toContain("binding form with no lowering");
+  });
+
   test("recognizes metadata-known classes from NativeScript-style declarations", async () => {
     const result = await compileAndroid(join(fixtures, "metadata-namespace.ts"), {
       outDir: join(root, "metadata-namespace-project"),
@@ -169,5 +184,35 @@ describe("Android target", () => {
         "utf8",
       ),
     ).toContain("ScriptcRuntime.shutdown()");
+  });
+
+  test("compiles NativeScript Core Button and StackLayout views", async () => {
+    const result = await compileAndroid(
+      join(repositoryRoot, "android", "app.ts"),
+      {
+        outDir: join(root, "nativescript-core-project"),
+        applicationId: "dev.scriptc.coreviews",
+      },
+    );
+    if (!result.ok) {
+      throw new Error(
+        result.diagnostics.map((d) => `${d.code}: ${d.message}`).join("\n"),
+      );
+    }
+
+    const generatedC = readFileSync(result.cPath, "utf8");
+    expect(generatedC).toContain('"android/widget/Button"');
+    expect(generatedC).toContain('"android/widget/LinearLayout"');
+    expect(generatedC).toContain('"setOnClickListener"');
+    expect(generatedC).toContain('"addView"');
+    // The alert button resolves the nested Builder type and the dialog
+    // listener through metadata, without any dialog-specific binding.
+    expect(generatedC).toContain('"android/app/AlertDialog$Builder"');
+    expect(generatedC).toContain('"setPositiveButton"');
+    expect(generatedC).toContain(
+      '"(Ljava/lang/CharSequence;Landroid/content/DialogInterface$OnClickListener;)Landroid/app/AlertDialog$Builder;"',
+    );
+    expect(generatedC).not.toContain("__ANDROID__");
+    expect(generatedC).not.toContain("scr_throw_error_msg_code");
   });
 });

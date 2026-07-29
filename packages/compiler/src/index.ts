@@ -31,6 +31,7 @@ import { lowerToIr, type LowerOptions, type LowerResult } from "./frontend/lower
 import type { CoverageInput, NpmStaticStatus } from "./coverage/report.js";
 import { loadFfiProfile, type FfiProfile } from "./ffi/profile.js";
 import { emitAndroidProject } from "./android/project.js";
+import { setSourcePlatform } from "./frontend/platform-source.js";
 
 export const VERSION = "0.0.1";
 
@@ -382,7 +383,12 @@ function packagesNamedByDiag(message: string, optedIn: ReadonlySet<string>): Set
  * status the shared loops record becomes compileLibrary's SC4020
  * static-or-refuse teaching, and the detection closes over the opted-in
  * packages' own bare edges (no island exists to serve a dep from). */
-function runFrontend(entryPath: string, npmStatic?: readonly string[] | "auto" | "lib"): Frontend {
+function runFrontend(
+  entryPath: string,
+  npmStatic?: readonly string[] | "auto" | "lib",
+  sourcePlatform: string | null = null,
+): Frontend {
+  setSourcePlatform(sourcePlatform);
   const statuses: NpmStaticStatus[] = [];
   const npmSites = new Map<string, SrcLoc>();
   const judged = new Set<string>();
@@ -464,6 +470,11 @@ function runFrontend(entryPath: string, npmStatic?: readonly string[] | "auto" |
     }
     const dropping = [...reasons.keys()].filter((p) => effective.has(p));
     if (dropping.length === 0) break;
+    // Android has no dynamic JavaScript island to receive a package that
+    // fails static compilation. Keep the requested package in the graph
+    // and surface its real diagnostics instead of reloading its .d.ts-only
+    // consumer view and producing a misleading fallback.
+    if (sourcePlatform === "android") break;
     for (const p of dropping) {
       effective.delete(p);
       statuses.push({ package: p, status: "fallback", detail: reasons.get(p)! });
@@ -485,7 +496,11 @@ function runFrontend(entryPath: string, npmStatic?: readonly string[] | "auto" |
   // degrade the same way — the ratified stance for bundle-shaped dists is
   // graceful per-package degradation, never a failed gate the user cannot
   // act on (the note carries the why).
-  if (effective.size > 0 && preflight.some((d) => d.code === "SC0001")) {
+  if (
+    sourcePlatform !== "android" &&
+    effective.size > 0 &&
+    preflight.some((d) => d.code === "SC0001")
+  ) {
     const dropWithNote = (p: string): void => {
       effective.delete(p);
       statuses.push({
@@ -870,7 +885,16 @@ export async function compileAndroid(
   entryPath: string,
   opts: AndroidCompileOptions,
 ): Promise<AndroidCompileResult> {
-  const fe = runFrontend(entryPath, opts.npmStatic);
+  const androidNpmStatic =
+    opts.npmStatic === "auto"
+      ? "auto"
+      : [
+          "@nativescript/core",
+          ...((opts.npmStatic ?? []).filter(
+            (pkg) => pkg !== "@nativescript/core",
+          )),
+        ];
+  const fe = runFrontend(entryPath, androidNpmStatic, "android");
   let mod: IrModule;
   let entryText: string;
   try {

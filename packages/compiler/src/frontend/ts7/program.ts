@@ -100,6 +100,7 @@ export class Ts7Host {
     fsShadow?: {
       readFile: (path: string) => string | undefined;
       hideFile: (path: string) => boolean;
+      fileExists?: (path: string) => boolean | undefined;
     } | null;
   }) {
     const virtualFiles = this.virtualFiles;
@@ -120,6 +121,8 @@ export class Ts7Host {
         fileExists: (fileName) => {
           if (virtualFiles.has(tsgoPath(fileName))) return true;
           if (shadow !== null && shadow.hideFile(fileName)) return false;
+          const shadowed = shadow?.fileExists?.(fileName);
+          if (shadowed !== undefined) return shadowed;
           return undefined;
         },
         directoryExists: () => undefined,

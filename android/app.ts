@@ -1,21 +1,34 @@
+import { Button, StackLayout } from "@nativescript/core";
+
 const activity = Application.android.foregroundActivity;
-const button = new android.widget.Button(activity);
-button.setAllCaps(false);
+const button = new Button();
+const alertButton = new Button();
 let count = 0;
 
 function render(): void {
-  button.setText(`Count: ${count}`);
+  button.text = `Count: ${count}`;
 }
 
 render();
-button.setOnClickListener(() => {
+button.on(Button.tapEvent, () => {
   count += 2;
   render();
 });
 
-const view = new android.widget.LinearLayout(activity);
-view.setOrientation(android.widget.LinearLayout.VERTICAL);
-view.setPadding(0, 160, 0, 0);
-view.addView(button);
+alertButton.text = "Show alert";
+alertButton.on(Button.tapEvent, () => {
+  const builder = new android.app.AlertDialog.Builder(activity);
+  builder.setTitle("scriptc");
+  builder.setMessage(`The count is ${count}.`);
+  builder.setPositiveButton("OK", () => {});
+  builder.show();
+});
 
-activity.setContentView(view);
+const view = new StackLayout();
+view.paddingTop = 160;
+view.addChild(button);
+view.addChild(alertButton);
+view.backgroundColor = 'red';
+view._setupAsRootView(activity);
+
+activity.setContentView(view.nativeViewProtected!);

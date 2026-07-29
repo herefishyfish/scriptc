@@ -85,6 +85,7 @@ declare namespace android {
     class View {
       constructor(context: content.Context);
       setPadding(left: number, top: number, right: number, bottom: number): void;
+      setBackgroundColor(color: number): void;
     }
     class ViewGroup extends View {
       addView(view: View): void;
@@ -93,6 +94,16 @@ declare namespace android {
   namespace app {
     class Activity extends content.Context {
       setContentView(view: view.View): void;
+    }
+    class AlertDialog {}
+    namespace AlertDialog {
+      class Builder {
+        constructor(context: content.Context);
+        setTitle(title: string): Builder;
+        setMessage(message: string): Builder;
+        setPositiveButton(text: string, listener: () => void): Builder;
+        show(): AlertDialog;
+      }
     }
   }
   namespace widget {
@@ -120,3 +131,10 @@ declare const Application: {
     readonly foregroundActivity: android.app.Activity;
   };
 };
+
+/* NativeScript bundler defines. Android builds fold these during lowering,
+ * matching NativeScript's platform-selection contract. */
+declare const __ANDROID__: boolean;
+declare const __IOS__: boolean;
+declare const __VISIONOS__: boolean;
+declare const __APPLE__: boolean;

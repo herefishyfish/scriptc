@@ -54,6 +54,7 @@ import { probeNodeImportRefusal, probeNodeRequireRefusal } from "./npm.js";
 import { isNpmStaticPackage, npmStaticActive, npmStaticFsShadow, npmStaticPackageOfPath, reportNpmStaticOffender, setNpmStaticPackages } from "./npm-static.js";
 import { provenanceEntryFor, provenancePaths } from "./provenance-registry.js";
 import { cjsLexerVisibleNames } from "./cjs-lexer.js";
+import { platformSourceSibling } from "./platform-source.js";
 import {
   ADOPTED_OPTIONS,
   ambientDtsPath,
@@ -217,7 +218,9 @@ function loadProgram7(host: ts.Ts7Host, entryPath: string): LoadResult & { dispo
   // not scriptc's fence and drowns real diagnostics in hundreds of
   // .d.ts-internal errors. Fence discipline never depended on it: the
   // lowerer checks provenance and forms at every use site.
-  let options: ts.Ts7CompilerOptions = nodeTypes ? { ...config.options, skipLibCheck: true } : { ...config.options };
+  let options: ts.Ts7CompilerOptions = nodeTypes
+    ? { ...config.options, skipLibCheck: true }
+    : { ...config.options };
   // --npm-static: opted-in packages' shipped JS must be TYPE-INCLUDED (not
   // just resolved) — without maxNodeModuleJsDepth, node_modules JS types as
   // an implicit-any module (TS7016) and nothing infers. Only flagged
@@ -288,9 +291,15 @@ export function loadProgram(
   // resolve.ts answers the same sibling for scriptc's own edges).
   const npmShadow = npmStaticFsShadow();
   const fsShadow = {
-    readFile: (path: string) => npmShadow?.readFile(path),
+    readFile: (path: string) => {
+      const platformSibling = platformSourceSibling(path);
+      if (platformSibling !== null) return ts.sys.readFile(platformSibling);
+      return npmShadow?.readFile(path);
+    },
     hideFile: (path: string) =>
       (npmShadow?.hideFile(path) ?? false) || projectDtsRuntimeSibling(path) !== null,
+    fileExists: (path: string) =>
+      platformSourceSibling(path) !== null ? true : undefined,
   };
   const host = new ts.Ts7Host({ cwd: dirname(entryPath), fsShadow });
   const load = loadProgram7(host, entryPath);

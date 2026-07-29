@@ -18,6 +18,7 @@ import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "n
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { isNpmStaticPackage, npmStaticPackageOfPath, npmStaticTransformPkgJson } from "./npm-static.js";
 import { provenanceEntryFor } from "./provenance-registry.js";
+import { platformSourceSibling } from "./platform-source.js";
 
 function isFile(path: string): boolean {
   try {
@@ -310,9 +311,14 @@ export function resolveRelativeModule(fromFile: string, specifier: string): stri
  * exact file first (JS/JSON only), then Node's extension candidates —
  * declaration files never answer. */
 function loadAsJsFile(base: string): string | null {
-  if (/\.(js|mjs|cjs|jsx|json)$/.test(base) && isFile(base)) return base;
+  if (
+    /\.(js|mjs|cjs|jsx)$/.test(base) &&
+    (platformSourceSibling(base) !== null || isFile(base))
+  ) return base;
+  if (base.endsWith(".json") && isFile(base)) return base;
   for (const ext of [".js", ".json", ".mjs", ".cjs"]) {
-    if (isFile(base + ext)) return base + ext;
+    const candidate = base + ext;
+    if (platformSourceSibling(candidate) !== null || isFile(candidate)) return candidate;
   }
   return null;
 }
@@ -328,7 +334,7 @@ function loadAsJsDirectory(base: string): string | null {
   }
   for (const ext of [".js", ".json", ".mjs", ".cjs"]) {
     const idx = join(base, "index" + ext);
-    if (isFile(idx)) return idx;
+    if (platformSourceSibling(idx) !== null || isFile(idx)) return idx;
   }
   return null;
 }
@@ -558,13 +564,21 @@ function loadTargetInPass(pkgDir: string, target: string, pass: NmPass): string 
   const path = join(pkgDir, target);
   if (pass === "types") {
     if (/\.(d\.ts|d\.mts|d\.cts|ts|tsx|mts|cts)$/.test(path) && isFile(path)) return path;
-  } else if (/\.(js|jsx|mjs|cjs)$/.test(path) && isFile(path)) {
+  } else if (
+    /\.(js|jsx|mjs|cjs)$/.test(path) &&
+    (platformSourceSibling(path) !== null || isFile(path))
+  ) {
     return path;
   }
   const sub = (ext: string, flavor: "plain" | "x" | "m" | "c"): string | null => {
     const stem = path.slice(0, -ext.length);
     for (const r of extensionsFor(pass, flavor)) {
-      if (isFile(stem + r)) return stem + r;
+      const candidate = stem + r;
+      if (
+        pass === "js" &&
+        (platformSourceSibling(candidate) !== null || isFile(candidate))
+      ) return candidate;
+      if (pass === "types" && isFile(candidate)) return candidate;
     }
     return null;
   };
@@ -577,7 +591,12 @@ function loadTargetInPass(pkgDir: string, target: string, pass: NmPass): string 
   // "@restart/hooks/useMergedRefs" through the subdirectory's own
   // package.json, "module" ignored), then the index files.
   for (const ext of extensionsFor(pass, "plain")) {
-    if (isFile(path + ext)) return path + ext;
+    const candidate = path + ext;
+    if (
+      pass === "js" &&
+      (platformSourceSibling(candidate) !== null || isFile(candidate))
+    ) return candidate;
+    if (pass === "types" && isFile(candidate)) return candidate;
   }
   if (isDirectory(path)) {
     const nested = pkgJsonOf(path);
@@ -591,7 +610,11 @@ function loadTargetInPass(pkgDir: string, target: string, pass: NmPass): string 
     }
     for (const ext of extensionsFor(pass, "plain")) {
       const idx = join(path, "index" + ext);
-      if (isFile(idx)) return idx;
+      if (
+        pass === "js" &&
+        (platformSourceSibling(idx) !== null || isFile(idx))
+      ) return idx;
+      if (pass === "types" && isFile(idx)) return idx;
     }
   }
   return null;

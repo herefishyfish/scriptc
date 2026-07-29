@@ -661,6 +661,26 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
       L.unsupported("SC1090", expr, "typeof expressions on statically-typed values");
     }
     if (ts.isIdentifier(expr)) {
+      // NativeScript's platform defines are replaced by its Android
+      // bundler before execution.  Android is likewise a compile-time
+      // target in scriptc, so expose the same constants while lowering
+      // package source (and user source) instead of manufacturing runtime
+      // globals.  Keeping the whole family explicit matters: Core uses the
+      // false branches as aggressively as the true __ANDROID__ branch.
+      if (
+        L.targetPlatform === "android" &&
+        (expr.text === "__ANDROID__" ||
+          expr.text === "__IOS__" ||
+          expr.text === "__VISIONOS__" ||
+          expr.text === "__APPLE__")
+      ) {
+        return {
+          kind: "boolLit",
+          value: expr.text === "__ANDROID__",
+          type: BOOL,
+          loc,
+        };
+      }
       if (L.isSelfReference(expr)) {
         return { kind: "selfRef", type: L.ctx.selfType!, loc };
       }
