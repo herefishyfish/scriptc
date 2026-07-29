@@ -2,7 +2,7 @@
  * expression lands in a fresh C temp, with RC ownership tracked on the
  * emitter's frames (see the discipline comment in emitter core). */
 import type { CEmitter, Temp } from "./emitter.js";
-import { arrayOf, BOOL, BYTES_U8, bytesOf, canMarshalFuncIntoIsland, CHILDSTREAM_T, DYN, F64, IrExpr, IrRecordShape, IrType, islandPromisePayloadTag, isRefCounted, isUnitType, MAY_THROW_LIB_FNS, RUNTIME_ERROR_CLASSES, STRING, typeEquals } from "../../ir/nodes.js";
+import { androidJavaClass, arrayOf, BOOL, BYTES_U8, bytesOf, canMarshalFuncIntoIsland, CHILDSTREAM_T, DYN, F64, IrExpr, IrRecordShape, IrType, islandPromisePayloadTag, isAndroidObjectType, isRefCounted, isUnitType, MAY_THROW_LIB_FNS, RUNTIME_ERROR_CLASSES, STRING, typeEquals } from "../../ir/nodes.js";
 import { boxAccess, BYTES_NUM_KIND_C, BYTES_NUM_VAR_C, bytesElemKindC, cDecl, cFnPtrCast, cNumberLiteral, cStringLiteral, cType, DV_GET_KIND_C, DV_SET_KIND_C, elemAccess, mapKeyAccess, mapKeyKindC, mapValKindC, retainCallC, vAdapters } from "./emit-types.js";
 import { mangleClassNew, mangleClassRetain, mangleClassStruct, mangleField, mangleFnClosure, mangleFunction, mangleGlobal, mangleLocal, mangleRecordNew, mangleRecordStruct, mangleVtStruct } from "../mangle.js";
 import { OVERFLOW_MEMBER } from "./emit-shapes.js";
@@ -6433,6 +6433,9 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
         // machine-produced JSON but reports engine surprises via NULL +
         // pending — check like a may-throw so the dummy unwinds cleanly.
         const v = E.emitExpr(e.value);
+        if (isAndroidObjectType(e.value.type)) {
+          return E.fallibleTemp(e.type, `scr_jsval_from_android(${v.name})`);
+        }
         switch (e.value.type.kind) {
           case "f64":
             return E.newTemp(e.type, `scr_jsval_from_f64(${v.name})`);
@@ -6621,6 +6624,13 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
         // failures. Every step is a may-throw with the standard pending
         // discipline; intermediate temps are frame-owned.
         const v = E.emitExpr(e.value);
+        if (isAndroidObjectType(e.type)) {
+          const javaClass = androidJavaClass(e.type)!;
+          return E.fallibleTemp(
+            e.type,
+            `scr_jsval_exit_android(${v.name}, ${cStringLiteral(Buffer.from(javaClass, "utf8"))})`,
+          );
+        }
         switch (e.type.kind) {
           case "f64":
           case "bool": {

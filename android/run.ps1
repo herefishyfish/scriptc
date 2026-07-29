@@ -3,8 +3,8 @@ param(
   [string]$Serial,
   [string]$ApplicationId = "dev.scriptc.counter",
   [string]$AppName = "JS Counter",
-  [string]$Entry = (Join-Path $PSScriptRoot "app.ts"),
-  [string]$OutputDir = (Join-Path $PSScriptRoot "build/counter"),
+  [string]$Entry,
+  [string]$OutputDir,
   [string]$Gradle,
   [switch]$SkipToolBuild,
   [switch]$NoLaunch
@@ -12,6 +12,12 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path $PSScriptRoot -Parent
+if (-not $Entry) {
+  $Entry = Join-Path $PSScriptRoot "app.ts"
+}
+if (-not $OutputDir) {
+  $OutputDir = Join-Path $PSScriptRoot "build/counter"
+}
 
 function Invoke-Checked {
   param(

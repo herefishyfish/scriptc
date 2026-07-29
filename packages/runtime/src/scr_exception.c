@@ -12,6 +12,9 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
 
 #ifndef SCR_LIB
 /* The trap funnel's EXECUTABLE expansion: exactly the historical
@@ -346,5 +349,20 @@ void scr_exc_print_uncaught(void) {
     break;
   }
   fputc('\n', stderr);
+#ifdef __ANDROID__
+  if (scr_exc_kind == SCR_EXC_STR) {
+    const ScrStr *s = (const ScrStr *)scr_exc_payload;
+    __android_log_print(ANDROID_LOG_ERROR, "scriptc", "Uncaught %.*s",
+                        (int)s->len, s->data);
+  } else if (scr_exc_kind == SCR_EXC_OBJ && scr_error_is(scr_exc_payload)) {
+    ScrStr *s = scr_error_to_string((ScrError *)scr_exc_payload);
+    __android_log_print(ANDROID_LOG_ERROR, "scriptc", "Uncaught %.*s",
+                        (int)s->len, s->data);
+    scr_str_release(s);
+  } else {
+    __android_log_write(ANDROID_LOG_ERROR, "scriptc",
+                        "Uncaught non-string runtime value");
+  }
+#endif
   scr_exc_reset(); /* the payload counts as live until released */
 }

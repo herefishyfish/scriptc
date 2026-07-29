@@ -106,6 +106,58 @@ export function npmStaticPackageOfPath(path: string): string | null {
   return ws !== null && activePackages.has(ws) ? ws : null;
 }
 
+/** Whether a published npm file is listed by its package's `sideEffects`
+ * metadata. Static package reachability uses this the same way a bundler
+ * does: unused barrels may disappear, but an explicit import of a declared
+ * side-effect module (NativeScript's globals bootstrap, for example) must
+ * remain. Conservative true for malformed/missing metadata. */
+export function npmStaticFileHasSideEffects(path: string): boolean {
+  const normalized = path.replaceAll("\\", "/");
+  const marker = "/node_modules/";
+  const at = normalized.lastIndexOf(marker);
+  if (at < 0) return true;
+  const after = normalized.slice(at + marker.length);
+  const parts = after.split("/");
+  const packageParts = parts[0]?.startsWith("@") ? 2 : 1;
+  if (parts.length <= packageParts) return true;
+  const packageRoot = normalized.slice(
+    0,
+    at + marker.length + parts.slice(0, packageParts).join("/").length,
+  );
+  let sideEffects: unknown;
+  try {
+    sideEffects = (
+      JSON.parse(readFileSync(`${packageRoot}/package.json`, "utf8")) as {
+        sideEffects?: unknown;
+      }
+    ).sideEffects;
+  } catch {
+    return true;
+  }
+  if (sideEffects === false) return false;
+  if (sideEffects === true || sideEffects === undefined) return true;
+  if (!Array.isArray(sideEffects)) return true;
+  const relative = `./${parts.slice(packageParts).join("/")}`;
+  return sideEffects.some((raw) => {
+    if (typeof raw !== "string") return false;
+    const pattern = raw.startsWith("./") ? raw : `./${raw}`;
+    if (!pattern.includes("*")) {
+      return (
+        relative === pattern ||
+        relative.startsWith(`${pattern}/`) ||
+        (relative.endsWith("/index.js") &&
+          relative.slice(0, -"/index.js".length) === pattern)
+      );
+    }
+    const escaped = pattern
+      .replace(/[.+?^${}()|[\]\\]/g, "\\$&")
+      .replaceAll("**", "\u0000")
+      .replaceAll("*", "[^/]*")
+      .replaceAll("\u0000", ".*");
+    return new RegExp(`^${escaped}$`).test(relative);
+  });
+}
+
 /** Records why a package cannot compile statically this attempt (first
  * reason wins — one line per package in the coverage note). */
 export function reportNpmStaticOffender(pkg: string, reason: string): void {

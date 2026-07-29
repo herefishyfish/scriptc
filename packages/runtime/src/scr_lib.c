@@ -935,6 +935,11 @@ static int scr_netmask_prefix(const unsigned char *bytes, size_t len) {
 ScrIfaddrs *scr_os_ifaddrs(void) {
   ScrIfaddrs *s = calloc(1, sizeof *s);
   if (!s) scr_trap("scriptc: out of memory\n");
+#if defined(__ANDROID__) && __ANDROID_API__ < 24
+  // bionic did not expose getifaddrs until API 24. Keep the Node-shaped
+  // result valid on scriptc's API-23 floor; it is simply empty there.
+  return s;
+#else
   struct ifaddrs *addrs = NULL;
   if (getifaddrs(&addrs) != 0) return s;
   size_t count = 0;
@@ -1009,6 +1014,7 @@ ScrIfaddrs *scr_os_ifaddrs(void) {
   }
   freeifaddrs(addrs);
   return s;
+#endif
 }
 #endif /* _WIN32 */
 

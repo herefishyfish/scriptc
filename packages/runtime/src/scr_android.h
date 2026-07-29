@@ -5,10 +5,10 @@
 #include <jni.h>
 
 /** Owned JNI global reference. */
-typedef struct ScrAndroidRef {
+struct ScrAndroidRef {
   size_t rc;
   jobject value;
-} ScrAndroidRef;
+};
 
 typedef enum ScrAndroidArgTag {
   SCR_ANDROID_ARG_OBJECT,
@@ -31,6 +31,8 @@ typedef struct ScrAndroidArg {
 
 bool scr_android_init(JNIEnv *env, jobject activity);
 void scr_android_shutdown(void);
+JNIEnv *scr_android_get_env(void);
+ScrAndroidRef *scr_android_ref_from_local(jobject value);
 
 ScrAndroidRef *scr_android_ref_retain(ScrAndroidRef *ref);
 void scr_android_ref_release(ScrAndroidRef *ref);

@@ -18,7 +18,7 @@ import { bindingContextualGenericFnNodeOf, bindingGenericFnAliasInfoOf, bindingG
 import { isVarDeclared, provenanceElidedConstDecl } from "./lower-stmts.js";
 import { streamClassAliasDecl } from "./lower-stream.js";
 import { stdlibGlobalAliasDecl } from "./surfaces.js";
-import { collectNamespaceStmt, nsPathPrefix, trapDeclRootOf } from "./lower-namespaces.js";
+import { collectNamespaceStmt, moduleNsConstAliasDecl, nsPathPrefix, trapDeclRootOf } from "./lower-namespaces.js";
 import { collectExpandoMembers } from "./lower-expando.js";
 import { isUnitOnlyTsType, unitOnlyUnion } from "../types.js";
 import type { ClassInfo } from "./lower-classes.js";
@@ -1228,6 +1228,9 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
         // `const fs = require("node:fs")` through that binding at file
         // scope — a namespace import in const clothing, same story.
         if (isConst && createRequireNamespaceDecl(L, decl.name, decl.initializer)) continue;
+        // `const mod = importedNamespace`: compile-time namespace alias.
+        // Member reads keep resolving to the exporter's own bindings.
+        if (isConst && moduleNsConstAliasDecl(L, decl)) continue;
         // `const { createSign } = crypto` over a builtin NAMESPACE binding
         // at file scope: alias plumbing like the destructured-require form
         // — no storage (the statement lowering skips by the same test).

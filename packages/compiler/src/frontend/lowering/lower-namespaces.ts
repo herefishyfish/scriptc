@@ -220,6 +220,14 @@ export function nsBlockKindOfSymbol(L: Lowerer, sym: ts.Symbol): "flattened" | "
  * .d.ts files) and npm packages answer null — their own chokepoints and
  * fences keep ownership. */
 export function moduleNsSourceFileOf(L: Lowerer, e: ts.Expression): ts.SourceFile | null {
+  return moduleNsSourceFileInner(L, e, new Set());
+}
+
+function moduleNsSourceFileInner(
+  L: Lowerer,
+  e: ts.Expression,
+  seen: Set<ts.Symbol>,
+): ts.SourceFile | null {
   let sym: ts.Symbol | undefined;
   if (ts.isIdentifier(e)) {
     sym = L.checker.getSymbolAtLocation(e);
@@ -231,6 +239,8 @@ export function moduleNsSourceFileOf(L: Lowerer, e: ts.Expression): ts.SourceFil
     sym = L.checker.getSymbolAtLocation(e.name);
   }
   if (!sym) return null;
+  if (seen.has(sym)) return null;
+  seen.add(sym);
   if (sym.flags & ts.SymbolFlags.Alias) sym = L.checker.getAliasedSymbol(sym);
   for (const d of L.checker.declarationsOf(sym)) {
     if (
@@ -255,8 +265,31 @@ export function moduleNsSourceFileOf(L: Lowerer, e: ts.Expression): ts.SourceFil
         if (dep && !dep.isDeclarationFile && L.fileTag.has(dep)) return dep;
       }
     }
+    // A const initialized directly from a module namespace is compile-time
+    // alias plumbing (`const mod = importedNamespace`). Qualified reads
+    // through the alias remain live export reads; no namespace object needs
+    // to be materialized unless the alias escapes some other way.
+    if (
+      ts.isVariableDeclaration(d) &&
+      d.initializer !== undefined &&
+      ts.isIdentifier(d.name)
+    ) {
+      const source = moduleNsSourceFileInner(L, d.initializer, seen);
+      if (source !== null) return source;
+    }
   }
   return null;
+}
+
+export function moduleNsConstAliasDecl(
+  L: Lowerer,
+  decl: ts.VariableDeclaration,
+): boolean {
+  return (
+    ts.isIdentifier(decl.name) &&
+    decl.initializer !== undefined &&
+    moduleNsSourceFileOf(L, decl.initializer) !== null
+  );
 }
 
 /** The member identifier of a qualified namespace reference, when `access`

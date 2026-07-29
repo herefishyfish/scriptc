@@ -11,7 +11,7 @@ import { enforceLibBoundary } from "./lib-boundary.js";
 import { cjsExportAssignmentOf, cjsExportDiscardReason, cjsExportTargetLiteral, isCjsJsFile, isJsSourceFile, locOf, requireSpecOf } from "../program.js";
 import { COMPOUND_ASSIGN_OPS, CompoundOp, STR_METHODS, UNSUPPORTED_STMT, isStdlibMember, sideEffectFreeOptionValue, stdlibGlobalAliasDecl, stdlibGlobalNameOf } from "./surfaces.js";
 import { isProvenanceSourceFile } from "../provenance-registry.js";
-import { ambientUndefVarRootOf, lowerImportEquals, nsUndefRead, nsWritableTarget, trapDeclRootOf } from "./lower-namespaces.js";
+import { ambientUndefVarRootOf, lowerImportEquals, moduleNsConstAliasDecl, nsUndefRead, nsWritableTarget, trapDeclRootOf } from "./lower-namespaces.js";
 import { expandoWritableTarget, lowerExpandoAssignStmt } from "./lower-expando.js";
 import { ForOfIterProjection, lowerForOfArrayIter, lowerForOfMap, lowerForOfSearchParams, lowerForOfSet, objectIterOverIndexShape, strCharsCall } from "./lower-containers.js";
 import { bindingContextualGenericFnNodeOf, bindingGenericFnAliasInfoOf, bindingGenericFnInfoOf, bindingGenericFnNodeOf, deadUnmappableBinding, implicitLocalFnInfoOf, implicitLocalFnNodeOf, nullishExprUnitOf, nullishGenericBindingUnitOf, recordKeysArrayCall } from "./lower-calls.js";
@@ -2810,6 +2810,13 @@ export function lowerVarDecl(L: Lowerer, decl: ts.VariableDeclaration, isLet: bo
     // namespace import in const clothing: alias plumbing, no storage
     // (builtinNamespaceModuleOf resolves member uses).
     if (!isLet && createRequireNamespaceDecl(L, decl.name, decl.initializer)) return null;
+    if (
+      !isLet &&
+      !isVarDeclared(decl) &&
+      moduleNsConstAliasDecl(L, decl)
+    ) {
+      return null;
+    }
 
     // `const { NGHTTP2_CANCEL } = http2.constants` — a destructure over
     // the baked constants table: alias plumbing, no storage (uses read

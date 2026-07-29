@@ -76,6 +76,11 @@ static ScrAndroidRef *scr_android_wrap(jobject local) {
   return ref;
 }
 
+JNIEnv *scr_android_get_env(void) { return scr_android_env; }
+ScrAndroidRef *scr_android_ref_from_local(jobject value) {
+  return scr_android_wrap(value);
+}
+
 ScrAndroidRef *scr_android_ref_retain(ScrAndroidRef *ref) {
   if (ref) ref->rc++;
   return ref;
@@ -365,6 +370,7 @@ bool scr_android_init(JNIEnv *env, jobject activity) {
 
 void scr_android_shutdown(void) {
   JNIEnv *env = scr_android_env;
+  scr_island_android_release_proxies();
   while (scr_android_callbacks) {
     ScrAndroidCallback *next = scr_android_callbacks->next;
     scr_closure_release(scr_android_callbacks->closure);

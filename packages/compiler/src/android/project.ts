@@ -48,9 +48,11 @@ function validateApplicationId(value: string): void {
 }
 
 const require = createRequire(import.meta.url);
-const ANDROID_TEMPLATE_DIR = join(
-  dirname(require.resolve("@scriptc/android/package.json")),
-  "template",
+const ANDROID_PACKAGE_DIR = dirname(require.resolve("@scriptc/android/package.json"));
+const ANDROID_TEMPLATE_DIR = join(ANDROID_PACKAGE_DIR, "template");
+const androidRequire = createRequire(join(ANDROID_PACKAGE_DIR, "package.json"));
+const NATIVESCRIPT_CORE_DIR = dirname(
+  androidRequire.resolve("@nativescript/core/package.json"),
 );
 
 async function renderTemplateTree(
@@ -97,6 +99,7 @@ export async function emitAndroidProject(
   const projectDir = options.outDir;
   const mainDir = join(projectDir, "app", "src", "main");
   const cppDir = join(mainDir, "cpp");
+  const libsDir = join(projectDir, "app", "libs");
   // Remove host files retired by newer templates when regenerating into an
   // existing output directory. The rest of the project remains incremental.
   await rm(
@@ -125,12 +128,26 @@ export async function emitAndroidProject(
   // it. CMake only compiles the selected units, but all headers/helpers are
   // copied so their relative includes remain exact.
   const runtimeDir = runtimeSrcDir();
+  await mkdir(libsDir, { recursive: true });
   await Promise.all([
     cp(runtimeDir, join(cppDir, "runtime"), { recursive: true }),
     cp(
       join(dirname(runtimeDir), "vendor", "ryu"),
       join(cppDir, "vendor", "ryu"),
       { recursive: true },
+    ),
+    cp(
+      join(dirname(runtimeDir), "vendor", "quickjs-ng"),
+      join(cppDir, "vendor", "quickjs-ng"),
+      { recursive: true },
+    ),
+    cp(
+      join(NATIVESCRIPT_CORE_DIR, "platforms", "android", "widgets-release.aar"),
+      join(libsDir, "widgets-release.aar"),
+    ),
+    cp(
+      join(NATIVESCRIPT_CORE_DIR, "platforms", "android", "winter_tc-release.aar"),
+      join(libsDir, "winter_tc-release.aar"),
     ),
   ]);
 

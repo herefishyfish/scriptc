@@ -18,7 +18,10 @@ import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "n
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { isNpmStaticPackage, npmStaticPackageOfPath, npmStaticTransformPkgJson } from "./npm-static.js";
 import { provenanceEntryFor } from "./provenance-registry.js";
-import { platformSourceSibling } from "./platform-source.js";
+import {
+  platformProjectSource,
+  platformSourceSibling,
+} from "./platform-source.js";
 
 function isFile(path: string): boolean {
   try {
@@ -220,10 +223,15 @@ function substitutionCandidates(base: string): string[] {
  * full name with every extension appended. */
 function loadAsFile(base: string): string | null {
   for (const candidate of substitutionCandidates(base)) {
-    if (isFile(candidate)) return candidate;
+    if (platformSourceSibling(candidate) !== null || isFile(candidate)) {
+      return candidate;
+    }
   }
   for (const ext of TS_FIRST) {
-    if (isFile(base + ext)) return base + ext;
+    const candidate = base + ext;
+    if (platformSourceSibling(candidate) !== null || isFile(candidate)) {
+      return candidate;
+    }
   }
   return null;
 }
@@ -244,7 +252,7 @@ function loadAsDirectory(base: string): string | null {
   }
   for (const ext of TS_FIRST) {
     const idx = join(base, "index" + ext);
-    if (isFile(idx)) return idx;
+    if (platformSourceSibling(idx) !== null || isFile(idx)) return idx;
   }
   return null;
 }
@@ -490,6 +498,8 @@ export function nearestPkgJsonPath(fromFile: string): string | null {
  * Relative specifiers, real node_modules packages, and builtins are other
  * resolvers' business; callers try those first. */
 export function resolveProjectImport(fromFile: string, specifier: string): string | null {
+  const platformSource = platformProjectSource(specifier);
+  if (platformSource !== null) return platformSource;
   // --provenance-sources (flag-gated; the registry is empty otherwise): a
   // registered bare specifier answers its attested SOURCE entry — the one
   // chokepoint that makes preflight's user-module edges, the module

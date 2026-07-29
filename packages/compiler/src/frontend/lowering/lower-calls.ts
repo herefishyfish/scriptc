@@ -5,7 +5,7 @@
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { lowerGenMethodCall } from "./lower-generators.js";
-import { androidJavaClass, BOOL, BYTES_U8, CAUGHT, DYN, F64, IrExpr, IrFunction, IrLocal, IrParam, IrStmt, IrType, JSVAL, STRING, SYMBOL_T, SrcLoc, UNDEFINED_T, VOID, arrayOf, canBoxFuncIntoDyn, canConvertToDyn, canDynCheckTo, canMarshalTypedFuncIntoIsland, funcOf, isUnitType, shapeHasAccessorSlots, typeEquals } from "../../ir/nodes.js";
+import { androidJavaClass, androidObjectType, BOOL, BYTES_U8, CAUGHT, DYN, F64, IrExpr, IrFunction, IrLocal, IrParam, IrStmt, IrType, JSVAL, STRING, SYMBOL_T, SrcLoc, UNDEFINED_T, VOID, arrayOf, canBoxFuncIntoDyn, canConvertToDyn, canDynCheckTo, canMarshalTypedFuncIntoIsland, funcOf, isUnitType, shapeHasAccessorSlots, typeEquals } from "../../ir/nodes.js";
 import type { IrFfiImport } from "../../ir/nodes.js";
 import { isJsSourceFile, locOf } from "../program.js";
 import { isGenericCallableMemberType, typeKey } from "../types.js";
@@ -2739,7 +2739,7 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
           L.noLowering(`${javaClass}.${access.name.text} spread call`, expr);
         }
         const receiver = L.lowerExpr(access.expression);
-        const args = expr.arguments.map((arg) => L.lowerExpr(arg));
+        let args = expr.arguments.map((arg) => L.lowerExpr(arg));
         for (const arg of args) {
           if (
             arg.type.kind === "func" &&
@@ -2768,6 +2768,12 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
             expr,
           );
         }
+        args = args.map((arg, index) => {
+          const expected = method!.parameterTypes[index]!;
+          return arg.type.kind === "jsval" && expected.length > 1
+            ? L.coerceToExpected(arg, androidObjectType(expected))
+            : arg;
+        });
         const lit = (value: string): IrExpr => ({
           kind: "strLit",
           value,
@@ -8572,6 +8578,13 @@ export function lowerFunction(L: Lowerer, decl: ts.FunctionDeclaration): IrFunct
     if (receiverIr?.kind !== "object") return null;
     const info = L.classes.get(receiverIr.className);
     if (!info) L.flushDeferredClass(receiverIr.className);
+    if (info?.unloweredMethods?.has(access.name.text)) {
+      L.unsupported(
+        "SC1090",
+        call,
+        `calling the deferred npm method '${access.name.text}' (its JavaScript override has no sound fixed vtable signature)`,
+      );
+    }
     const found = info ? L.findMethodOn(info, access.name.text) : null;
     // The stream surface: API-named calls on stream-rooted receivers
     // lower through the stream spoke (checked before the emitter surface

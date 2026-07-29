@@ -86,6 +86,7 @@ let nextConfigId = 0;
  * the snapshot. */
 export class Ts7Host {
   private readonly virtualFiles = new Map<string, string>();
+  private readonly virtualDirectories = new Set<string>();
   private readonly api: API;
   private closed = false;
 
@@ -104,6 +105,7 @@ export class Ts7Host {
     } | null;
   }) {
     const virtualFiles = this.virtualFiles;
+    const virtualDirectories = this.virtualDirectories;
     const shadow = options?.fsShadow ?? null;
     this.api = new API({
       cwd: options?.cwd ?? process.cwd(),
@@ -125,7 +127,8 @@ export class Ts7Host {
           if (shadowed !== undefined) return shadowed;
           return undefined;
         },
-        directoryExists: () => undefined,
+        directoryExists: (path) =>
+          virtualDirectories.has(tsgoPath(path)) ? true : undefined,
         realpath: (path) => (virtualFiles.has(tsgoPath(path)) ? path : undefined),
         getAccessibleEntries: () => undefined,
       },
@@ -134,7 +137,14 @@ export class Ts7Host {
 
   /** Registers an in-memory file served to tsgo by the virtual-FS hooks. */
   addVirtualFile(path: string, content: string): void {
-    this.virtualFiles.set(tsgoPath(path), content);
+    const normalized = tsgoPath(resolve(path));
+    this.virtualFiles.set(normalized, content);
+    for (let dir = dirname(normalized); ; ) {
+      this.virtualDirectories.add(dir);
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
   }
 
   /** tsgo's own tsconfig parser (extends chains resolved server-side) — the

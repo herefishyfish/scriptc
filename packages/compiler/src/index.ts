@@ -388,7 +388,7 @@ function runFrontend(
   npmStatic?: readonly string[] | "auto" | "lib",
   sourcePlatform: string | null = null,
 ): Frontend {
-  setSourcePlatform(sourcePlatform);
+  setSourcePlatform(sourcePlatform, entryPath);
   const statuses: NpmStaticStatus[] = [];
   const npmSites = new Map<string, SrcLoc>();
   const judged = new Set<string>();
@@ -470,11 +470,6 @@ function runFrontend(
     }
     const dropping = [...reasons.keys()].filter((p) => effective.has(p));
     if (dropping.length === 0) break;
-    // Android has no dynamic JavaScript island to receive a package that
-    // fails static compilation. Keep the requested package in the graph
-    // and surface its real diagnostics instead of reloading its .d.ts-only
-    // consumer view and producing a misleading fallback.
-    if (sourcePlatform === "android") break;
     for (const p of dropping) {
       effective.delete(p);
       statuses.push({ package: p, status: "fallback", detail: reasons.get(p)! });
@@ -885,16 +880,11 @@ export async function compileAndroid(
   entryPath: string,
   opts: AndroidCompileOptions,
 ): Promise<AndroidCompileResult> {
-  const androidNpmStatic =
-    opts.npmStatic === "auto"
-      ? "auto"
-      : [
-          "@nativescript/core",
-          ...((opts.npmStatic ?? []).filter(
-            (pkg) => pkg !== "@nativescript/core",
-          )),
-        ];
-  const fe = runFrontend(entryPath, androidNpmStatic, "android");
+  // Execute the installed @nativescript/core package unchanged in the npm
+  // island. The Android host supplies the NativeScript runtime contract
+  // (Java namespaces, metadata-backed JNI bindings and callbacks); it does
+  // not reimplement Core's views or application behavior.
+  const fe = runFrontend(entryPath, opts.npmStatic, "android");
   let mod: IrModule;
   let entryText: string;
   try {
@@ -907,7 +897,7 @@ export async function compileAndroid(
 
     let lowered: LowerResult;
     try {
-      lowered = fe.lower({ dynamic: false, targetPlatform: "android" });
+      lowered = fe.lower({ dynamic: true, targetPlatform: "android" });
     } catch (e) {
       if (!isCheckerPanic(e)) throw e;
       return fail([
@@ -925,7 +915,7 @@ export async function compileAndroid(
       return fail(validation.map((v) => iceDiag(v.message, v.loc)));
     }
     const asyncSurface = moduleLibAsyncSurface(mod);
-    if (asyncSurface !== null) {
+    if (asyncSurface !== null && (mod.embedded?.modules.length ?? 0) === 0) {
       return fail([
         {
           code: "SC6001",

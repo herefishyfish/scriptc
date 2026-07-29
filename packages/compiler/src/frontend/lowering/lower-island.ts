@@ -4,7 +4,7 @@
  * package boundary fences for node_modules-declared symbols. */
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
-import { F64, IrExpr, IrStmt, IrType, JSVAL, MAX_ISLAND_CALLBACK_ARITY, STRING, VOID, canMarshalTypedFuncIntoIsland, islandPromisePayloadTag, isUnitType } from "../../ir/nodes.js";
+import { F64, IrExpr, IrStmt, IrType, JSVAL, MAX_ISLAND_CALLBACK_ARITY, STRING, VOID, canMarshalTypedFuncIntoIsland, islandPromisePayloadTag, isAndroidObjectType, isUnitType } from "../../ir/nodes.js";
 import { ISLAND_SURFACE, IslandFnEntry, STATIC_MATH_FNS, boundaryIntoIslandMsg } from "./surfaces.js";
 import { requiresDynamicApiDiag, requiresDynamicPackageDiag } from "../../diagnostics/diagnostic.js";
 import { isCjsJsFile, isJsSourceFile, locOf, npmPackageNameOf } from "../program.js";
@@ -91,6 +91,9 @@ import { PoisonError, newFnCtx, own } from "./lowerer.js";
 
   export function jsvalIn(L: Lowerer, e: IrExpr, node: ts.Node): IrExpr {
     if (e.type.kind === "jsval") return e;
+    if (isAndroidObjectType(e.type)) {
+      return { kind: "jsMarshal", value: e, type: JSVAL, loc: e.loc };
+    }
     // Bare unit literals (`undefined` / `null` in an 'any' slot): the
     // engine's own units — unit-typed expressions are literals (units have
     // no other producers), so dropping the operand loses nothing.

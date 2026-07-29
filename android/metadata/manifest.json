@@ -7,12 +7,56 @@
   "dependencies": [
     {
       "file": "android.jar",
-      "sha256": "d9eb9da824d9e247a352f570f01e1169e725b2954bca9e283a71786c59b59f9a"
+      "sha256": "4566663c3876e022b4fa4ced8c8697c4ab1688267f090114fd92d027b32e619b"
+    },
+    {
+      "file": "lifecycle-common-2.6.2.jar",
+      "sha256": "f34831b6c71cd844e1d35d1be49d5e79447c5ab856346531b1e8676fda7374b1"
+    },
+    {
+      "file": "dependency-0.jar",
+      "sha256": "e1ed6534f173381e5486858dfa66c7a2fdfcceba0d0e3f2efa8291f1a7ab5e94"
+    },
+    {
+      "file": "dependency-1.jar",
+      "sha256": "b271ee59f0b18471ebcc5a250cc6e84006547798dc3afab8844c2f9d3146b384"
+    },
+    {
+      "file": "dependency-2.jar",
+      "sha256": "bbbb0c4e02faa69f1303cff45201d7c6a7f208571fc8e5a69935cd7f334439bf"
+    },
+    {
+      "file": "dependency-3.jar",
+      "sha256": "036566c1bf780cd8a8759713820203bb219a4bebfb1c6de551625cf3b879656e"
+    },
+    {
+      "file": "dependency-4.jar",
+      "sha256": "5086cb01af26288f1d212818638272792a6f8b5c3630248e43ba986814be14d9"
+    },
+    {
+      "file": "dependency-5.jar",
+      "sha256": "4c6fd2e758d8dffe13d2b66371b329ca7520d8f4c4df0b6391a5e4465d9759ce"
+    },
+    {
+      "file": "dependency-6.jar",
+      "sha256": "de4631b3bcf43b194259738405dd8b0686287c7a5b1615ac6e7e9bb84af4a8ae"
+    },
+    {
+      "file": "dependency-7.jar",
+      "sha256": "b3d2e1b21f092b95e167c28ef45f63afed535967fec8f3368c608cd2ef0bcee0"
+    },
+    {
+      "file": "dependency-8.jar",
+      "sha256": "19cc1c0e8f925eccae7b8feadcd0efcec57262a206a7754817626ea4d3b37738"
+    },
+    {
+      "file": "dependency-9.jar",
+      "sha256": "6ea060cc3ded80fe7ba7407d8b0b6fc7f8ce67c025f67c893ed07b386a86fc77"
     }
   ],
   "streams": {
-    "treeNodeStream.dat": "25324639112e6fbf121c845b109f8e6c84f9bb938f6413c16ebc76ee5e4ea3d9",
-    "treeStringsStream.dat": "26c34d8c55027207106cf396d899fd485b0b8b39b0d513c2cf66347407da2c99",
-    "treeValueStream.dat": "d4d7f05ec04948bb06acddc72d758f7bda99b110d15289a78af67d0e42d5d2e8"
+    "treeNodeStream.dat": "95775786065045c09ccc072d9cb92b891297fa46678bb164af3f39c073cda24e",
+    "treeStringsStream.dat": "dd6c180a9f0f399904a56a33f031e6cd9a66749b046f69342ff94f080e97a422",
+    "treeValueStream.dat": "f1ec74602034052e51ffa6103fec5cca775b2c1c92c975a88204e20ec06794be"
   }
 }

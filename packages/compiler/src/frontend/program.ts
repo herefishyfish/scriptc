@@ -41,7 +41,8 @@
  *    that path (no snapshot pins it). */
 
 import { builtinModules } from "node:module";
-import { dirname, resolve } from "node:path";
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import { dirname, join, relative, resolve } from "node:path";
 import * as ts from "./ts7/adapter.js";
 import type { ScrDiagnostic } from "../diagnostics/diagnostic.js";
 import {
@@ -51,10 +52,13 @@ import {
 } from "../diagnostics/diagnostic.js";
 import { isNodeModulesPath, nearestPkgJsonPath, projectDtsRuntimeSibling, resolveBareModule, resolveProjectImport, resolveRelativeModule, resolveTypeDirective, setProjectRealm } from "./resolve.js";
 import { probeNodeImportRefusal, probeNodeRequireRefusal } from "./npm.js";
-import { isNpmStaticPackage, npmStaticActive, npmStaticFsShadow, npmStaticPackageOfPath, reportNpmStaticOffender, setNpmStaticPackages } from "./npm-static.js";
+import { isNpmStaticPackage, npmStaticActive, npmStaticFileHasSideEffects, npmStaticFsShadow, npmStaticPackageOfPath, reportNpmStaticOffender, setNpmStaticPackages } from "./npm-static.js";
 import { provenanceEntryFor, provenancePaths } from "./provenance-registry.js";
 import { cjsLexerVisibleNames } from "./cjs-lexer.js";
-import { platformSourceSibling } from "./platform-source.js";
+import {
+  platformSourceSibling,
+  sourcePlatformName,
+} from "./platform-source.js";
 import {
   ADOPTED_OPTIONS,
   ambientDtsPath,
@@ -174,6 +178,94 @@ function resolveNodeTypes7(entryPath: string): string | null {
   return file !== null && isNodeTypesPath(file) ? file : null;
 }
 
+/** NativeScript's TypeScript implementation names the Android SDK classes
+ * directly. Android builds therefore add the package's generated platform
+ * declarations as an explicit root; `types: []` remains forced so unrelated
+ * ambient packages still cannot leak into a scriptc program. */
+function resolvePlatformTypes7(entryPath: string): string | null {
+  if (sourcePlatformName() !== "android") return null;
+  return resolveTypeDirective("@nativescript/types-android", entryPath);
+}
+
+/** TS7 no longer accepts the legacy internal-namespace spelling generated
+ * by @nativescript/types-android (`declare module android` / `export module
+ * app`). NativeScript uses these as namespaces, never string-literal module
+ * augmentations, so normalize them in the read-only compiler overlay. */
+function platformTypeSource7(path: string): string | undefined {
+  const normalized = path.replaceAll("\\", "/");
+  if (
+    sourcePlatformName() !== "android" ||
+    !normalized.includes("/node_modules/@nativescript/types-android/") ||
+    !normalized.endsWith(".d.ts")
+  ) {
+    return undefined;
+  }
+  return ts.sys
+    .readFile(path)
+    ?.replace(
+      /^(\s*(?:declare|export)\s+)module(?=\s+[A-Za-z_$])/gm,
+      "$1namespace",
+    );
+}
+
+/** Gives NativeScript's emitted Android JavaScript its published declaration
+ * surface without redirecting execution to declarations. A private virtual
+ * copy keeps the .d.ts dependency graph intact while npm-static continues
+ * resolving runtime imports to .android.js. The module augmentations merge
+ * the public instance surfaces into the real JS classes. */
+function prepareNativeScriptTypeBridge7(
+  host: ts.Ts7Host,
+  entryPath: string,
+): string | null {
+  if (
+    sourcePlatformName() !== "android" ||
+    !isNpmStaticPackage("@nativescript/core")
+  ) {
+    return null;
+  }
+  const runtime = resolveBareModule(
+    entryPath,
+    "@nativescript/core",
+    "js-only",
+  );
+  if (runtime === null) return null;
+  const packageRoot = dirname(runtime.typesFile);
+  const typeRoot = join(packageRoot, ".scriptc-types");
+  const visit = (dir: string): void => {
+    for (const name of readdirSync(dir)) {
+      const path = join(dir, name);
+      const stat = statSync(path);
+      if (stat.isDirectory()) {
+        if (name !== "platforms" && name !== "node_modules") visit(path);
+      } else if (name.endsWith(".d.ts")) {
+        host.addVirtualFile(
+          join(typeRoot, relative(packageRoot, path)),
+          readFileSync(path, "utf8"),
+        );
+      }
+    }
+  };
+  visit(packageRoot);
+  const bridge = join(packageRoot, ".scriptc-core-types.d.ts");
+  host.addVirtualFile(
+    bridge,
+    [
+      'import type { Button as ButtonSurface } from "./.scriptc-types/ui/button/index";',
+      'import type { StackLayout as StackLayoutSurface } from "./.scriptc-types/ui/layouts/stack-layout/index";',
+      'import "./ui/button/index.js";',
+      'import "./ui/layouts/stack-layout/index.js";',
+      'declare module "./ui/button/index.js" {',
+      "  interface Button extends ButtonSurface {}",
+      "}",
+      'declare module "./ui/layouts/stack-layout/index.js" {',
+      "  interface StackLayout extends StackLayoutSurface {}",
+      "}",
+      "",
+    ].join("\n"),
+  );
+  return bridge;
+}
+
 export interface LoadResult {
   program: ts.Program;
   entry: ts.SourceFile;
@@ -199,6 +291,14 @@ export interface LoadResult {
   projectWorld: () => ts.Program;
 }
 
+/** Per-program import routing produced by npm-static ESM tree shaking.
+ * Weakly keyed because a frontend load owns and disposes its checker
+ * program as one unit. */
+const npmStaticRoutedImports = new WeakMap<
+  ts.Program,
+  Map<ts.Statement, ts.SourceFile[]>
+>();
+
 /** See LoadResult.startupCrash: Node's exact error message, the IR error
  * class that carries it (a RUNTIME_ERROR_CLASSES name — %Error for the
  * resolver's ERR_MODULE_NOT_FOUND family, %TypeError for invalid-specifier
@@ -213,26 +313,51 @@ export interface StartupCrash {
 function loadProgram7(host: ts.Ts7Host, entryPath: string): LoadResult & { disposeAll: () => void } {
   const config = adoptProjectConfig7(host, entryPath);
   const nodeTypes = config.configFile ? resolveNodeTypes7(entryPath) : null;
+  const platformTypes = resolvePlatformTypes7(entryPath);
+  const nativeScriptTypeBridge = prepareNativeScriptTypeBridge7(
+    host,
+    entryPath,
+  );
   // skipLibCheck is FORCED with @types/node in the program: checking a
   // third-party lib's internals against OUR lib choice (es2025, no dyn) is
   // not scriptc's fence and drowns real diagnostics in hundreds of
   // .d.ts-internal errors. Fence discipline never depended on it: the
   // lowerer checks provenance and forms at every use site.
-  let options: ts.Ts7CompilerOptions = nodeTypes
+  let options: ts.Ts7CompilerOptions = nodeTypes || platformTypes
     ? { ...config.options, skipLibCheck: true }
     : { ...config.options };
   // --npm-static: opted-in packages' shipped JS must be TYPE-INCLUDED (not
   // just resolved) — without maxNodeModuleJsDepth, node_modules JS types as
   // an implicit-any module (TS7016) and nothing infers. Only flagged
   // compiles pay this; flagless builds keep the exact historical options.
-  if (npmStaticActive()) options.maxNodeModuleJsDepth = 4;
+  // NativeScript Core's real implementation graph is substantially deeper
+  // than small npm utility packages. An opted-in static package must be
+  // admitted in full; truncating the checker graph makes later relative
+  // imports look unresolved and severs class inheritance chains.
+  if (npmStaticActive()) options.maxNodeModuleJsDepth = 64;
   // --provenance-sources: the registered entries become tsconfig "paths"
   // so tsgo's OWN resolution of the bare specifiers lands on the same
   // source files the preflight resolver answers — the checker types the
   // driver against the package's real TypeScript, not its shipped .d.ts.
   const paths = provenancePaths();
-  if (paths !== null) options = { ...options, paths };
-  const coreRoots = [entryPath, ambientDtsPath(), nodeTypes ?? fallbackDtsPath()];
+  if (paths !== null || sourcePlatformName() === "android") {
+    options = {
+      ...options,
+      paths: {
+        ...(paths ?? {}),
+        ...(sourcePlatformName() === "android"
+          ? { "~/*": ["./*"] }
+          : {}),
+      },
+    };
+  }
+  const coreRoots = [
+    entryPath,
+    ambientDtsPath(),
+    nodeTypes ?? fallbackDtsPath(),
+    ...(platformTypes !== null ? [platformTypes] : []),
+    ...(nativeScriptTypeBridge !== null ? [nativeScriptTypeBridge] : []),
+  ];
   const program = ts.createProgram([...coreRoots, overridesDtsPath()], options, host);
   const entry = program.getSourceFile(entryPath);
   if (!entry) throw new Error(`could not load ${entryPath}`);
@@ -293,7 +418,11 @@ export function loadProgram(
   const fsShadow = {
     readFile: (path: string) => {
       const platformSibling = platformSourceSibling(path);
-      if (platformSibling !== null) return ts.sys.readFile(platformSibling);
+      if (platformSibling !== null) {
+        return ts.sys.readFile(platformSibling);
+      }
+      const platformTypeSource = platformTypeSource7(path);
+      if (platformTypeSource !== undefined) return platformTypeSource;
       return npmShadow?.readFile(path);
     },
     hideFile: (path: string) =>
@@ -1466,7 +1595,7 @@ function preflight7(load: LoadResult): {
   // program (see nodeModulesJsSuppressed above): its execution home is the
   // island, so preflight's statement walks skip it — no import fences, no
   // module edges, no statement counts from files the lowering never lowers.
-  const userFiles = program
+  const allUserFiles = program
     .getSourceFiles()
     .filter(
       (sf) =>
@@ -1483,6 +1612,235 @@ function preflight7(load: LoadResult): {
     );
 
   const ambientModules = new Set<string>(SUPPORTED_NODE_MODULES);
+
+  /* Published ESM barrels are written for a bundler: importing three names
+   * from a package root does not make every re-exported implementation part
+   * of the application. TypeScript has already resolved every imported
+   * binding through the barrel chain, so use that authoritative alias to
+   * connect an import directly to the file containing its runtime value.
+   *
+   * This is deliberately package-generic. No NativeScript path or export is
+   * named here: an opted-in npm-static package participates when its
+   * package.json publishes `sideEffects` metadata. Files named by that
+   * metadata are retained, while side-effect-free relay barrels remain type
+   * and binding plumbing rather than program modules. */
+  const checker = program.getTypeChecker();
+  const staticReachable = new Set<ts.SourceFile>();
+  const staticStatementDeps = new Map<ts.Statement, ts.SourceFile[]>();
+  const staticWork: ts.SourceFile[] = [];
+
+  const runtimeSourceOf = (node: ts.Node): ts.SourceFile | null => {
+    let symbol = checker.getSymbolAtLocation(node);
+    if (symbol === undefined) return null;
+    for (let depth = 0; depth < 32; depth++) {
+      if ((symbol.flags & ts.SymbolFlags.Alias) === 0) break;
+      const target = checker.getAliasedSymbol(symbol);
+      if (target === symbol) break;
+      symbol = target;
+    }
+    const declarations = [
+      checker.valueDeclarationOf(symbol),
+      ...checker.declarationsOf(symbol),
+    ];
+    for (const declaration of declarations) {
+      if (declaration === undefined) continue;
+      const source = declaration.getSourceFile();
+      if (source.isDeclarationFile || source.fileName.endsWith(".json")) {
+        continue;
+      }
+      return program.getSourceFile(source.fileName) ?? source;
+    }
+    return null;
+  };
+
+  const resolveRuntimeDep = (
+    from: ts.SourceFile,
+    spec: string,
+  ): ts.SourceFile | null => {
+    if (isRelativeSpecifier(spec)) return resolveImport7(program, from, spec);
+    if (spec.startsWith("#")) {
+      const resolved = resolveProjectImport(from.fileName, spec);
+      return resolved === null ? null : (program.getSourceFile(resolved) ?? null);
+    }
+    const npm = resolveNpmImport7(from.fileName, spec);
+    if (npm === null || !isNpmStaticPackage(npm.packageName)) return null;
+    return npmStaticProgramDep(program, npm.packageName, npm.typesFile);
+  };
+
+  const namespaceRuntimeSources = (
+    sf: ts.SourceFile,
+    binding: ts.Identifier,
+  ): ts.SourceFile[] | null => {
+    const bindingSymbol = checker.getSymbolAtLocation(binding);
+    if (bindingSymbol === undefined) return null;
+    const found = new Set<ts.SourceFile>();
+    let escaped = false;
+    ts.walkPreorder(sf, (node) => {
+      if (
+        ts.isPropertyAccessExpression(node) &&
+        ts.isIdentifier(node.expression) &&
+        checker.getSymbolAtLocation(node.expression) === bindingSymbol
+      ) {
+        const source = runtimeSourceOf(node.name);
+        if (source !== null) found.add(source);
+        return "skip";
+      }
+      if (
+        ts.isIdentifier(node) &&
+        node !== binding &&
+        checker.getSymbolAtLocation(node) === bindingSymbol
+      ) {
+        const parent = node.parent;
+        if (
+          !(
+            parent !== undefined &&
+            ts.isPropertyAccessExpression(parent) &&
+            parent.expression === node
+          )
+        ) {
+          escaped = true;
+        }
+      }
+      return undefined;
+    });
+    return escaped ? null : [...found];
+  };
+
+  const bindingRuntimeSources = (
+    sf: ts.SourceFile,
+    stmt: ts.ImportDeclaration | ts.ExportDeclaration,
+    dep: ts.SourceFile,
+  ): ts.SourceFile[] => {
+    const found = new Set<ts.SourceFile>();
+    const add = (node: ts.Node): void => {
+      const source = runtimeSourceOf(node);
+      if (source !== null) found.add(source);
+    };
+    if (ts.isImportDeclaration(stmt)) {
+      const clause = stmt.importClause;
+      if (clause === undefined) {
+        if (npmStaticFileHasSideEffects(dep.fileName)) found.add(dep);
+      } else {
+        if (clause.name !== undefined) add(clause.name);
+        const bindings = clause.namedBindings;
+        if (bindings !== undefined && ts.isNamedImports(bindings)) {
+          for (const element of bindings.elements) {
+            if (!element.isTypeOnly) add(element.name);
+          }
+        } else if (bindings !== undefined) {
+          const sources = namespaceRuntimeSources(sf, bindings.name);
+          if (sources === null) found.add(dep);
+          else for (const source of sources) found.add(source);
+        }
+      }
+    } else {
+      const clause = stmt.exportClause;
+      if (clause !== undefined && ts.isNamedExports(clause)) {
+        for (const element of clause.elements) {
+          if (!element.isTypeOnly) add(element.name);
+        }
+      } else if (
+        clause !== undefined &&
+        ts.isNamespaceExport(clause)
+      ) {
+        found.add(dep);
+      } else if (npmStaticFileHasSideEffects(dep.fileName)) {
+        // An unused `export *` relay itself disappears, but a module the
+        // package explicitly marked side-effectful must still evaluate.
+        found.add(dep);
+      }
+    }
+    // A direct implementation import can occasionally have no checker
+    // value declaration (dynamic CommonJS surfaces, for example). Keeping
+    // the resolved file is the conservative static answer.
+    if (found.size === 0 && ts.isImportDeclaration(stmt) && stmt.importClause !== undefined) {
+      found.add(dep);
+    }
+    return [...found];
+  };
+
+  const activateStatic = (source: ts.SourceFile): void => {
+    if (
+      npmStaticPackageOfPath(source.fileName) === null ||
+      staticReachable.has(source)
+    ) {
+      return;
+    }
+    staticReachable.add(source);
+    staticWork.push(source);
+  };
+
+  const discoverStatement = (
+    sf: ts.SourceFile,
+    stmt: ts.ImportDeclaration | ts.ExportDeclaration,
+  ): void => {
+    if (
+      stmt.moduleSpecifier === undefined ||
+      !ts.isStringLiteral(stmt.moduleSpecifier)
+    ) {
+      return;
+    }
+    const dep = resolveRuntimeDep(sf, stmt.moduleSpecifier.text);
+    if (dep === null || npmStaticPackageOfPath(dep.fileName) === null) return;
+    const deps = bindingRuntimeSources(sf, stmt, dep).filter(
+      (source) => npmStaticPackageOfPath(source.fileName) !== null,
+    );
+    staticStatementDeps.set(stmt, deps);
+    for (const source of deps) activateStatic(source);
+
+    // A side-effect-free relay can disappear, but its explicit imports of
+    // side-effectful package files cannot. Inspect the relay without
+    // admitting its declarations or top-level statements.
+    if (!staticReachable.has(dep)) {
+      for (const relayStmt of dep.statements) {
+        if (
+          !ts.isImportDeclaration(relayStmt) ||
+          relayStmt.importClause !== undefined ||
+          !ts.isStringLiteral(relayStmt.moduleSpecifier)
+        ) {
+          continue;
+        }
+        const relayDep = resolveRuntimeDep(dep, relayStmt.moduleSpecifier.text);
+        if (
+          relayDep !== null &&
+          npmStaticPackageOfPath(relayDep.fileName) !== null &&
+          npmStaticFileHasSideEffects(relayDep.fileName)
+        ) {
+          const current = staticStatementDeps.get(stmt) ?? [];
+          if (!current.includes(relayDep)) {
+            staticStatementDeps.set(stmt, [relayDep, ...current]);
+          }
+          activateStatic(relayDep);
+        }
+      }
+    }
+  };
+
+  // Seed package reachability from project imports. Static modules added by
+  // those imports recursively discover their own actual value dependencies.
+  for (const sf of allUserFiles) {
+    if (npmStaticPackageOfPath(sf.fileName) !== null) continue;
+    for (const stmt of sf.statements) {
+      if (ts.isImportDeclaration(stmt) || ts.isExportDeclaration(stmt)) {
+        discoverStatement(sf, stmt);
+      }
+    }
+  }
+  for (let at = 0; at < staticWork.length; at++) {
+    const sf = staticWork[at]!;
+    for (const stmt of sf.statements) {
+      if (ts.isImportDeclaration(stmt) || ts.isExportDeclaration(stmt)) {
+        discoverStatement(sf, stmt);
+      }
+    }
+  }
+  npmStaticRoutedImports.set(program, staticStatementDeps);
+
+  const userFiles = allUserFiles.filter(
+    (sf) =>
+      npmStaticPackageOfPath(sf.fileName) === null ||
+      staticReachable.has(sf),
+  );
 
   // Ambient `declare module "name"` declarations anywhere in the program —
   // exact names and `*` patterns — so the import fence can say "type
@@ -1571,6 +1929,17 @@ function preflight7(load: LoadResult): {
         if (stmt.isTypeOnly || erasedTypeOnlyReexport(stmt)) continue;
         if (!stmt.moduleSpecifier) continue;
         const fromSpec = ts.isStringLiteral(stmt.moduleSpecifier) ? stmt.moduleSpecifier.text : "";
+        const routedStaticDeps = staticStatementDeps.get(stmt);
+        if (routedStaticDeps !== undefined) {
+          for (const reDep of routedStaticDeps) {
+            deps.push({ dep: reDep, stmt });
+            depPositions.get(sf)!.push({
+              dep: reDep,
+              pos: stmt.getStart(sf),
+            });
+          }
+          continue;
+        }
         if (!isRelativeSpecifier(fromSpec)) {
           // NAMED re-exports from a SUPPORTED builtin pass (`export { ok }
           // from "node:assert"` — a universal re-export facade facade): the
@@ -1842,7 +2211,12 @@ function preflight7(load: LoadResult): {
             // lexer facade (self-imports of a CJS module included — the
             // partially-built exports are never observed). Any OTHER use
             // keeps the fence.
-            if (!nsBindingUsesAreBareStatements7(program, sf, clause.namedBindings.name)) {
+            const routedStaticNamespace =
+              staticStatementDeps.has(stmt);
+            if (
+              !routedStaticNamespace &&
+              !nsBindingUsesAreBareStatements7(program, sf, clause.namedBindings.name)
+            ) {
               diags.push(unsupportedDiag("SC1013", locOf7(clause.namedBindings), "namespace imports of CommonJS modules"));
             }
           } else if (dep === null && !(!isRelative && ambientModules.has(spec))) {
@@ -1851,8 +2225,19 @@ function preflight7(load: LoadResult): {
         }
       }
       if (dep && !isJson) {
-        deps.push({ dep, stmt });
-        depPositions.get(sf)!.push({ dep, pos: stmt.getStart(sf) });
+        const routedStaticDeps = staticStatementDeps.get(stmt);
+        if (routedStaticDeps !== undefined) {
+          for (const routedDep of routedStaticDeps) {
+            deps.push({ dep: routedDep, stmt });
+            depPositions.get(sf)!.push({
+              dep: routedDep,
+              pos: stmt.getStart(sf),
+            });
+          }
+        } else {
+          deps.push({ dep, stmt });
+          depPositions.get(sf)!.push({ dep, pos: stmt.getStart(sf) });
+        }
       }
     }
     if (isJsSourceFileName(sf.fileName)) {
@@ -2360,11 +2745,17 @@ export function orderedImportsOf(
   sf: ts.SourceFile,
 ): { stmt: ts.Statement; dep: ts.SourceFile | null }[] {
   const out: { stmt: ts.Statement; dep: ts.SourceFile | null }[] = [];
+  const routed = npmStaticRoutedImports.get(program);
   for (const stmt of sf.statements) {
     if (ts.isExportDeclaration(stmt) && (stmt.isTypeOnly || erasedTypeOnlyReexport(stmt) || !stmt.moduleSpecifier)) continue;
     if (!ts.isImportDeclaration(stmt) && !ts.isExportDeclaration(stmt)) continue;
     if (ts.isImportDeclaration(stmt) && erasedTypeOnlyImport(stmt)) continue;
     if (!stmt.moduleSpecifier || !ts.isStringLiteral(stmt.moduleSpecifier)) continue;
+    const routedDeps = routed?.get(stmt);
+    if (routedDeps !== undefined) {
+      for (const dep of routedDeps) out.push({ stmt, dep });
+      continue;
+    }
     const spec = stmt.moduleSpecifier.text;
     const isRelative = isRelativeSpecifier(spec);
     // Relative edges as ever; PROJECT imports (#alias/self-name — the

@@ -89,6 +89,11 @@ import { readFileSync, realpathSync } from "node:fs";
 import { dirname, extname, join, resolve } from "node:path";
 import ts from "typescript5";
 import { cjsLexedExportsOf } from "./cjs-lexer.js";
+import {
+  platformProjectSource,
+  platformSourceSibling,
+  sourcePlatformName,
+} from "./platform-source.js";
 
 export type EmbeddedFormat = "esm" | "cjs" | "json";
 
@@ -1072,6 +1077,19 @@ export class NpmGraphBuilder {
     if (file.endsWith(".mjs")) return "esm";
     if (file.endsWith(".cjs")) return "cjs";
     if (file.endsWith(".json")) return "json";
+    // NativeScript Core is published for a bundler/runtime which treats
+    // its JavaScript as ESM. A few vendored subdirectories retain their
+    // original package.json (without "type":"module") even though Core's
+    // copy was converted to real import/export syntax (e.g. easysax).
+    // Honor the syntax on the NativeScript Android lane instead of
+    // synthesizing a CommonJS facade that loses those named exports.
+    if (
+      sourcePlatformName() === "android" &&
+      /[\\/]@nativescript[\\/]core[\\/]/.test(file)
+    ) {
+      const source = this.host.readFile(file);
+      if (source !== null && /^\s*(?:import|export)\b/m.test(source)) return "esm";
+    }
     for (let dir = dirname(file); ; ) {
       const pkg = this.pkgJsonOf(dir);
       if (pkg) return pkg.type === "module" ? "esm" : "cjs";
@@ -1088,9 +1106,14 @@ export class NpmGraphBuilder {
    * its index files). */
   private resolveFile(path: string, depth = 0): string | null {
     if (depth > 8) return null; // a "main" cycle — refuse quietly
+    const exactPlatform = platformSourceSibling(path);
+    if (exactPlatform !== null) return exactPlatform;
     if (this.host.isFile(path)) return path;
     for (const ext of [".js", ".json", ".mjs", ".cjs", ".node"]) {
-      if (this.host.isFile(path + ext)) return path + ext;
+      const candidate = path + ext;
+      const platform = platformSourceSibling(candidate);
+      if (platform !== null) return platform;
+      if (this.host.isFile(candidate)) return candidate;
     }
     if (this.host.isDirectory(path)) {
       const dir = this.host.realpath(path);
@@ -1101,6 +1124,8 @@ export class NpmGraphBuilder {
       }
       for (const idx of ["index.js", "index.json", "index.mjs", "index.cjs", "index.node"]) {
         const p = join(path, idx);
+        const platform = platformSourceSibling(p);
+        if (platform !== null) return platform;
         if (this.host.isFile(p)) return p;
       }
     }
@@ -1350,7 +1375,19 @@ export class NpmGraphBuilder {
     for (const use of this.specifiersOf(key, source)?.uses ?? []) {
       const spec = use.specifier;
       const eager = !lazy && use.static;
-      if (spec.startsWith("./") || spec.startsWith("../")) {
+      const projectSource = platformProjectSource(spec);
+      if (projectSource !== null) {
+        const to = this.host.realpath(projectSource);
+        pushEdge(key, spec, to, "any");
+        this.walk(to, chain, lazy || !use.static);
+        continue;
+      }
+      if (
+        spec === "." ||
+        spec === ".." ||
+        spec.startsWith("./") ||
+        spec.startsWith("../")
+      ) {
         // A relative file: no conditions apply, so every call form shares
         // one "any" edge. A blocked lazy one embeds the import trap only
         // for import()/static-in-lazy sites — require-reached specs embed

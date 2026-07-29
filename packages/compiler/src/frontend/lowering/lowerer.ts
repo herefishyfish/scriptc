@@ -2939,6 +2939,9 @@ export class Lowerer {
     // TypeError instead of corrupting memory (SEMANTICS.md). Unmarshalable
     // and unextractable types fall through to requireExactShape's fences.
     if (expected.kind === "jsval" && expr.type.kind !== "jsval") {
+      if (isAndroidObjectType(expr.type)) {
+        return { kind: "jsMarshal", value: expr, type: JSVAL, loc: expr.loc };
+      }
       // Bare unit literals: the engine's own undefined/null (units have no
       // other producers, so dropping the operand loses nothing).
       if (isUnitType(expr.type)) {
@@ -2981,6 +2984,9 @@ export class Lowerer {
       return expr;
     }
     if (expr.type.kind === "jsval" && expected.kind !== "jsval") {
+      if (isAndroidObjectType(expected)) {
+        return { kind: "jsExit", value: expr, type: expected, loc: expr.loc };
+      }
       // The jsval→dyn crossing (the world unification's engine-handle
       // kind): an 'any'-typed engine value flowing into an 'unknown'/
       // 'object'/JS-residue slot wraps BY REFERENCE as the checked-dynamic tree's island

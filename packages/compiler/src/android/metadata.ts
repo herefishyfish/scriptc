@@ -35,6 +35,14 @@ export interface AndroidField {
   isFinal: boolean;
 }
 
+export interface AndroidBindingEntry {
+  /** NativeScript's JavaScript-facing dotted namespace/type path. */
+  jsName: string;
+  /** Class.forName-compatible binary name; absent for namespace nodes. */
+  binaryName?: string;
+  kind: "namespace" | "class" | "interface";
+}
+
 export class AndroidMetadata {
   readonly #nodes: RawNode[];
   readonly #names: Buffer;
@@ -91,6 +99,32 @@ export class AndroidMetadata {
 
   hasType(javaName: string): boolean {
     return this.#nodeForName(javaName) !== undefined;
+  }
+
+  /** Compact runtime namespace/type index consumed by the Android island.
+   * It is generated from the same NativeScript metadata tree used for
+   * compile-time descriptor selection, so optional namespace lookups and
+   * nested Java types do not depend on reflection guesses. */
+  bindingEntries(): AndroidBindingEntry[] {
+    const entries: AndroidBindingEntry[] = [];
+    for (const node of this.#nodes) {
+      if (node.id === 0 || node.offsetValue >= ARRAY_OFFSET) continue;
+      const type = this.#nodeType(node);
+      const internalName = this.#typeName(node);
+      if (!internalName || (type & PRIMITIVE) !== 0) continue;
+      const jsName = internalName.replaceAll("/", ".").replaceAll("$", ".");
+      if ((type & (CLASS | INTERFACE)) !== 0) {
+        entries.push({
+          jsName,
+          binaryName: internalName.replaceAll("/", "."),
+          kind: (type & INTERFACE) !== 0 ? "interface" : "class",
+        });
+      } else {
+        entries.push({ jsName, kind: "namespace" });
+      }
+    }
+    entries.sort((a, b) => a.jsName < b.jsName ? -1 : a.jsName > b.jsName ? 1 : 0);
+    return entries;
   }
 
   resolveConstructor(owner: string, args: readonly IrType[]): AndroidMethod {
@@ -173,6 +207,13 @@ export class AndroidMetadata {
   }
 
   #conversionCost(actual: IrType, expected: string): number | null {
+    // Values produced by the embedded JavaScript engine may carry an
+    // Android host object.  Keep this match deliberately below statically
+    // typed Android objects so metadata still selects the most precise
+    // overload when the frontend knows the Java class.
+    if (actual.kind === "jsval") {
+      return expected.length > 1 ? 4 : null;
+    }
     if (actual.kind === "string") {
       if (expected === "java/lang/String") return 0;
       if (expected === "java/lang/CharSequence") return 1;

@@ -30,4 +30,21 @@ console.log('brand →', bag.brand());
 console.log('count * 10 =', bag.count * 10);
 bag.count *= 2;
 console.log('doubled:', bag.count);
+
+// A property first created outside the constructor starts as JavaScript's
+// actual undefined value. Shipped framework JS frequently uses this setter-
+// initialized form, including composite implicit-any values.
+class LateBag {
+  setValue(value) {
+    this.late = value;
+  }
+  read() {
+    return this.late;
+  }
+}
+
+const late = new LateBag();
+console.log('late before:', typeof late.read());
+late.setValue({ answer: 42 });
+console.log('late after:', late.read().answer);
 console.log('take(6) →', bag.take(6));

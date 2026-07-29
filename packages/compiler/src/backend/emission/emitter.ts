@@ -55,6 +55,7 @@ import { emitAsyncScaffolding, childDataThunkFor, childExitThunkFor, childExitTh
 import { emitNpmEmbedding, islandAdapter, islandTypedAdapter } from "./emit-island.js";
 import { emitFunction, emitBlock, emitStmts, emitStmt, emitTryCatch, emitSwitch, mergeBrace, emitBranchInto, emitCondition } from "./emit-stmts.js";
 import { emitExpr } from "./emit-exprs.js";
+import { getAndroidMetadata } from "../../android/metadata.js";
 
 export interface CEmitOptions {
   /** Process contract surrounding the generated module. */
@@ -784,12 +785,22 @@ export class CEmitter {
       `${indent}}`,
     ];
     if (this.options.host === "android") {
+      const androidBindings = getAndroidMetadata().bindingEntries();
+      out.push(`static const ScrAndroidBindingEntry sc_android_bindings[] = {`);
+      const kind = { namespace: 1, class: 2, interface: 3 } as const;
+      for (const binding of androidBindings) {
+        out.push(
+          `  { ${cStringLiteral(Buffer.from(binding.jsName))}, ` +
+            `${binding.binaryName ? cStringLiteral(Buffer.from(binding.binaryName)) : "NULL"}, ` +
+            `${kind[binding.kind]} },`,
+        );
+      }
+      out.push(`};`, ``);
       // Android owns the process entry and UI thread. The generated Java
-      // Activity invokes this JNI entry exactly once from onCreate. The
-      // first Android target deliberately admits the synchronous static
-      // graph only; compileAndroid enforces that before this emitter runs.
-      // A successful entry keeps globals and the JNI bridge alive for UI
-      // callbacks. MainActivity.onDestroy enters the paired shutdown hook.
+      // Activity invokes this JNI entry exactly once from onCreate. A
+      // successful entry keeps globals, the JS island, and the JNI bridge
+      // alive for UI callbacks. MainActivity.onDestroy enters the paired
+      // shutdown hook.
       out.push(
         `static bool sc_android_started = false;`,
         ``,
@@ -806,8 +817,29 @@ export class CEmitter {
         `    scr_android_shutdown();`,
         `    return 1;`,
         `  }`,
+        `  scr_lib_init(0, NULL);`,
+        ...(embedded && embedded.modules.length > 0
+          ? [
+              ...(moduleEmbedsCompressedNpm(this.mod)
+                ? [`  scr_island_set_inflate(scr_zlib_inflate_exact);`]
+                : []),
+              `  scr_island_modules(sc_npm_modules, ${embedded.modules.length}, ` +
+                `${embedded.edges.length > 0 ? "sc_npm_edges" : "NULL"}, ${embedded.edges.length});`,
+            ]
+          : []),
+        `  scr_island_android_metadata(sc_android_bindings, ${androidBindings.length});`,
         `  ${mangleFunction(this.mod.entry)}();`,
         ...(this.mayThrow.has(this.mod.entry) ? uncaught("  ") : []),
+        ...(hasAsync || hasGenerators || this.usesTimers || usesIsland
+          ? [
+              `  bool sc_loop_rejection = scr_loop_run(NULL);`,
+              ...uncaught("  "),
+              `  if (sc_loop_rejection) {`,
+              `    scr_discard_unhandled_rejections();`,
+              `    ${needsRelease ? `${runExitListeners}sc_release_globals(); ` : ""}scr_android_shutdown(); return 1;`,
+              `  }`,
+            ]
+          : []),
         `  sc_android_started = true;`,
         `  return 0;`,
         `}`,
@@ -1564,6 +1596,9 @@ export class CEmitter {
   undefFieldInitLineC(name: string, t: IrType): string[] {
     if (t.kind === "jsval") {
       return [`  o->${mangleField(name)} = scr_jsval_undefined(); /* ${name} starts undefined */`];
+    }
+    if (t.kind === "dyn") {
+      return [`  o->${mangleField(name)} = scr_dyn_retain(scr_dyn_undefined()); /* ${name} starts undefined */`];
     }
     const tag = this.undefinedArmTag(t);
     if (tag < 0 || t.kind !== "union") return [];

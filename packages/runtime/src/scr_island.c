@@ -38,6 +38,10 @@
 #include <string.h>
 
 #include "quickjs.h"
+#ifdef __ANDROID__
+#include <android/log.h>
+#include "scr_android.h"
+#endif
 
 #if defined(__APPLE__)
 #include <malloc/malloc.h>
@@ -224,6 +228,8 @@ static const char *isl_edge_find(const char *from, const char *spec, int want) {
 static void isl_install_module_loader(void);
 /* Defined with the host-function machinery below; called from isl_init. */
 static void isl_register_hostfn_class(void);
+/* Defined with the Android host-object bridge below; a no-op elsewhere. */
+static void isl_android_boot(void);
 /* Defined with the island → static promise bridge below; called from the
  * host-function registration (both classes register together). */
 static void isl_register_bridge_class(void);
@@ -343,6 +349,19 @@ static bool isl_report_rejections(bool print) {
     const char *msg = JS_ToCString(isl_ctx, isl_rejections->reason);
     if (msg) {
       fputs(msg, stderr);
+#ifdef __ANDROID__
+      __android_log_print(
+          ANDROID_LOG_ERROR, "scriptc-js",
+          "Unhandled promise rejection: %s", msg);
+      JSValue stack = JS_GetPropertyStr(isl_ctx, isl_rejections->reason, "stack");
+      const char *stack_text =
+          JS_IsException(stack) ? NULL : JS_ToCString(isl_ctx, stack);
+      if (stack_text) {
+        __android_log_print(ANDROID_LOG_ERROR, "scriptc-js", "%s", stack_text);
+        JS_FreeCString(isl_ctx, stack_text);
+      }
+      JS_FreeValue(isl_ctx, stack);
+#endif
       JS_FreeCString(isl_ctx, msg);
     } else {
       /* String(reason) itself threw (a symbol): clear it, keep the same
@@ -576,6 +595,10 @@ static void isl_init(void) {
   /* Host-function class (closures entering the island): registered
    * eagerly — the id must exist before any from_closure call. */
   isl_register_hostfn_class();
+  /* Android's Java namespace/object bridge depends on the opaque host class
+   * registered above. scr_android_init has already captured the Activity and
+   * JNIEnv before generated Android entry code can first enter the island. */
+  isl_android_boot();
   /* LIFO: registered after scr_init's handlers, so teardown runs before
    * the cycle collection + RC audit — the audit sees the engine gone. */
   atexit(isl_teardown_at_exit);
@@ -764,6 +787,15 @@ static ScrStr *isl_prop_str(JSValueConst obj, const char *prop, const char *fall
  * promise bridge (isl_bridge_settle). */
 static void isl_throw_reason(JSValueConst exc) {
   if (JS_IsError(exc)) {
+#ifdef __ANDROID__
+    JSValue stack = JS_GetPropertyStr(isl_ctx, exc, "stack");
+    const char *stack_text = JS_IsException(stack) ? NULL : JS_ToCString(isl_ctx, stack);
+    if (stack_text) {
+      __android_log_print(ANDROID_LOG_ERROR, "scriptc-js", "%s", stack_text);
+      JS_FreeCString(isl_ctx, stack_text);
+    }
+    JS_FreeValue(isl_ctx, stack);
+#endif
     scr_throw_error_named(isl_prop_str(exc, "name", "Error"),
                            isl_prop_str(exc, "message", ""));
     return;
@@ -926,6 +958,635 @@ static ScrJsval *isl_cell_new(JSValue v) {
 #endif
   return c;
 }
+
+#ifdef __ANDROID__
+static JSClassID isl_android_ref_class_id;
+static jclass isl_android_runtime_class;
+static jclass isl_android_boolean_class;
+static jclass isl_android_number_class;
+static jclass isl_android_string_class;
+static jmethodID isl_android_class_exists_id;
+static jmethodID isl_android_get_static_id;
+static jmethodID isl_android_get_property_id;
+static jmethodID isl_android_has_method_id;
+static jmethodID isl_android_has_static_method_id;
+static jmethodID isl_android_construct_id;
+static jmethodID isl_android_invoke_id;
+static jmethodID isl_android_invoke_static_id;
+static jmethodID isl_android_create_js_proxy_id;
+static jmethodID isl_android_boolean_value_id;
+static jmethodID isl_android_double_value_id;
+static const ScrAndroidBindingEntry *isl_android_bindings;
+static size_t isl_android_binding_count;
+
+typedef struct IslAndroidJsProxy {
+  JSValue object;
+  struct IslAndroidJsProxy *next;
+} IslAndroidJsProxy;
+static IslAndroidJsProxy *isl_android_js_proxies;
+
+void scr_island_android_metadata(const ScrAndroidBindingEntry *entries,
+                                 size_t count) {
+  isl_android_bindings = entries;
+  isl_android_binding_count = count;
+}
+
+static const ScrAndroidBindingEntry *
+isl_android_binding_find(const char *name) {
+  size_t lo = 0, hi = isl_android_binding_count;
+  while (lo < hi) {
+    size_t mid = lo + (hi - lo) / 2;
+    int cmp = strcmp(name, isl_android_bindings[mid].js_name);
+    if (cmp == 0) return &isl_android_bindings[mid];
+    if (cmp < 0) hi = mid;
+    else lo = mid + 1;
+  }
+  return NULL;
+}
+
+static void isl_android_ref_finalizer(JSRuntime *rt, JSValueConst value) {
+  (void)rt;
+  ScrAndroidRef *ref = JS_GetOpaque(value, isl_android_ref_class_id);
+  if (ref) scr_android_ref_release(ref);
+}
+
+static const JSClassDef isl_android_ref_class = {
+    .class_name = "AndroidObject",
+    .finalizer = isl_android_ref_finalizer,
+};
+
+static void isl_register_android_class(void) {
+  JNIEnv *env = scr_android_get_env();
+  JS_NewClassID(isl_rt, &isl_android_ref_class_id);
+  JS_NewClass(isl_rt, isl_android_ref_class_id, &isl_android_ref_class);
+  jclass local = (*env)->FindClass(env, "org/scriptc/runtime/ScriptcRuntime");
+  isl_android_runtime_class = (jclass)(*env)->NewGlobalRef(env, local);
+  (*env)->DeleteLocalRef(env, local);
+  local = (*env)->FindClass(env, "java/lang/Boolean");
+  isl_android_boolean_class = (jclass)(*env)->NewGlobalRef(env, local);
+  (*env)->DeleteLocalRef(env, local);
+  local = (*env)->FindClass(env, "java/lang/Number");
+  isl_android_number_class = (jclass)(*env)->NewGlobalRef(env, local);
+  (*env)->DeleteLocalRef(env, local);
+  local = (*env)->FindClass(env, "java/lang/String");
+  isl_android_string_class = (jclass)(*env)->NewGlobalRef(env, local);
+  (*env)->DeleteLocalRef(env, local);
+  isl_android_class_exists_id = (*env)->GetStaticMethodID(
+      env, isl_android_runtime_class, "classExists", "(Ljava/lang/String;)Z");
+  isl_android_get_static_id = (*env)->GetStaticMethodID(
+      env, isl_android_runtime_class, "getStatic",
+      "(Ljava/lang/String;Ljava/lang/String;)[Ljava/lang/Object;");
+  isl_android_get_property_id = (*env)->GetStaticMethodID(
+      env, isl_android_runtime_class, "getProperty",
+      "(Ljava/lang/Object;Ljava/lang/String;)[Ljava/lang/Object;");
+  isl_android_has_method_id = (*env)->GetStaticMethodID(
+      env, isl_android_runtime_class, "hasMethod",
+      "(Ljava/lang/Object;Ljava/lang/String;)Z");
+  isl_android_has_static_method_id = (*env)->GetStaticMethodID(
+      env, isl_android_runtime_class, "hasStaticMethod",
+      "(Ljava/lang/String;Ljava/lang/String;)Z");
+  isl_android_construct_id = (*env)->GetStaticMethodID(
+      env, isl_android_runtime_class, "construct",
+      "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/Object;");
+  isl_android_invoke_id = (*env)->GetStaticMethodID(
+      env, isl_android_runtime_class, "invoke",
+      "(Ljava/lang/Object;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/Object;");
+  isl_android_invoke_static_id = (*env)->GetStaticMethodID(
+      env, isl_android_runtime_class, "invokeStatic",
+      "(Ljava/lang/String;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/Object;");
+  isl_android_create_js_proxy_id = (*env)->GetStaticMethodID(
+      env, isl_android_runtime_class, "createJsProxy",
+      "(Ljava/lang/String;J)Ljava/lang/Object;");
+  isl_android_boolean_value_id = (*env)->GetMethodID(
+      env, isl_android_boolean_class, "booleanValue", "()Z");
+  isl_android_double_value_id = (*env)->GetMethodID(
+      env, isl_android_number_class, "doubleValue", "()D");
+}
+
+static JSValue isl_android_jni_exception(JSContext *ctx, const char *operation) {
+  JNIEnv *env = scr_android_get_env();
+  if ((*env)->ExceptionCheck(env)) {
+    (*env)->ExceptionDescribe(env);
+    (*env)->ExceptionClear(env);
+  }
+  return JS_ThrowInternalError(ctx, "Android binding failed in %s", operation);
+}
+
+static JSValue isl_android_value_to_js(JSContext *ctx, jobject value) {
+  JNIEnv *env = scr_android_get_env();
+  if (!value) return JS_NULL;
+  if ((*env)->IsInstanceOf(env, value, isl_android_boolean_class)) {
+    return JS_NewBool(ctx, (*env)->CallBooleanMethod(
+        env, value, isl_android_boolean_value_id));
+  }
+  if ((*env)->IsInstanceOf(env, value, isl_android_number_class)) {
+    return JS_NewFloat64(ctx, (*env)->CallDoubleMethod(
+        env, value, isl_android_double_value_id));
+  }
+  if ((*env)->IsInstanceOf(env, value, isl_android_string_class)) {
+    const char *text = (*env)->GetStringUTFChars(env, (jstring)value, NULL);
+    JSValue result = JS_NewString(ctx, text ? text : "");
+    if (text) (*env)->ReleaseStringUTFChars(env, (jstring)value, text);
+    return result;
+  }
+  ScrAndroidRef *ref = scr_android_ref_from_local(value);
+  JSValue object = JS_NewObjectClass(ctx, isl_android_ref_class_id);
+  JS_SetOpaque(object, ref);
+  return object;
+}
+
+static jobject isl_android_js_proxy(JSContext *ctx, JSValueConst value,
+                                    const char *interface_name) {
+  JNIEnv *env = scr_android_get_env();
+  IslAndroidJsProxy *binding = calloc(1, sizeof *binding);
+  if (!binding) {
+    JS_ThrowOutOfMemory(ctx);
+    return NULL;
+  }
+  binding->object = JS_DupValue(ctx, value);
+  binding->next = isl_android_js_proxies;
+  isl_android_js_proxies = binding;
+  jstring name = (*env)->NewStringUTF(env, interface_name);
+  jobject proxy = (*env)->CallStaticObjectMethod(
+      env, isl_android_runtime_class, isl_android_create_js_proxy_id,
+      name, (jlong)(intptr_t)binding);
+  (*env)->DeleteLocalRef(env, name);
+  if ((*env)->ExceptionCheck(env) || !proxy) {
+    if ((*env)->ExceptionCheck(env)) {
+      (*env)->ExceptionDescribe(env);
+      (*env)->ExceptionClear(env);
+    }
+    isl_android_js_proxies = binding->next;
+    JS_FreeValue(ctx, binding->object);
+    free(binding);
+    JS_ThrowTypeError(ctx, "cannot implement Java interface %s", interface_name);
+    return NULL;
+  }
+  return proxy;
+}
+
+static ScrAndroidRef *isl_android_unwrap_ref(JSContext *ctx,
+                                             JSValueConst value) {
+  ScrAndroidRef *ref = JS_GetOpaque(value, isl_android_ref_class_id);
+  if (ref || !JS_IsObject(value)) return ref;
+  JSValue raw = JS_GetPropertyStr(ctx, value, "__scr_android_raw");
+  if (JS_IsException(raw)) return NULL;
+  ref = JS_GetOpaque(raw, isl_android_ref_class_id);
+  JS_FreeValue(ctx, raw);
+  return ref;
+}
+
+static jobject isl_android_js_to_value(JSContext *ctx, JSValueConst value) {
+  JNIEnv *env = scr_android_get_env();
+  if (JS_IsNull(value) || JS_IsUndefined(value)) return NULL;
+  ScrAndroidRef *ref = isl_android_unwrap_ref(ctx, value);
+  if (ref) return (*env)->NewLocalRef(env, ref->value);
+  if (JS_IsString(value)) {
+    const char *text = JS_ToCString(ctx, value);
+    jstring result = (*env)->NewStringUTF(env, text ? text : "");
+    if (text) JS_FreeCString(ctx, text);
+    return result;
+  }
+  if (JS_IsBool(value)) {
+    jclass cls = isl_android_boolean_class;
+    jmethodID value_of = (*env)->GetStaticMethodID(
+        env, cls, "valueOf", "(Z)Ljava/lang/Boolean;");
+    return (*env)->CallStaticObjectMethod(
+        env, cls, value_of, JS_ToBool(ctx, value));
+  }
+  if (JS_IsNumber(value)) {
+    double number = 0;
+    JS_ToFloat64(ctx, &number, value);
+    jclass cls = (*env)->FindClass(env, "java/lang/Double");
+    jmethodID value_of = (*env)->GetStaticMethodID(
+        env, cls, "valueOf", "(D)Ljava/lang/Double;");
+    jobject result = (*env)->CallStaticObjectMethod(env, cls, value_of, number);
+    (*env)->DeleteLocalRef(env, cls);
+    return result;
+  }
+  if (JS_IsObject(value)) {
+    JSValue interfaces = JS_GetPropertyStr(ctx, value, "__scr_interfaces");
+    if (!JS_IsException(interfaces) && JS_IsArray(interfaces)) {
+      JSValue first = JS_GetPropertyUint32(ctx, interfaces, 0);
+      const char *name = JS_IsString(first) ? JS_ToCString(ctx, first) : NULL;
+      jobject result = name ? isl_android_js_proxy(ctx, value, name) : NULL;
+      if (name) JS_FreeCString(ctx, name);
+      JS_FreeValue(ctx, first);
+      JS_FreeValue(ctx, interfaces);
+      return result;
+    }
+    JS_FreeValue(ctx, interfaces);
+  }
+  return NULL;
+}
+
+static jobjectArray isl_android_args(JSContext *ctx, JSValueConst value) {
+  JNIEnv *env = scr_android_get_env();
+  uint32_t length = 0;
+  JSValue len = JS_GetPropertyStr(ctx, value, "length");
+  JS_ToUint32(ctx, &length, len);
+  JS_FreeValue(ctx, len);
+  jclass object_class = (*env)->FindClass(env, "java/lang/Object");
+  jobjectArray result = (*env)->NewObjectArray(env, (jsize)length, object_class, NULL);
+  (*env)->DeleteLocalRef(env, object_class);
+  for (uint32_t i = 0; i < length; i++) {
+    JSValue item = JS_GetPropertyUint32(ctx, value, i);
+    jobject converted = isl_android_js_to_value(ctx, item);
+    JS_FreeValue(ctx, item);
+    (*env)->SetObjectArrayElement(env, result, (jsize)i, converted);
+    if (converted) (*env)->DeleteLocalRef(env, converted);
+  }
+  return result;
+}
+
+static JSValue isl_android_class_exists(JSContext *ctx, JSValueConst this_val,
+                                        int argc, JSValueConst *argv) {
+  (void)this_val; (void)argc;
+  JNIEnv *env = scr_android_get_env();
+  const char *path = JS_ToCString(ctx, argv[0]);
+  jstring name = (*env)->NewStringUTF(env, path ? path : "");
+  if (path) JS_FreeCString(ctx, path);
+  jboolean result = (*env)->CallStaticBooleanMethod(
+      env, isl_android_runtime_class, isl_android_class_exists_id, name);
+  (*env)->DeleteLocalRef(env, name);
+  if ((*env)->ExceptionCheck(env)) return isl_android_jni_exception(ctx, "classExists");
+  return JS_NewBool(ctx, result);
+}
+
+static JSValue isl_android_is_object(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv) {
+  (void)this_val; (void)argc;
+  return JS_NewBool(ctx,
+      JS_GetOpaque(argv[0], isl_android_ref_class_id) != NULL);
+}
+
+static JSValue isl_android_current_application(JSContext *ctx,
+                                               JSValueConst this_val,
+                                               int argc,
+                                               JSValueConst *argv) {
+  (void)this_val; (void)argc; (void)argv;
+  JNIEnv *env = scr_android_get_env();
+  ScrAndroidRef *activity = scr_android_current_activity();
+  if (!activity) return JS_EXCEPTION;
+  jclass activity_class = (*env)->GetObjectClass(env, activity->value);
+  jmethodID get_application = activity_class
+      ? (*env)->GetMethodID(
+            env, activity_class, "getApplication", "()Landroid/app/Application;")
+      : NULL;
+  jobject application = get_application
+      ? (*env)->CallObjectMethod(env, activity->value, get_application)
+      : NULL;
+  if (activity_class) (*env)->DeleteLocalRef(env, activity_class);
+  scr_android_ref_release(activity);
+  if ((*env)->ExceptionCheck(env) || !get_application) {
+    if (application) (*env)->DeleteLocalRef(env, application);
+    return isl_android_jni_exception(ctx, "current application");
+  }
+  JSValue result = isl_android_value_to_js(ctx, application);
+  if (application) (*env)->DeleteLocalRef(env, application);
+  return result;
+}
+
+static JSValue isl_android_binding(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv) {
+  (void)this_val; (void)argc;
+  const char *name = JS_ToCString(ctx, argv[0]);
+  if (!name) return JS_EXCEPTION;
+  const ScrAndroidBindingEntry *entry = isl_android_binding_find(name);
+  JS_FreeCString(ctx, name);
+  if (!entry) return JS_UNDEFINED;
+  JSValue result = JS_NewArray(ctx);
+  JS_SetPropertyUint32(ctx, result, 0, JS_NewInt32(ctx, entry->kind));
+  JS_SetPropertyUint32(
+      ctx, result, 1,
+      entry->binary_name ? JS_NewString(ctx, entry->binary_name) : JS_NULL);
+  return result;
+}
+
+static JSValue isl_android_lookup_result(JSContext *ctx, jobjectArray pair) {
+  JNIEnv *env = scr_android_get_env();
+  if (!pair) return isl_android_jni_exception(ctx, "property lookup");
+  jobject found = (*env)->GetObjectArrayElement(env, pair, 0);
+  jboolean yes = (*env)->CallBooleanMethod(
+      env, found, isl_android_boolean_value_id);
+  (*env)->DeleteLocalRef(env, found);
+  if (!yes) return JS_UNDEFINED;
+  jobject value = (*env)->GetObjectArrayElement(env, pair, 1);
+  JSValue result = isl_android_value_to_js(ctx, value);
+  if (value) (*env)->DeleteLocalRef(env, value);
+  return result;
+}
+
+static JSValue isl_android_static_get(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv) {
+  (void)this_val; (void)argc;
+  JNIEnv *env = scr_android_get_env();
+  const char *a = JS_ToCString(ctx, argv[0]);
+  const char *b = JS_ToCString(ctx, argv[1]);
+  jstring cls = (*env)->NewStringUTF(env, a ? a : "");
+  jstring prop = (*env)->NewStringUTF(env, b ? b : "");
+  if (a) JS_FreeCString(ctx, a);
+  if (b) JS_FreeCString(ctx, b);
+  jobjectArray pair = (jobjectArray)(*env)->CallStaticObjectMethod(
+      env, isl_android_runtime_class, isl_android_get_static_id, cls, prop);
+  (*env)->DeleteLocalRef(env, cls);
+  (*env)->DeleteLocalRef(env, prop);
+  if ((*env)->ExceptionCheck(env)) return isl_android_jni_exception(ctx, "static get");
+  JSValue result = isl_android_lookup_result(ctx, pair);
+  (*env)->DeleteLocalRef(env, pair);
+  return result;
+}
+
+static JSValue isl_android_object_get(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv) {
+  (void)this_val; (void)argc;
+  JNIEnv *env = scr_android_get_env();
+  ScrAndroidRef *receiver = JS_GetOpaque(argv[0], isl_android_ref_class_id);
+  const char *b = JS_ToCString(ctx, argv[1]);
+  jstring prop = (*env)->NewStringUTF(env, b ? b : "");
+  if (b) JS_FreeCString(ctx, b);
+  jobjectArray pair = (jobjectArray)(*env)->CallStaticObjectMethod(
+      env, isl_android_runtime_class, isl_android_get_property_id,
+      receiver ? receiver->value : NULL, prop);
+  (*env)->DeleteLocalRef(env, prop);
+  if ((*env)->ExceptionCheck(env)) return isl_android_jni_exception(ctx, "property get");
+  JSValue result = isl_android_lookup_result(ctx, pair);
+  (*env)->DeleteLocalRef(env, pair);
+  return result;
+}
+
+static JSValue isl_android_has_method(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv) {
+  (void)this_val; (void)argc;
+  JNIEnv *env = scr_android_get_env();
+  ScrAndroidRef *receiver = isl_android_unwrap_ref(ctx, argv[0]);
+  const char *text = JS_ToCString(ctx, argv[1]);
+  jstring name = (*env)->NewStringUTF(env, text ? text : "");
+  if (text) JS_FreeCString(ctx, text);
+  jboolean result = (*env)->CallStaticBooleanMethod(
+      env, isl_android_runtime_class, isl_android_has_method_id,
+      receiver ? receiver->value : NULL, name);
+  (*env)->DeleteLocalRef(env, name);
+  if ((*env)->ExceptionCheck(env))
+    return isl_android_jni_exception(ctx, "instance method lookup");
+  return JS_NewBool(ctx, result);
+}
+
+static JSValue isl_android_has_static_method(JSContext *ctx,
+                                             JSValueConst this_val,
+                                             int argc,
+                                             JSValueConst *argv) {
+  (void)this_val; (void)argc;
+  JNIEnv *env = scr_android_get_env();
+  const char *class_text = JS_ToCString(ctx, argv[0]);
+  const char *name_text = JS_ToCString(ctx, argv[1]);
+  jstring class_name = (*env)->NewStringUTF(env, class_text ? class_text : "");
+  jstring name = (*env)->NewStringUTF(env, name_text ? name_text : "");
+  if (class_text) JS_FreeCString(ctx, class_text);
+  if (name_text) JS_FreeCString(ctx, name_text);
+  jboolean result = (*env)->CallStaticBooleanMethod(
+      env, isl_android_runtime_class, isl_android_has_static_method_id,
+      class_name, name);
+  (*env)->DeleteLocalRef(env, class_name);
+  (*env)->DeleteLocalRef(env, name);
+  if ((*env)->ExceptionCheck(env))
+    return isl_android_jni_exception(ctx, "static method lookup");
+  return JS_NewBool(ctx, result);
+}
+
+static JSValue isl_android_construct_host(JSContext *ctx, JSValueConst this_val,
+                                          int argc, JSValueConst *argv) {
+  (void)this_val; (void)argc;
+  JNIEnv *env = scr_android_get_env();
+  const char *a = JS_ToCString(ctx, argv[0]);
+  jstring cls = (*env)->NewStringUTF(env, a ? a : "");
+  if (a) JS_FreeCString(ctx, a);
+  jobjectArray args = isl_android_args(ctx, argv[1]);
+  jobject value = (*env)->CallStaticObjectMethod(
+      env, isl_android_runtime_class, isl_android_construct_id, cls, args);
+  (*env)->DeleteLocalRef(env, cls);
+  (*env)->DeleteLocalRef(env, args);
+  if ((*env)->ExceptionCheck(env)) return isl_android_jni_exception(ctx, "constructor");
+  JSValue result = isl_android_value_to_js(ctx, value);
+  if (value) (*env)->DeleteLocalRef(env, value);
+  return result;
+}
+
+static JSValue isl_android_invoke_host(JSContext *ctx, JSValueConst this_val,
+                                       int argc, JSValueConst *argv) {
+  (void)this_val; (void)argc;
+  JNIEnv *env = scr_android_get_env();
+  ScrAndroidRef *receiver = JS_GetOpaque(argv[0], isl_android_ref_class_id);
+  const char *b = JS_ToCString(ctx, argv[1]);
+  jstring name = (*env)->NewStringUTF(env, b ? b : "");
+  if (b) JS_FreeCString(ctx, b);
+  jobjectArray args = isl_android_args(ctx, argv[2]);
+  jobject value = (*env)->CallStaticObjectMethod(
+      env, isl_android_runtime_class, isl_android_invoke_id,
+      receiver ? receiver->value : NULL, name, args);
+  (*env)->DeleteLocalRef(env, name);
+  (*env)->DeleteLocalRef(env, args);
+  if ((*env)->ExceptionCheck(env)) return isl_android_jni_exception(ctx, "method call");
+  JSValue result = isl_android_value_to_js(ctx, value);
+  if (value) (*env)->DeleteLocalRef(env, value);
+  return result;
+}
+
+static JSValue isl_android_invoke_static_host(JSContext *ctx,
+                                              JSValueConst this_val,
+                                              int argc,
+                                              JSValueConst *argv) {
+  (void)this_val; (void)argc;
+  JNIEnv *env = scr_android_get_env();
+  const char *a = JS_ToCString(ctx, argv[0]);
+  const char *b = JS_ToCString(ctx, argv[1]);
+  jstring cls = (*env)->NewStringUTF(env, a ? a : "");
+  jstring name = (*env)->NewStringUTF(env, b ? b : "");
+  if (a) JS_FreeCString(ctx, a);
+  if (b) JS_FreeCString(ctx, b);
+  jobjectArray args = isl_android_args(ctx, argv[2]);
+  jobject value = (*env)->CallStaticObjectMethod(
+      env, isl_android_runtime_class, isl_android_invoke_static_id,
+      cls, name, args);
+  (*env)->DeleteLocalRef(env, cls);
+  (*env)->DeleteLocalRef(env, name);
+  (*env)->DeleteLocalRef(env, args);
+  if ((*env)->ExceptionCheck(env))
+    return isl_android_jni_exception(ctx, "static method call");
+  JSValue result = isl_android_value_to_js(ctx, value);
+  if (value) (*env)->DeleteLocalRef(env, value);
+  return result;
+}
+
+static JSValue isl_android_interface_host(JSContext *ctx,
+                                          JSValueConst this_val,
+                                          int argc,
+                                          JSValueConst *argv) {
+  (void)this_val; (void)argc;
+  const char *name = JS_ToCString(ctx, argv[0]);
+  if (!name) return JS_EXCEPTION;
+  jobject proxy = isl_android_js_proxy(ctx, argv[1], name);
+  JS_FreeCString(ctx, name);
+  if (!proxy) return JS_EXCEPTION;
+  JSValue result = isl_android_value_to_js(ctx, proxy);
+  (*scr_android_get_env())->DeleteLocalRef(scr_android_get_env(), proxy);
+  return result;
+}
+
+static void isl_android_boot(void) {
+  JSValue global = JS_GetGlobalObject(isl_ctx);
+#define ISL_ANDROID_FN(name, fn, arity) \
+  JS_SetPropertyStr(isl_ctx, global, name, \
+                    JS_NewCFunction(isl_ctx, fn, name, arity))
+  ISL_ANDROID_FN("__scr_android_class_exists", isl_android_class_exists, 1);
+  ISL_ANDROID_FN("__scr_android_is_object", isl_android_is_object, 1);
+  ISL_ANDROID_FN("__scr_android_current_application",
+                 isl_android_current_application, 0);
+  ISL_ANDROID_FN("__scr_android_binding", isl_android_binding, 1);
+  ISL_ANDROID_FN("__scr_android_static_get", isl_android_static_get, 2);
+  ISL_ANDROID_FN("__scr_android_object_get", isl_android_object_get, 2);
+  ISL_ANDROID_FN("__scr_android_has_method", isl_android_has_method, 2);
+  ISL_ANDROID_FN("__scr_android_has_static_method",
+                 isl_android_has_static_method, 2);
+  ISL_ANDROID_FN("__scr_android_construct", isl_android_construct_host, 2);
+  ISL_ANDROID_FN("__scr_android_invoke", isl_android_invoke_host, 3);
+  ISL_ANDROID_FN("__scr_android_invoke_static", isl_android_invoke_static_host, 3);
+  ISL_ANDROID_FN("__scr_android_interface", isl_android_interface_host, 2);
+#undef ISL_ANDROID_FN
+  static const char bootstrap[] =
+      "(()=>{"
+      "const wrap=v=>__scr_android_is_object(v)?new Proxy(v,{get:(o,p)=>{"
+      "if(p==='__scr_android_raw')return o;"
+      "if(typeof p==='symbol'||Reflect.has(o,p))return Reflect.get(o,p);"
+      "const x=__scr_android_object_get(o,String(p));"
+      "if(x!==undefined)return wrap(x);"
+      "return __scr_android_has_method(o,String(p))?"
+      "((...a)=>wrap(__scr_android_invoke(o,String(p),a))):undefined},"
+      "set:(o,p,v)=>(Reflect.set(o,p,v),true)}):v;"
+      "const extend=(base,argv)=>{const impl=argv[argv.length-1]||{};"
+      "function Extended(...a){Object.assign(this,impl);if(typeof this.init==='function')this.init(...a);}"
+      "Extended.prototype=Object.assign(Object.create(base.prototype),impl);"
+      "Object.defineProperty(Extended.prototype,'constructor',{value:Extended});return Extended};"
+      "const path=n=>{const target=function(){};return new Proxy(target,{get:(t,p)=>{"
+      "if(p==='prototype')return t.prototype;if(p==='__scr_android_type')return __scr_android_binding(n);"
+      "if(typeof p==='symbol'||Reflect.has(t,p))return Reflect.get(t,p);"
+      "const s=String(p),q=n+'.'+s;"
+      "const child=__scr_android_binding(q);if(child!==undefined)return path(q);"
+      "const here=__scr_android_binding(n);if(here===undefined||here[0]===1)return undefined;"
+      "if(s==='extend')return(...a)=>extend(t,a);"
+      "const x=__scr_android_static_get(here[1],s);if(x!==undefined)return wrap(x);"
+      "return __scr_android_has_static_method(here[1],s)?"
+      "((...a)=>wrap(__scr_android_invoke_static(here[1],s,a))):undefined},"
+      "construct:(_,a)=>{const i=__scr_android_binding(n);"
+      "if(i===undefined||i[0]===1)throw new TypeError(n+' is not a Java type');"
+      "if(i[0]===3)return wrap(__scr_android_interface(i[1],a[0]||{}));"
+      "return wrap(__scr_android_construct(i[1],a))}})};"
+      "for(const n of ['android','androidx','java','javax','org','com'])globalThis[n]=path(n);"
+      "Object.defineProperty(globalThis.com,'tns',{value:{NativeScriptApplication:{"
+      "getInstance:()=>wrap(__scr_android_current_application())}}});"
+      "globalThis.__ANDROID__=true;globalThis.__IOS__=false;"
+      "globalThis.__VISIONOS__=false;globalThis.__APPLE__=false;"
+      "globalThis.__DEV__=false;globalThis.__COMMONJS__=false;"
+      "globalThis.__CSS_PARSER__='css-tree';"
+      "globalThis.__UI_USE_EXTERNAL_RENDERER__=false;globalThis.__UI_USE_XML_PARSER__=false;"
+      "globalThis.global=globalThis;globalThis.__native=x=>x;"
+      "if(typeof WeakRef==='function'&&WeakRef.prototype&&"
+      "typeof WeakRef.prototype.get!=='function'&&typeof WeakRef.prototype.deref==='function')"
+      "Object.defineProperty(WeakRef.prototype,'get',{value:WeakRef.prototype.deref});"
+      "globalThis.Interfaces=types=>ctor=>{const names=types.map(t=>t.__scr_android_type[1]);"
+      "Object.defineProperty(ctor.prototype,'__scr_interfaces',{value:names});return ctor};"
+      "})();";
+  JSValue result = JS_Eval(isl_ctx, bootstrap, sizeof bootstrap - 1,
+                           "<scr-android>", JS_EVAL_TYPE_GLOBAL);
+  JS_FreeValue(isl_ctx, result);
+  JS_FreeValue(isl_ctx, global);
+}
+
+ScrJsval *scr_jsval_from_android(ScrAndroidRef *ref) {
+  if (!ref) return scr_jsval_null();
+  isl_entry();
+  JSValue object = JS_NewObjectClass(isl_ctx, isl_android_ref_class_id);
+  if (JS_IsException(object)) {
+    isl_bridge_exception();
+    return NULL;
+  }
+  JS_SetOpaque(object, scr_android_ref_retain(ref));
+  return isl_cell_new(object);
+}
+
+ScrAndroidRef *scr_jsval_exit_android(ScrJsval *value,
+                                      const char *expected_class) {
+  (void)expected_class;
+  if (!value) return NULL;
+  isl_entry();
+  ScrAndroidRef *ref = isl_android_unwrap_ref(isl_ctx, value->v);
+  if (!ref) {
+    JS_ThrowTypeError(isl_ctx, "value is not an Android object");
+    isl_bridge_exception();
+    return NULL;
+  }
+  return scr_android_ref_retain(ref);
+}
+
+void scr_island_android_release_proxies(void) {
+  while (isl_android_js_proxies) {
+    IslAndroidJsProxy *next = isl_android_js_proxies->next;
+    if (isl_ctx) JS_FreeValue(isl_ctx, isl_android_js_proxies->object);
+    free(isl_android_js_proxies);
+    isl_android_js_proxies = next;
+  }
+}
+
+JNIEXPORT jobject JNICALL
+Java_org_scriptc_runtime_ScriptcRuntime_invokeJsProxy(
+    JNIEnv *env, jclass cls, jlong callback_token, jstring method,
+    jobjectArray args) {
+  (void)cls;
+  IslAndroidJsProxy *binding =
+      (IslAndroidJsProxy *)(intptr_t)callback_token;
+  bool registered = false;
+  for (IslAndroidJsProxy *it = isl_android_js_proxies; it; it = it->next) {
+    if (it == binding) { registered = true; break; }
+  }
+  if (!registered || !binding || !isl_ctx) return NULL;
+  const char *name = (*env)->GetStringUTFChars(env, method, NULL);
+  if (!name) return NULL;
+  JSValue fn = JS_GetPropertyStr(isl_ctx, binding->object, name);
+  (*env)->ReleaseStringUTFChars(env, method, name);
+  if (JS_IsException(fn) || !JS_IsFunction(isl_ctx, fn)) {
+    JS_FreeValue(isl_ctx, fn);
+    return NULL;
+  }
+  jsize argc = args ? (*env)->GetArrayLength(env, args) : 0;
+  JSValue *argv = argc ? calloc((size_t)argc, sizeof *argv) : NULL;
+  if (argc && !argv) {
+    JS_FreeValue(isl_ctx, fn);
+    return NULL;
+  }
+  for (jsize i = 0; i < argc; i++) {
+    jobject arg = (*env)->GetObjectArrayElement(env, args, i);
+    argv[i] = isl_android_value_to_js(isl_ctx, arg);
+    if (arg) (*env)->DeleteLocalRef(env, arg);
+  }
+  JSValue result = JS_Call(isl_ctx, fn, binding->object, argc,
+                           (JSValueConst *)argv);
+  for (jsize i = 0; i < argc; i++) JS_FreeValue(isl_ctx, argv[i]);
+  free(argv);
+  JS_FreeValue(isl_ctx, fn);
+  if (JS_IsException(result)) {
+    isl_bridge_exception();
+    scr_exc_print_uncaught();
+    JS_FreeValue(isl_ctx, result);
+    return NULL;
+  }
+  jobject java_result = isl_android_js_to_value(isl_ctx, result);
+  JS_FreeValue(isl_ctx, result);
+  return java_result;
+}
+#else
+static void isl_register_android_class(void) {}
+static void isl_android_boot(void) {}
+#endif
 
 ScrJsval *scr_jsval_retain(ScrJsval *v) {
   if (v) v->rc++;
@@ -1712,6 +2373,7 @@ static void isl_register_hostfn_class(void) {
   JS_NewClassID(isl_rt, &isl_dynfn_class_id);
   JS_NewClass(isl_rt, isl_dynfn_class_id, &isl_dynfn_class);
   isl_register_bridge_class();
+  isl_register_android_class();
 }
 
 /* Pending scriptc exception → engine VALUE (reverse bridge); clears the
@@ -2550,13 +3212,29 @@ static JSModuleDef *isl_module_load(JSContext *ctx, const char *name, void *opaq
     } else {
       /* JSON (or a facade-less CJS module from an older emitter) entering
        * the ESM graph: Node's default-only interop. */
-      size_t n = strlen(name) + 64;
+      /* `name` is a native absolute path. On Windows it contains
+       * backslashes, so interpolating it verbatim into a JS string would
+       * turn `\C`, `\p`, ... into escapes and silently change the module
+       * key. Reserve for every byte needing a leading escape and quote the
+       * key as a JavaScript string literal. */
+      size_t n = strlen(name) * 2 + 64;
       heap = malloc(n);
       if (!heap) {
         JS_ThrowOutOfMemory(ctx);
         return NULL;
       }
-      snprintf(heap, n, "const m=globalThis.__scr_require(\"%s\");export default m;", name);
+      char *p = heap;
+      const char *prefix = "const m=globalThis.__scr_require(\"";
+      size_t prefix_len = strlen(prefix);
+      memcpy(p, prefix, prefix_len);
+      p += prefix_len;
+      for (const unsigned char *s = (const unsigned char *)name; *s; s++) {
+        if (*s == '\\' || *s == '"') *p++ = '\\';
+        *p++ = (char)*s;
+      }
+      const char *suffix = "\");export default m;";
+      size_t suffix_len = strlen(suffix);
+      memcpy(p, suffix, suffix_len + 1);
       src = heap;
       len = strlen(heap);
     }
@@ -3606,7 +4284,8 @@ static const char isl_modules_bootstrap[] =
     "    const fn = new Function('exports', 'require', 'module', '__filename', '__dirname', src);\n"
     "    const req = (spec) => requireKey(resolveFrom(key, spec), key);\n"
     "    req.cache = cache;\n"
-    "    const dir = key.slice(0, key.lastIndexOf('/')) || '/';\n"
+    "    const cut = Math.max(key.lastIndexOf('/'), key.lastIndexOf('\\\\'));\n"
+    "    const dir = cut < 0 ? '.' : key.slice(0, cut);\n"
     /* A module whose evaluation THROWS leaves no cache entry — Node
      * deletes it so a later require re-evaluates (and a lazy require
      * trap throws EVERY time instead of answering {} on the retry). */

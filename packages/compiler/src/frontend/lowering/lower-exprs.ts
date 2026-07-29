@@ -16,7 +16,7 @@ import { IndexMergeContributor, lowerIndexMergeHelper, lowerNpmStaticSafeIndexRe
 import { npmStaticPackageOfPath } from "../npm-static.js";
 import { unsupportedModuleFeatureOf } from "../shared.js";
 import { fenceEnumObjectValue, lowerEnumAccess } from "./lower-enums.js";
-import { ambientNsRootOf, ambientUndefReadType, ambientUndefVarRootOf, ambientUndefinedFnSymbolOf, contextualUndefReadType, fenceEarlyAliasUse, fenceEarlyNsMemberRef, lowerNsIdentifierValue, nsMemberIdentOf, nsUndefRead, nsWritableTarget } from "./lower-namespaces.js";
+import { ambientNsRootOf, ambientUndefReadType, ambientUndefVarRootOf, ambientUndefinedFnSymbolOf, contextualUndefReadType, fenceEarlyAliasUse, fenceEarlyNsMemberRef, lowerNsIdentifierValue, moduleNsSourceFileOf, nsMemberIdentOf, nsUndefRead, nsWritableTarget } from "./lower-namespaces.js";
 import { expandoMemberRead, expandoWritableTarget } from "./lower-expando.js";
 import { lowerSocketInstanceOf, lowerTlsRootCertificates } from "./lower-server.js";
 import { findGenericMethodOn, lowerStaticFieldRead } from "./lower-classes.js";
@@ -578,6 +578,11 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
       return { kind: "jsOp", op: "arrLit", args, type: JSVAL, loc };
     }
     if (ts.isTypeOfExpression(expr)) {
+      // ES module namespace objects are always ordinary objects, including
+      // the namespace facade Node creates for a CommonJS module.
+      if (moduleNsSourceFileOf(L, expr.expression) !== null) {
+        return { kind: "strLit", value: "object", type: STRING, loc };
+      }
       // `typeof queueMicrotask` / `typeof DOMException` on a STDLIB global
       // whose declared type is callable or constructable: folds to
       // "function" BEFORE the operand lowers — the identity-token story
@@ -3017,6 +3022,9 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
   export function lowerCondition(L: Lowerer, expr: ts.Expression): IrExpr {
     let e: ts.Expression = expr;
     while (ts.isParenthesizedExpression(e)) e = e.expression;
+    if (moduleNsSourceFileOf(L, e) !== null) {
+      return { kind: "boolLit", value: true, type: BOOL, loc: locOf(expr) };
+    }
     if (ts.isBinaryExpression(e)) {
       const op = e.operatorToken.kind;
       if (op === ts.SyntaxKind.AmpersandAmpersandToken || op === ts.SyntaxKind.BarBarToken) {
@@ -7132,6 +7140,14 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
       L.unsupported("SC1040", expr);
     }
     if (op === ts.SyntaxKind.AmpersandAmpersandToken || op === ts.SyntaxKind.BarBarToken) {
+      if (
+        op === ts.SyntaxKind.AmpersandAmpersandToken &&
+        moduleNsSourceFileOf(L, expr.left) !== null
+      ) {
+        // Module namespace objects are unconditionally truthy; the import
+        // header already performed their only observable evaluation.
+        return L.lowerExpr(expr.right);
+      }
       // JS value semantics: `a && b` is `toBool(a) ? b : a` — the result is
       // an operand value, so both operands must share one IR kind (which is
       // also what tsc's type says, modulo literal-union collapsing that

@@ -3981,6 +3981,19 @@ void scr_net_island_install(void);
  * compiler-emitted pending checks. Every entry re-anchors the engine's
  * stack check, so all of these are fiber-safe. */
 typedef struct ScrJsval ScrJsval;
+#ifdef __ANDROID__
+typedef struct ScrAndroidRef ScrAndroidRef;
+typedef struct ScrAndroidBindingEntry {
+  const char *js_name;
+  const char *binary_name;
+  uint8_t kind; /* 1 namespace, 2 class, 3 interface */
+} ScrAndroidBindingEntry;
+void scr_island_android_metadata(const ScrAndroidBindingEntry *entries,
+                                 size_t count);
+void scr_island_android_release_proxies(void);
+ScrJsval *scr_jsval_from_android(ScrAndroidRef *ref);
+ScrAndroidRef *scr_jsval_exit_android(ScrJsval *value, const char *expected_class);
+#endif
 
 ScrJsval *scr_jsval_retain(ScrJsval *v);
 void scr_jsval_release(ScrJsval *v);

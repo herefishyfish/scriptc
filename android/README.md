@@ -7,10 +7,11 @@ This directory owns the Android host package and runnable JavaScript example.
   by the compiler for overload and JVM-descriptor resolution.
 - `scripts/generate-metadata.mjs` regenerates those streams from a NativeScript
   metadata-generator JAR and an Android platform JAR.
-- `compat/` is the first NativeScript Core view compatibility slice.
-- `app.ts` is a compiled TypeScript counter app using `Button` and
-  `StackLayout` from `@nativescript/core`, plus a second button that opens
-  an `android.app.AlertDialog`.
+- `node_modules/@nativescript/core` supplies the real NativeScript Core
+  JavaScript implementation and its published TypeScript declarations.
+- `app.ts` is a compiled TypeScript counter app using `Button`, `Color`, and
+  `StackLayout` from `@nativescript/core`, plus a reset button and a third
+  button that opens an `android.app.AlertDialog`.
 
 From the repository root:
 
@@ -44,8 +45,8 @@ Pass `--jar path/to/library.jar` repeatedly to include application or plugin
 Java APIs. `metadata/manifest.json` records SHA-256 hashes for the generator,
 inputs, and resulting streams.
 
-The generated program does not embed the NativeScript JavaScript runtime.
-Android builds select `.android.js`, fold `__ANDROID__` to true (and the Apple
-platform flags to false), and statically provide the supported NativeScript
-Core view slice. NativeScript metadata still resolves every platform call
-through scriptc's generic JNI binding engine.
+The generated program embeds and executes the installed NativeScript Core
+JavaScript. Android builds select `.android.js` and expose the platform globals
+that the package expects. Scriptc's Android host implements the NativeScript
+runtime boundary—metadata-backed Java access and callbacks—but does not
+reimplement Core views or application behavior.

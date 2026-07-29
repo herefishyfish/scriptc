@@ -201,10 +201,25 @@ describe("Android target", () => {
     }
 
     const generatedC = readFileSync(result.cPath, "utf8");
-    expect(generatedC).toContain('"android/widget/Button"');
-    expect(generatedC).toContain('"android/widget/LinearLayout"');
-    expect(generatedC).toContain('"setOnClickListener"');
-    expect(generatedC).toContain('"addView"');
+    const portableGeneratedC = generatedC.replaceAll("\\", "/");
+    // The application embeds the installed Core implementation selected by
+    // NativeScript's Android source convention. These are real package
+    // modules, not locally reimplemented views.
+    expect(portableGeneratedC).toContain(
+      "/node_modules/@nativescript/core/ui/button/index.android.js",
+    );
+    expect(portableGeneratedC).toContain(
+      "/node_modules/@nativescript/core/ui/layouts/stack-layout/index.android.js",
+    );
+    // Runtime namespace/class discovery is populated from the NativeScript
+    // metadata streams, including the widget classes used inside Core.
+    expect(generatedC).toContain(
+      '{ "android.widget.Button", "android.widget.Button", 2 }',
+    );
+    expect(generatedC).toContain(
+      '{ "org.nativescript.widgets.StackLayout", "org.nativescript.widgets.StackLayout", 2 }',
+    );
+    expect(generatedC).toContain("scr_island_android_metadata");
     // The alert button resolves the nested Builder type and the dialog
     // listener through metadata, without any dialog-specific binding.
     expect(generatedC).toContain('"android/app/AlertDialog$Builder"');
@@ -212,7 +227,6 @@ describe("Android target", () => {
     expect(generatedC).toContain(
       '"(Ljava/lang/CharSequence;Landroid/content/DialogInterface$OnClickListener;)Landroid/app/AlertDialog$Builder;"',
     );
-    expect(generatedC).not.toContain("__ANDROID__");
     expect(generatedC).not.toContain("scr_throw_error_msg_code");
   });
 });

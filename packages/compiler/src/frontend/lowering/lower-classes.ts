@@ -21,6 +21,7 @@ import { uniqueSymbolKeyOf } from "./lower-exprs.js";
 import { lowerHttpAgentNew, lowerHttpServerNew } from "./lower-server.js";
 import { ambientNsRootOf, ambientUndefReadType, ambientUndefVarRootOf, ambientUndefinedFnSymbolOf, fenceEarlyAliasUse, fenceEarlyNsMemberRef, nsMemberIdentOf, nsUndefRead } from "./lower-namespaces.js";
 import { mixinResultBindingClassOf, type MixinInstanceInfo } from "./lower-mixins.js";
+import { npmStaticPackageOfPath } from "../npm-static.js";
 
 export interface ClassInfo {
   def: IrClassDef;
@@ -44,6 +45,11 @@ export interface ClassInfo {
    * #private GENERATOR method: the body is a generator IrFunction and
    * calls enter through its gen-spawn wrapper. */
   methods: Map<string, { params: ParamShape[]; ret: IrType; abstract?: true; async?: true; gen?: { yieldT: IrType; nextT: IrType } }>;
+  /** npm-static JavaScript methods whose runtime calling convention cannot
+   * enter this class's vtable. They are deferred, not erased: a call through
+   * this class fences at its use site. Inherited entries are copied so calls
+   * through a subclass remain guarded. */
+  unloweredMethods?: Set<string>;
   /** OWN GENERIC instance methods (own type parameters — `m<T>(x: T)`),
    * monomorphized per call site like top-level generic functions: instance
    * `n` is the module function `%C.m%n` taking `this` as param 0. They
@@ -498,7 +504,20 @@ export interface GenericClassInfo {
   function undefArmedFieldType(L: Lowerer, p: ts.Symbol): IrType | null {
     const t = L.checker.getTypeOfSymbol(p);
     const mapped = L.mapTypeOf(t);
-    if (!mapped || mapped.kind === "void" || mapped.kind === "dyn") return null;
+    // Shipped JavaScript commonly leaves property types implicit. In a JS
+    // class the honest static representation of that implicit `any` is the
+    // checked-dynamic tree, whose value domain includes `undefined`.
+    if (!mapped && (t.flags & ts.TypeFlags.Any) !== 0) return DYN;
+    // Composite inference involving implicit `any` (any[] | undefined,
+    // Map<any, any> | undefined, and similar emitted-JS shapes) is likewise
+    // not statically mappable as one fixed slot. A checked-dynamic slot is
+    // the faithful JavaScript representation; individual writes still pass
+    // through the normal dyn conversion fence.
+    if (!mapped) return DYN;
+    if (mapped.kind === "void") return null;
+    // Checked-dynamic values already represent JavaScript's `undefined`
+    // directly, so a late-assigned JS property needs no synthetic union.
+    if (mapped.kind === "dyn") return mapped;
     const byKey = new Map<string, IrType>();
     const arms = mapped.kind === "union" ? (L.unions.get(mapped.unionId)?.arms ?? []) : [mapped];
     for (const a of arms) {
@@ -1095,6 +1114,7 @@ export function collectClassShapeInner(L: Lowerer, decl: ts.ClassLikeDeclaration
       const symbolFields = new Map<ts.Symbol, string>(base?.symbolFields ?? []);
       const fieldOrder: ClassInfo["fieldOrder"] = [];
       const methods = new Map<string, { params: ParamShape[]; ret: IrType; abstract?: true; async?: true; gen?: { yieldT: IrType; nextT: IrType } }>();
+      const unloweredMethods = new Set<string>(base?.unloweredMethods ?? []);
       // Own accessor declarations ("get:x"/"set:x" → node), for the
       // partial-override analysis below (diagnostics need the node).
       const accessorNodes = new Map<string, ts.AccessorDeclaration>();
@@ -1727,6 +1747,11 @@ export function collectClassShapeInner(L: Lowerer, decl: ts.ClassLikeDeclaration
           // a generic-class instantiation's member.
           if (
             implicitMonoFile(decl.getSourceFile()) &&
+            !(
+              L.targetPlatform === "android" &&
+              npmStaticPackageOfPath(decl.getSourceFile().fileName) ===
+                "@nativescript/core"
+            ) &&
             ts.isIdentifier(member.name) &&
             inst === undefined && decl.typeParameters === undefined &&
             !fields.has(member.name.text) &&
@@ -1785,12 +1810,20 @@ export function collectClassShapeInner(L: Lowerer, decl: ts.ClassLikeDeclaration
               `overriding the builtin Error method '${mName}'`,
             );
           }
-          if (
-            overridden &&
+          const overrideMismatch =
+            overridden !== null &&
             (overridden.sig.params.length !== shapes.length ||
               !overridden.sig.params.every((p, i) => typeEquals(p.type, shapes[i]!.type)) ||
-              !typeEquals(overridden.sig.ret, ft.ret))
-          ) {
+              !typeEquals(overridden.sig.ret, ft.ret));
+          if (overrideMismatch && implicitMonoFile(decl.getSourceFile())) {
+            // A large shipped-JS class should remain usable when an
+            // unrelated legacy override has no sound fixed vtable ABI.
+            // Omitting the override alone would silently call the base, so
+            // record it and make lowerObjectMethodCall fence every use.
+            unloweredMethods.add(mName);
+            continue;
+          }
+          if (overrideMismatch) {
             L.unsupported(
               "SC1090",
               member.name,
@@ -1835,8 +1868,13 @@ export function collectClassShapeInner(L: Lowerer, decl: ts.ClassLikeDeclaration
           const isGet = ts.isGetAccessor(member);
           // #private accessors collect as "get:#x"/"set:#x" — the same
           // reserved spelling, one more unspellable segment.
-          if (!ts.isIdentifier(member.name) && !ts.isPrivateIdentifier(member.name)) {
-            L.unsupported("SC1090", member, "computed accessor names");
+          const accessorName = classMemberNameOf(L, member.name);
+          if (accessorName === null || accessorName === "sym:iterator") {
+            L.unsupported(
+              "SC1090",
+              member,
+              "computed accessor names that do not fold to one string",
+            );
           }
           // ABSTRACT accessors are the abstract-method story with property
           // syntax: body-less by definition, they enter `methods` (marked
@@ -1845,7 +1883,7 @@ export function collectClassShapeInner(L: Lowerer, decl: ts.ClassLikeDeclaration
           const abstractAccessor =
             ts.getModifiers(member)?.some((m) => m.kind === ts.SyntaxKind.AbstractKeyword) === true;
           if (!member.body && !abstractAccessor) L.unsupported("SC1090", member, "bodyless accessors");
-          const prop = member.name.text;
+          const prop = accessorName;
           const mName = `${isGet ? "get" : "set"}:${prop}`;
           if (fields.has(prop)) {
             // tsc rejects field/accessor mixing (TS2610/2611); defensive.
@@ -2260,6 +2298,7 @@ export function collectClassShapeInner(L: Lowerer, decl: ts.ClassLikeDeclaration
         fields,
         fieldOrder,
         methods,
+        ...(unloweredMethods.size > 0 ? { unloweredMethods } : {}),
         decl,
         ...(emitOverride !== undefined ? { emitOverride } : {}),
         ctor,

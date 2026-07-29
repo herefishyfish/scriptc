@@ -4711,6 +4711,7 @@ function validateFunction(
         // union arms before marshaling, so bare bytes/url operands are
         // exactly what it produces.
         if (
+          !isAndroidObjectType(src) &&
           src.kind !== "bytes" &&
           src.kind !== "url" &&
           src.kind !== "dyn" && // dyn values deep-copy in (data kinds; the runtime throws on boxes)
@@ -4767,7 +4768,10 @@ function validateFunction(
       case "jsExit": {
         checkExpr(e.value);
         expectType(e.value, JSVAL, "jsExit operand");
-        if (!canExitIslandToType(e.type, (id) => records.get(id), (id) => unions.get(id))) {
+        if (
+          !isAndroidObjectType(e.type) &&
+          !canExitIslandToType(e.type, (id) => records.get(id), (id) => unions.get(id))
+        ) {
           err(`jsExit to non-extractable type ${e.type.kind}`, e.loc);
         }
         break;

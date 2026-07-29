@@ -209,9 +209,12 @@ export function isRelativeSpecifier(spec: string): boolean {
  * node_modules segment answer their registered workspace package (the
  * realpath'd home of a symlinked workspace install), else null. */
 export function npmPackageNameOf(file: string): string | null {
-  const parts = file.split("/");
+  const normalized = file.split("\\").join("/");
+  const parts = normalized.split("/");
   const i = parts.lastIndexOf("node_modules");
-  if (i < 0 || i + 1 >= parts.length) return workspacePackageOfPath(file);
+  if (i < 0 || i + 1 >= parts.length) {
+    return workspacePackageOfPath(normalized);
+  }
   const first = parts[i + 1]!;
   if (first.startsWith("@")) {
     const second = parts[i + 2];
