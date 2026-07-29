@@ -15,6 +15,7 @@
   "exports": {
     ".": "./dist/index.js",
     "./scriptc.d.ts": "./ambient/scriptc.d.ts",
+    "./scriptc-android.d.ts": "./ambient/scriptc-android.d.ts",
     "./scriptc-overrides.d.ts": "./ambient/scriptc-overrides.d.ts",
     "./scriptc-node-fallback.d.ts": "./ambient/scriptc-node-fallback.d.ts",
     "./surface-manifest.json": "./surface-manifest.json"

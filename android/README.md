@@ -9,9 +9,9 @@ This directory owns the Android host package and runnable JavaScript example.
   metadata-generator JAR and an Android platform JAR.
 - `node_modules/@nativescript/core` supplies the real NativeScript Core
   JavaScript implementation and its published TypeScript declarations.
-- `app.ts` is a compiled TypeScript counter app using `Button`, `Color`, and
-  `StackLayout` from `@nativescript/core`, plus a reset button and a third
-  button that opens an `android.app.AlertDialog`.
+- `app.ts` is a compiled TypeScript counter app using `Button`, `Color`,
+  `GridLayout`, and `StackLayout` from `@nativescript/core`, plus a reset
+  button and a third button that opens an `android.app.AlertDialog`.
 
 From the repository root:
 

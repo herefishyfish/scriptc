@@ -73,65 +73,6 @@ declare function comptime<T>(compute: () => T): T;
  * to the island through their own paths, not through this. */
 declare function __island_eval(code: string): string;
 
-/* Android target bootstrap surface. These declarations mirror the initial
- * NativeScript-style android.* globals; non-Android builds still fence any
- * reached use because only targetPlatform=android installs the JNI type
- * mapping and lowerings. */
-declare namespace android {
-  namespace content {
-    class Context {}
-  }
-  namespace view {
-    class View {
-      constructor(context: content.Context);
-      setPadding(left: number, top: number, right: number, bottom: number): void;
-      setBackgroundColor(color: number): void;
-    }
-    class ViewGroup extends View {
-      addView(view: View): void;
-    }
-  }
-  namespace app {
-    class Activity extends content.Context {
-      setContentView(view: view.View): void;
-    }
-    class AlertDialog {}
-    namespace AlertDialog {
-      class Builder {
-        constructor(context: content.Context);
-        setTitle(title: string): Builder;
-        setMessage(message: string): Builder;
-        setPositiveButton(text: string, listener: () => void): Builder;
-        show(): AlertDialog;
-      }
-    }
-  }
-  namespace widget {
-    class TextView extends view.View {
-      constructor(context: content.Context);
-      setText(text: string): void;
-      setAllCaps(allCaps: boolean): void;
-    }
-    class Button extends TextView {
-      constructor(context: content.Context);
-      setOnClickListener(listener: () => void): void;
-    }
-    class LinearLayout extends view.ViewGroup {
-      static readonly VERTICAL: number;
-      constructor(context: content.Context);
-      setOrientation(orientation: number): void;
-    }
-  }
-}
-
-/** NativeScript-compatible access to the Activity supplied by the generated
- * Android host. */
-declare const Application: {
-  readonly android: {
-    readonly foregroundActivity: android.app.Activity;
-  };
-};
-
 /* NativeScript bundler defines. Android builds fold these during lowering,
  * matching NativeScript's platform-selection contract. */
 declare const __ANDROID__: boolean;

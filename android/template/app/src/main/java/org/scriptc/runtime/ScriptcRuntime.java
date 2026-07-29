@@ -101,6 +101,30 @@ public final class ScriptcRuntime {
         return new Object[] { false, null };
     }
 
+    public static boolean setProperty(Object receiver, String name, Object value)
+            throws Exception {
+        Class<?> type = receiver.getClass();
+        try {
+            Field field = type.getField(name);
+            if (!Modifier.isFinal(field.getModifiers())) {
+                field.set(receiver, coerce(value, field.getType()));
+                return true;
+            }
+        } catch (NoSuchFieldException ignored) {}
+        String suffix = Character.toUpperCase(name.charAt(0)) + name.substring(1);
+        String setterName = "set" + suffix;
+        for (Method method : type.getMethods()) {
+            Class<?>[] parameters = method.getParameterTypes();
+            if (method.getName().equals(setterName)
+                    && parameters.length == 1
+                    && accepts(parameters, new Object[] { value })) {
+                method.invoke(receiver, coerce(value, parameters[0]));
+                return true;
+            }
+        }
+        return false;
+    }
+
     public static boolean hasMethod(Object receiver, String name) {
         for (Method method : receiver.getClass().getMethods()) {
             if (method.getName().equals(name)) return true;

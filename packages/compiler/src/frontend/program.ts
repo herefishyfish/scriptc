@@ -40,8 +40,8 @@
  *    JSON.parse's wording rather than tsc's, the one message-text delta on
  *    that path (no snapshot pins it). */
 
-import { builtinModules } from "node:module";
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { builtinModules, createRequire } from "node:module";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import * as ts from "./ts7/adapter.js";
 import type { ScrDiagnostic } from "../diagnostics/diagnostic.js";
@@ -62,6 +62,7 @@ import {
 import {
   ADOPTED_OPTIONS,
   ambientDtsPath,
+  androidAmbientDtsPath,
   builtinDefaultImportModule,
   canonicalBuiltinModule,
   clearWorkspacePackages,
@@ -78,6 +79,11 @@ import {
   unsupportedModuleFeatureOf,
   workspacePackageOfPath,
 } from "./shared.js";
+
+const nodeRequire = createRequire(import.meta.url);
+const androidTypesAnchor = nodeRequire.resolve(
+  "@scriptc/android/package.json",
+);
 
 const BASE_OPTIONS: ts.Ts7CompilerOptions = {
   strict: true,
@@ -184,7 +190,10 @@ function resolveNodeTypes7(entryPath: string): string | null {
  * ambient packages still cannot leak into a scriptc program. */
 function resolvePlatformTypes7(entryPath: string): string | null {
   if (sourcePlatformName() !== "android") return null;
-  return resolveTypeDirective("@nativescript/types-android", entryPath);
+  return (
+    resolveTypeDirective("@nativescript/types-android", entryPath) ??
+    resolveTypeDirective("@nativescript/types-android", androidTypesAnchor)
+  );
 }
 
 /** TS7 no longer accepts the legacy internal-namespace spelling generated
@@ -211,8 +220,14 @@ function platformTypeSource7(path: string): string | undefined {
 /** Gives NativeScript's emitted Android JavaScript its published declaration
  * surface without redirecting execution to declarations. A private virtual
  * copy keeps the .d.ts dependency graph intact while npm-static continues
- * resolving runtime imports to .android.js. The module augmentations merge
- * the public instance surfaces into the real JS classes. */
+ * resolving runtime imports to .android.js.
+ *
+ * The bridge is derived from the installed package rather than naming a
+ * ScriptC-supported view list. Every non-generic exported Core class whose
+ * runtime module exists gets its declared instance surface merged into that
+ * real JavaScript class. Generic classes keep their JavaScript/JSDoc inference
+ * for now because declaration merging requires an identical type-parameter
+ * list; guessing one would be less honest than leaving that inference intact. */
 function prepareNativeScriptTypeBridge7(
   host: ts.Ts7Host,
   entryPath: string,
@@ -231,6 +246,7 @@ function prepareNativeScriptTypeBridge7(
   if (runtime === null) return null;
   const packageRoot = dirname(runtime.typesFile);
   const typeRoot = join(packageRoot, ".scriptc-types");
+  const declarationFiles: string[] = [];
   const visit = (dir: string): void => {
     for (const name of readdirSync(dir)) {
       const path = join(dir, name);
@@ -242,24 +258,81 @@ function prepareNativeScriptTypeBridge7(
           join(typeRoot, relative(packageRoot, path)),
           readFileSync(path, "utf8"),
         );
+        declarationFiles.push(path);
       }
     }
   };
   visit(packageRoot);
+  const surfaces: {
+    alias: string;
+    className: string;
+    runtimeModule: string;
+    typeModule: string;
+  }[] = [];
+  const seen = new Set<string>();
+  for (const genericDeclaration of declarationFiles) {
+    const relativeDeclaration = relative(
+      packageRoot,
+      genericDeclaration,
+    ).replaceAll("\\", "/");
+    if (
+      !relativeDeclaration.endsWith(".d.ts") ||
+      /\.(?:android|ios)\.d\.ts$/.test(relativeDeclaration)
+    ) {
+      continue;
+    }
+    const genericRuntime = genericDeclaration.replace(/\.d\.ts$/, ".js");
+    if (
+      !existsSync(genericRuntime) &&
+      platformSourceSibling(genericRuntime) === null
+    ) {
+      continue;
+    }
+    const androidDeclaration = genericDeclaration.replace(
+      /\.d\.ts$/,
+      ".android.d.ts",
+    );
+    const surfaceDeclaration = existsSync(androidDeclaration)
+      ? androidDeclaration
+      : genericDeclaration;
+    const surfaceSource = readFileSync(surfaceDeclaration, "utf8");
+    const classPattern =
+      /\bexport\s+(?:declare\s+)?(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)(?=\s*(?:extends|implements|\{))/g;
+    for (const match of surfaceSource.matchAll(classPattern)) {
+      const className = match[1]!;
+      const runtimeRelative = relativeDeclaration.replace(/\.d\.ts$/, ".js");
+      const key = `${runtimeRelative}\0${className}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      surfaces.push({
+        alias: `NativeScriptSurface${surfaces.length}`,
+        className,
+        runtimeModule: `./${runtimeRelative}`,
+        typeModule: `./.scriptc-types/${relative(
+          packageRoot,
+          surfaceDeclaration,
+        )
+          .replaceAll("\\", "/")
+          .replace(/\.d\.ts$/, "")}`,
+      });
+    }
+  }
   const bridge = join(packageRoot, ".scriptc-core-types.d.ts");
   host.addVirtualFile(
     bridge,
     [
-      'import type { Button as ButtonSurface } from "./.scriptc-types/ui/button/index";',
-      'import type { StackLayout as StackLayoutSurface } from "./.scriptc-types/ui/layouts/stack-layout/index";',
-      'import "./ui/button/index.js";',
-      'import "./ui/layouts/stack-layout/index.js";',
-      'declare module "./ui/button/index.js" {',
-      "  interface Button extends ButtonSurface {}",
-      "}",
-      'declare module "./ui/layouts/stack-layout/index.js" {',
-      "  interface StackLayout extends StackLayoutSurface {}",
-      "}",
+      ...surfaces.map(
+        ({ alias, className, typeModule }) =>
+          `import type { ${className} as ${alias} } from ${JSON.stringify(typeModule)};`,
+      ),
+      ...surfaces.flatMap(
+        ({ alias, className, runtimeModule }) => [
+          `import ${JSON.stringify(runtimeModule)};`,
+          `declare module ${JSON.stringify(runtimeModule)} {`,
+          `  interface ${className} extends ${alias} {}`,
+          "}",
+        ],
+      ),
       "",
     ].join("\n"),
   );
@@ -354,6 +427,7 @@ function loadProgram7(host: ts.Ts7Host, entryPath: string): LoadResult & { dispo
   const coreRoots = [
     entryPath,
     ambientDtsPath(),
+    ...(sourcePlatformName() === "android" ? [androidAmbientDtsPath()] : []),
     nodeTypes ?? fallbackDtsPath(),
     ...(platformTypes !== null ? [platformTypes] : []),
     ...(nativeScriptTypeBridge !== null ? [nativeScriptTypeBridge] : []),

@@ -23,6 +23,12 @@ export function ambientDtsPath(): string {
   return tsgoPath(require.resolve("@scriptc/compiler/scriptc.d.ts"));
 }
 
+/** Android-host declarations layered only into Android programs. Platform
+ * namespaces themselves come from @nativescript/types-android. */
+export function androidAmbientDtsPath(): string {
+  return tsgoPath(require.resolve("@scriptc/compiler/scriptc-android.d.ts"));
+}
+
 /** Path of the shipped divergence/precision OVERRIDES (JSON.parse():
  * unknown, pop(): T, the Promise executor shape, ...). Part of the LOWERING
  * program only — preflight's project-world second chance builds without it,

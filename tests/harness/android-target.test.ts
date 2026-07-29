@@ -186,11 +186,12 @@ describe("Android target", () => {
     ).toContain("ScriptcRuntime.shutdown()");
   });
 
-  test("compiles NativeScript Core Button and StackLayout views", async () => {
+  test("compiles NativeScript Core Button, GridLayout, and StackLayout views", async () => {
+    const projectDir = join(root, "nativescript-core-project");
     const result = await compileAndroid(
       join(repositoryRoot, "android", "app.ts"),
       {
-        outDir: join(root, "nativescript-core-project"),
+        outDir: projectDir,
         applicationId: "dev.scriptc.coreviews",
       },
     );
@@ -211,6 +212,9 @@ describe("Android target", () => {
     expect(portableGeneratedC).toContain(
       "/node_modules/@nativescript/core/ui/layouts/stack-layout/index.android.js",
     );
+    expect(portableGeneratedC).toContain(
+      "/node_modules/@nativescript/core/ui/layouts/grid-layout/index.android.js",
+    );
     // Runtime namespace/class discovery is populated from the NativeScript
     // metadata streams, including the widget classes used inside Core.
     expect(generatedC).toContain(
@@ -219,7 +223,25 @@ describe("Android target", () => {
     expect(generatedC).toContain(
       '{ "org.nativescript.widgets.StackLayout", "org.nativescript.widgets.StackLayout", 2 }',
     );
+    expect(generatedC).toContain(
+      '{ "org.nativescript.widgets.GridLayout", "org.nativescript.widgets.GridLayout", 2 }',
+    );
     expect(generatedC).toContain("scr_island_android_metadata");
+    const islandRuntime = readFileSync(
+      join(projectDir, "app/src/main/cpp/runtime/scr_island.c"),
+      "utf8",
+    );
+    expect(islandRuntime).toContain("Symbol.hasInstance");
+    expect(islandRuntime).toContain("__scr_android_object_set");
+    expect(
+      readFileSync(
+        join(
+          projectDir,
+          "app/src/main/java/org/scriptc/runtime/ScriptcRuntime.java",
+        ),
+        "utf8",
+      ),
+    ).toContain("static boolean setProperty");
     // The alert button resolves the nested Builder type and the dialog
     // listener through metadata, without any dialog-specific binding.
     expect(generatedC).toContain('"android/app/AlertDialog$Builder"');
