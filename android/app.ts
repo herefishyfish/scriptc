@@ -99,7 +99,7 @@ gridLayout.addChildAtCell(benchButton, 0, 3);
 const flexbox = new FlexboxLayout();
 flexbox.flexDirection = "row";
 flexbox.flexWrap = "wrap";
-for (let i = 0; i < 40; i++) {
+for (let i = 0; i < 10; i++) {
   const view = new StackLayout();
   view.width = 64;
   view.height = 64;
