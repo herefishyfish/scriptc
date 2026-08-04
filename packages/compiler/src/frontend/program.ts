@@ -186,12 +186,15 @@ function resolveNodeTypes7(entryPath: string): string | null {
 }
 
 /** NativeScript's TypeScript implementation names the Android SDK classes
- * directly. Android builds therefore add the package's generated platform
- * declarations as an explicit root; `types: []` remains forced so unrelated
- * ambient packages still cannot leak into a scriptc program. */
+ * directly. Android builds therefore add the installed NativeScript type
+ * bundle as an explicit root; `types: []` remains forced so unrelated ambient
+ * packages still cannot leak into a scriptc program. Prefer the public
+ * @nativescript/types umbrella selected by the application, while retaining
+ * types-android as the published @scriptc/android fallback. */
 function resolvePlatformTypes7(entryPath: string): string | null {
   if (sourcePlatformName() !== "android") return null;
   return (
+    resolveTypeDirective("@nativescript/types", entryPath) ??
     resolveTypeDirective("@nativescript/types-android", entryPath) ??
     resolveTypeDirective("@nativescript/types-android", androidTypesAnchor)
   );

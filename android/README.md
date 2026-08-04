@@ -11,6 +11,9 @@ This directory owns the Android host package and runnable JavaScript example.
   reads and calls it — see "Refreshing the metadata" below.
 - `node_modules/@nativescript/core` supplies the real NativeScript Core
   JavaScript implementation and its published TypeScript declarations.
+- `tsconfig.json` loads `@nativescript/types`, so editors and standalone
+  TypeScript checks see the generated Android and NativeScript globals used by
+  `app.ts`; ScriptC selects the same bundle for Android builds.
 - `app.ts` is a compiled TypeScript counter app using `Button`, `Color`,
   `GridLayout`, `Image`, and `StackLayout` from `@nativescript/core`, plus a
   reset button, a button that opens an `android.app.AlertDialog`, and a

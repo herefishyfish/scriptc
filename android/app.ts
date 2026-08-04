@@ -66,6 +66,20 @@ benchButton.on(Button.tapEvent, () => {
   const tsResult = fib(FIB_N);
   const tsMs = performance.now() - tsStart;
 
+  // Android builds already embed ScriptC's QuickJS-ng island for dynamic
+  // NativeScript code. Time inside the evaluated program so parsing and the
+  // native/island boundary are excluded from the comparison.
+  const quickJsResult = __island_eval(`
+    (() => {
+      function fib(n) {
+        return n < 2 ? n : fib(n - 1) + fib(n - 2);
+      }
+      const started = Date.now();
+      const result = fib(${FIB_N});
+      return result + " in " + (Date.now() - started) + "ms";
+    })()
+  `);
+
   const kotlinFib = new org.scriptc.demo.Fib();
   const kotlinMs = kotlinFib.timeMillis(FIB_N);
   const kotlinResult = kotlinFib.result();
@@ -78,6 +92,7 @@ benchButton.on(Button.tapEvent, () => {
   builder.setTitle(`fib(${FIB_N})`);
   builder.setMessage(
     `scriptc (native): ${tsResult} in ${tsMs.toFixed(1)}ms\n` +
+      `QuickJS-ng: ${quickJsResult}\n` +
       `Kotlin (JVM): ${kotlinResult} in ${kotlinMs.toFixed(1)}ms` +
       `\nKotlin (JVM, w/ bounds): ${kotlinWithBounds} in ${kotlinWithBoundsMs.toFixed(1)}ms`,
   );
