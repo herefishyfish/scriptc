@@ -473,10 +473,11 @@ interface BufferConstructor {
 }
 declare var Buffer: BufferConstructor;
 
-/* The WHATWG encoders (Node globals). Only the COMPOSED forms lower —
- * `new TextEncoder().encode(s)` and `new TextDecoder().decode(bytes)`;
- * the label is typed as the utf-8 spellings (the one supported decoder;
- * other labels and the fatal/ignoreBOM options fence at the use site). */
+/* The WHATWG encoders (Node globals). The COMPOSED forms lower —
+ * `new TextEncoder().encode(s)` and `new TextDecoder().decode(bytes)` —
+ * as do same-scope const store-then-call forms. The label is typed as the
+ * utf-8 spellings (the one supported decoder; other labels and the
+ * fatal/ignoreBOM options fence at the use site). */
 interface TextEncoder {
   encode(input?: string): Uint8Array;
 }
@@ -587,10 +588,9 @@ declare var MessageChannel: {
   readonly prototype: MessageChannel;
 };
 
-/* AbortSignal, the fetch-cancellation slice (AbortSignal.timeout is the
- * whole surface real CLIs construct; the statics beyond it — abort/any —
- * and the instance events are declared for the suite and fence per site
- * statically, with the island's real implementation behind --dynamic). */
+/* AbortSignal, the native fetch-cancellation slice. The three statics,
+ * state/reason reads, throwIfAborted, and abort listeners all lower in
+ * static builds; dynamic builds use the island's Web implementation. */
 interface AbortSignal extends EventTarget {
   readonly aborted: boolean;
   readonly reason: unknown;
@@ -604,22 +604,55 @@ declare var AbortSignal: {
   readonly prototype: AbortSignal;
 };
 
-/* fetch, typed as the JSON-API slice: one URL, an optional init with the
- * members CLI requests carry, a Response with the probe members and body
- * readers. json() returns unknown — the same dynamic boundary as
- * JSON.parse: cast and validate. Response, AbortSignal, and RequestInit
- * are ISLAND-BACKED ambients: under --dynamic their values are handles
- * into the embedded engine (the engine's own fetch executes; member reads
- * and calls are engine ops with validated exits at typed boundaries), so
- * `body` is honestly `any` — the streaming world lives entirely in the
- * island. The named RequestInit interface is what routes init object
- * literals through the island literal builder. */
-/* Headers — a response's header map (r.headers), island-backed like
- * Response itself: the value is the engine's real Headers (lowercase
- * names, combine-on-append, sorted iteration), member reads and calls are
- * engine ops with validated exits at typed boundaries. Declared to the
- * implemented surface; constructing one statically (`new Headers()`) keeps
- * the constructor fence. */
+interface ReadableStreamReadValueResult<T> {
+  done: false;
+  value: T;
+}
+interface ReadableStreamReadDoneResult<T> {
+  done: true;
+  value: T | undefined;
+}
+type ReadableStreamReadResult<T> =
+  | ReadableStreamReadValueResult<T>
+  | ReadableStreamReadDoneResult<T>;
+interface ReadableStreamDefaultReader<T = unknown> {
+  readonly closed: Promise<void>;
+  read(): Promise<ReadableStreamReadResult<T>>;
+  cancel(reason?: unknown): Promise<void>;
+  releaseLock(): void;
+}
+interface ReadableStreamDefaultController<T = unknown> {
+  readonly desiredSize: number | null;
+  enqueue(chunk?: T): void;
+  close(): void;
+  error(reason?: unknown): void;
+}
+interface UnderlyingSource<T = unknown> {
+  start?(controller: ReadableStreamDefaultController<T>): unknown;
+  pull?(controller: ReadableStreamDefaultController<T>): unknown;
+  cancel?(reason?: unknown): unknown;
+}
+interface ReadableStream<T = unknown> {
+  readonly locked: boolean;
+  cancel(reason?: unknown): Promise<void>;
+  getReader(): ReadableStreamDefaultReader<T>;
+}
+declare var ReadableStream: {
+  new <T = unknown>(source?: UnderlyingSource<T>): ReadableStream<T>;
+  from<T>(iterable: readonly T[]): ReadableStream<T>;
+  from(iterable: Uint8Array): ReadableStream<number>;
+  from(iterable: string): ReadableStream<string>;
+  readonly prototype: ReadableStream<unknown>;
+};
+
+/* fetch, typed as the native JSON + readable-stream slice: one URL, an
+ * optional init with the members CLI requests carry, and a Response
+ * whose body is the same stream consumed by json(). json() returns
+ * unknown — the same dynamic boundary as JSON.parse: cast and validate. */
+/* Headers — a response's native header map (lowercase names,
+ * combine-on-append, sorted iteration). The value is a checked-dynamic
+ * native handle like Response itself; constructing one statically
+ * (`new Headers()`) keeps the constructor fence. */
 interface Headers {
   append(name: string, value: string): void;
   delete(name: string): void;
@@ -627,8 +660,16 @@ interface Headers {
   getSetCookie(): string[];
   has(name: string): boolean;
   set(name: string, value: string): void;
-  forEach(callbackfn: (value: string, key: string, parent: Headers) => void): void;
+  forEach(
+    callbackfn: (value: string, key: string, parent: Headers) => void,
+    thisArg?: unknown,
+  ): void;
+  [Symbol.iterator](): IterableIterator<[string, string]>;
 }
+declare var Headers: {
+  new (init?: Record<string, string> | readonly (readonly [string, string])[]): Headers;
+  readonly prototype: Headers;
+};
 interface Response {
   readonly ok: boolean;
   readonly status: number;
@@ -636,23 +677,26 @@ interface Response {
   readonly url: string;
   readonly redirected: boolean;
   readonly headers: Headers;
-  readonly body: any;
+  readonly body: ReadableStream<Uint8Array> | null;
   readonly bodyUsed: boolean;
   json(): Promise<unknown>;
   text(): Promise<string>;
-  /* The whole body as bytes: arrayBuffer() answers the engine's
-   * ArrayBuffer (a handle — read it through `new Uint8Array(...)` in
-   * island code or its byteLength directly); bytes() answers a
-   * Uint8Array, which exits to the static bytes tier at a typed
-   * boundary (`const b: Uint8Array = await r.bytes()` is a validated
-   * copy — divergence 44's aliasing stance). */
+  /* The whole body as bytes: bytes() answers a Uint8Array in both tiers.
+   * arrayBuffer() remains dynamic-only because static programs have no
+   * free-standing ArrayBuffer representation; the compiler diagnoses its
+   * direct use and points at bytes(). */
   arrayBuffer(): Promise<ArrayBuffer>;
   bytes(): Promise<Uint8Array>;
 }
 interface RequestInit {
   method?: string;
-  headers?: Record<string, string>;
-  body?: string;
+  headers?:
+    | Headers
+    | Record<string, string>
+    | readonly (readonly [string, string])[];
+  body?: string | Uint8Array | ReadableStream<Uint8Array> | null;
+  duplex?: "half";
+  redirect?: "follow" | "error" | "manual";
   signal?: AbortSignal;
 }
 declare function fetch(input: string | URL, init?: RequestInit): Promise<Response>;

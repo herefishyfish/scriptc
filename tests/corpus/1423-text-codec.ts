@@ -1,6 +1,6 @@
-// The WHATWG encoder pair, composed: new TextEncoder().encode(s) and
-// new TextDecoder().decode(bytes) — utf-8 round trips, BOM stripping, and
-// maximal-subpart replacement, byte-compared against Node.
+// The WHATWG encoder pair, composed and same-scope const store-then-call:
+// utf-8 round trips, BOM stripping, and maximal-subpart replacement,
+// byte-compared against Node.
 const enc = new TextEncoder().encode("héllo😀");
 console.log(enc.length, enc[0], enc[1], enc[2], enc[6]);
 console.log(new TextDecoder().decode(enc));
@@ -23,3 +23,31 @@ console.log(new TextDecoder("utf-8").decode(Buffer.from("hi", "utf8")));
 const rt = new TextDecoder().decode(new TextEncoder().encode("round ✓ trip"));
 console.log(rt === "round ✓ trip", rt);
 console.log(new TextEncoder().encode("").length);
+
+// The ordinary stored-instance idiom is compile-time alias plumbing: the
+// default constructors have no effects, and supported calls resolve back
+// through a stable const without materializing the codec object.
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+const stored = encoder.encode("stored héllo 😀");
+console.log(stored.length, decoder.decode(stored));
+console.log(encoder.encode("again").length, decoder.decode(Buffer.from("twice", "utf8")));
+
+// An explicit literal utf-8 label is equally effect-free. Function-local
+// bindings take the same rewrite within their own execution scope.
+function localRoundTrip(s: string): string {
+  const labelledDecoder = new TextDecoder("utf-8");
+  const localEncoder = new TextEncoder();
+  return labelledDecoder.decode(localEncoder.encode(s));
+}
+console.log(localRoundTrip("local ✓"));
+
+// A switch clause is still one straight-line execution region: the
+// declaration dominates the call when both live in that clause.
+const codecCase = 1;
+switch (codecCase) {
+  case 1:
+    const caseEncoder = new TextEncoder();
+    console.log(caseEncoder.encode("same clause").length);
+    break;
+}

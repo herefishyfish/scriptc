@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { readFileSync, rmSync } from "node:fs";
+import { readFileSync, rmSync, statSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { analyze, compile, compileAndroid, compileC, compileLibrary, renderAll, renderCoverage, resolveProvenanceSources, setProvenanceSources } from "@scriptc/compiler";
+import { analyze, compile, compileAndroid, compileC, compileLibrary, isExactExternalTypeSpecifier, renderAll, renderCoverage, resolveProvenanceSources, setProvenanceSources } from "@scriptc/compiler";
 import { defaultExecutableName } from "./paths.js";
 
 const USAGE = `scriptc — TypeScript/JavaScript to native executables (experimental)
@@ -16,6 +16,8 @@ Usage:
   scriptc coverage <file.ts|.js> --dynamic  what a --dynamic build compiles, and what still blocks it
   scriptc build <file.ts|.js> --target android
                                             emit an Android Gradle/NDK project
+  scriptc coverage <file.ts|.js> --external-types <specifier=file.d.ts>
+                                            type-resolve an embedder-provided module for analysis
   scriptc build --lib --profile <p.json>    library mode: compile the profile's entry
                                             module to a linkable static archive
                                             (<name>.lib.a) exporting the
@@ -60,6 +62,11 @@ Options:
                      commit) as static program modules; packages without a
                      usable attestation keep the island path (a note, never
                      a failure)
+      --external-types <specifier=file.d.ts>
+                     coverage only: map an exact bare module specifier to a
+                     local declaration file. The declaration supplies types
+                     for analysis; the host module remains an explicit
+                     external-boundary blocker (repeatable)
   -h, --help         show this help
   -v, --version      print the version
 `;
@@ -125,6 +132,7 @@ const CLI_OPTIONS = {
   ffi: { type: "string" },
   "npm-static": { type: "string", multiple: true },
   "provenance-sources": { type: "boolean", default: false },
+  "external-types": { type: "string", multiple: true },
   lib: { type: "boolean", default: false },
   profile: { type: "string" },
   help: { type: "boolean", short: "h", default: false },
@@ -133,6 +141,7 @@ const CLI_OPTIONS = {
 
 async function main(): Promise<number> {
   const { values, positionals } = parseCli();
+  const externalTypeArgs = values["external-types"] ?? [];
 
   if (values.version) {
     process.stdout.write(`${version()}\n`);
@@ -161,9 +170,9 @@ async function main(): Promise<number> {
     if (inputArg) {
       fail("scriptc build --lib takes no input positional: the profile names the entry module");
     }
-    if (values.target !== undefined || values.dynamic || values.backend !== undefined || values.ffi !== undefined || (values["npm-static"] ?? []).length > 0) {
+    if (values.target !== undefined || values.dynamic || values.backend !== undefined || values.ffi !== undefined || (values["npm-static"] ?? []).length > 0 || externalTypeArgs.length > 0) {
       fail(
-        "scriptc build --lib takes no --target/--dynamic/--backend/--npm-static/--ffi: the profile pins the emission, npm imports are judged automatically, and outbound FFI currently belongs to executable builds",
+        "scriptc build --lib takes no --target/--dynamic/--backend/--npm-static/--ffi/--external-types: the profile pins the emission, npm imports are judged automatically, outbound FFI belongs to executable builds, and external type mappings belong to coverage",
       );
     }
     const profilePath = resolve(profileArg);
@@ -191,6 +200,34 @@ async function main(): Promise<number> {
   }
   if (!inputArg) fail(`missing input file\n\n${USAGE}`);
   const input = resolve(inputArg);
+  if (externalTypeArgs.length > 0 && command !== "coverage") {
+    fail(`--external-types is a coverage-only option\n\n${USAGE}`);
+  }
+  const externalTypes: Record<string, string> = Object.create(null) as Record<string, string>;
+  for (const mapping of externalTypeArgs) {
+    const equals = mapping.indexOf("=");
+    if (equals <= 0 || equals === mapping.length - 1) {
+      fail(`invalid --external-types mapping ${JSON.stringify(mapping)} (expected <specifier=file.d.ts>)`);
+    }
+    const specifier = mapping.slice(0, equals).trim();
+    const declarationArg = mapping.slice(equals + 1).trim();
+    if (!isExactExternalTypeSpecifier(specifier)) {
+      fail(`invalid --external-types specifier ${JSON.stringify(specifier)} (expected an exact bare package specifier)`);
+    }
+    if (!/\.d\.(?:ts|mts|cts)$/.test(declarationArg)) {
+      fail(`invalid --external-types declaration ${JSON.stringify(declarationArg)} (expected a .d.ts, .d.mts, or .d.cts file)`);
+    }
+    if (externalTypes[specifier] !== undefined) {
+      fail(`duplicate --external-types mapping for ${JSON.stringify(specifier)}`);
+    }
+    const declarationPath = resolve(declarationArg);
+    try {
+      if (!statSync(declarationPath).isFile()) throw new Error("not a file");
+    } catch {
+      fail(`--external-types declaration does not name a readable file: ${declarationPath}`);
+    }
+    externalTypes[specifier] = declarationPath;
+  }
   const ffiProfilePath = values.ffi !== undefined ? resolve(values.ffi) : undefined;
   const target = values.target;
   if (target !== undefined && target !== "android") {
@@ -281,6 +318,7 @@ async function main(): Promise<number> {
       dynamic: values.dynamic,
       ...(npmStatic !== undefined ? { npmStatic } : {}),
       ...(ffiProfilePath !== undefined ? { ffiProfilePath } : {}),
+      ...(Object.keys(externalTypes).length > 0 ? { externalTypes } : {}),
     });
     const color = process.stdout.isTTY ?? false;
     process.stdout.write(renderCoverage(coverage, { color, sourceTexts }) + "\n");

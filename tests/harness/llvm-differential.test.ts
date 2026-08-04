@@ -58,6 +58,11 @@ const TIER_FLOOR = [
   "401-mutual-recursion.ts",
 ];
 
+/** Fixed backend gaps whose corpus programs must remain in the LLVM tier. */
+const TIER_REGRESSIONS = [
+  "2672-http-request-response-callback.ts",
+];
+
 interface RunResult {
   stdout: Buffer;
   stderr: Buffer;
@@ -297,6 +302,12 @@ describe(`llvm differential corpus (${files.length} programs${sanitize ? ", sani
     // Under a shard, only the floor programs THIS slice ran can be asserted
     // (same key as the corpus split above); the shard union covers all six.
     for (const name of shardSelect(TIER_FLOOR, (n) => n)) {
+      expect(claimed, `${name} regressed out of the LLVM tier`).toContain(name);
+    }
+  });
+
+  test("fixed tier regressions stay claimed", () => {
+    for (const name of shardSelect(TIER_REGRESSIONS, (n) => n)) {
       expect(claimed, `${name} regressed out of the LLVM tier`).toContain(name);
     }
   });

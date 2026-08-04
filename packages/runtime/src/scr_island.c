@@ -2355,6 +2355,25 @@ ScrJsval *scr_jsval_call(ScrJsval *f, int argc, ScrJsval **argv) {
   return isl_cell_new(r);
 }
 
+/* Call an already-resolved computed member with its original receiver. The
+ * frontend performs GetValue before argument evaluation, then arrives here
+ * after the arguments are ready; keeping callee and receiver separate avoids
+ * a second getter read while preserving method `this`. */
+ScrJsval *scr_jsval_call_this(ScrJsval *f, ScrJsval *receiver, int argc,
+                              ScrJsval **argv) {
+  isl_entry();
+  JSValue stack_args[8];
+  JSValue *args = argc <= 8 ? stack_args : malloc((size_t)argc * sizeof(JSValue));
+  for (int i = 0; i < argc; i++) args[i] = argv[i]->v;
+  JSValue r = JS_Call(isl_ctx, f->v, receiver->v, argc, args);
+  if (args != stack_args) free(args);
+  if (JS_IsException(r)) {
+    isl_bridge_exception();
+    return NULL;
+  }
+  return isl_cell_new(r);
+}
+
 /* Spread application on an island callee (jsOp callSpread) — the prelude
  * helper's real `f(...pre, ...spread)`, so iterator protocols are the
  * engine's own and the guards front-run V8's exact spread-call TypeError

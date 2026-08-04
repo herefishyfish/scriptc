@@ -6130,25 +6130,157 @@ const NUMBER_CONSTANTS: Record<string, number | undefined> = {
     return { kind: "libCall", fn: "date.toISOString", args: [ms], type: STRING, loc };
   }
 
-/** The WHATWG encoder pair, COMPOSED: `new TextDecoder().decode(bytes)`
-   * and `new TextEncoder().encode(s)` — the encoder object between the two
-   * calls never exists (the crypto/Date precedent; bare construction is
-   * fenced in lowerNew with the composed hint). decode is the runtime's
-   * WHATWG utf-8 decode with the leading BOM stripped; a zero-argument
-   * decode() is "" like the spec's. encode IS Buffer.from(s, "utf8") —
-   * ScrStr storage is well-formed UTF-8, so the bytes are identical (lone
+type TextCodecCtor = {
+  cls: "TextDecoder" | "TextEncoder";
+  ctor: ts.NewExpression;
+};
+
+/** A direct construction of THE stdlib TextEncoder/TextDecoder, through
+   * type-only wrappers. Name alone is never enough: a user class with the
+   * same spelling keeps the ordinary class lowering. */
+  function directTextCodecCtorOf(L: Lowerer, expr: ts.Expression): TextCodecCtor | null {
+    const ctor = stripTypeCasts(expr);
+    if (!ts.isNewExpression(ctor)) return null;
+    const callee = stripTypeCasts(ctor.expression);
+    if (!ts.isIdentifier(callee)) return null;
+    if (callee.text !== "TextDecoder" && callee.text !== "TextEncoder") return null;
+    const sym = L.resolveValueSymbol(callee);
+    if (!sym || !L.isStdlibSymbol(sym)) return null;
+    if (sym.name !== "TextDecoder" && sym.name !== "TextEncoder") return null;
+    return { cls: sym.name, ctor };
+  }
+
+/** True when construction itself is effect-free and inside the already
+   * lowered codec slice, so a const binding can be erased and calls can
+   * resolve back to the initializer. TextDecoder's explicit label must be
+   * an actual literal here: accepting an arbitrary expression merely typed
+   * as "utf-8" would move or repeat its effects when the binding is erased. */
+  function erasableTextCodecCtor(info: TextCodecCtor): boolean {
+    const args = info.ctor.arguments ?? [];
+    if (info.cls === "TextEncoder") return args.length === 0;
+    if (args.length === 0) return true;
+    if (args.length !== 1) return false;
+    const label = stripTypeCasts(args[0]!);
+    return ts.isStringLiteralLike(label) && (label.text === "utf-8" || label.text === "utf8");
+  }
+
+/** `const encoder = new TextEncoder()` / the default TextDecoder twin:
+   * compile-time alias plumbing with no runtime object. Calls through the
+   * stable binding are recognized by textCodecReceiverOf below; any other
+   * reached value use keeps the ordinary SC2020 representation fence. Both
+   * declaration walks call this and independently gate on constness. */
+  export function textCodecBindingClassOf(
+    L: Lowerer,
+    nameNode: ts.Node,
+    init: ts.Expression | undefined,
+  ): TextCodecCtor["cls"] | null {
+    if (!ts.isIdentifier(nameNode) || init === undefined) return null;
+    const decl = nameNode.parent;
+    if (
+      !ts.isVariableDeclaration(decl) || !ts.isVariableDeclarationList(decl.parent) ||
+      !ts.isVariableStatement(decl.parent.parent)
+    ) {
+      return null;
+    }
+    const info = directTextCodecCtorOf(L, init);
+    return info !== null && erasableTextCodecCtor(info) ? info.cls : null;
+  }
+
+  export function textCodecBindingDecl(
+    L: Lowerer,
+    nameNode: ts.Node,
+    init: ts.Expression | undefined,
+  ): boolean {
+    return textCodecBindingClassOf(L, nameNode, init) !== null;
+  }
+
+/** The inline composed receiver, or a const identifier whose initializer
+   * is an erasable codec construction in the same execution scope and
+   * after that declaration. Following the declaration instead of
+   * materializing the value is honest for the supported slice: receiver
+   * reads are pure, construction has no effects, and every non-call use
+   * fences because there is deliberately no general value lowering. */
+  function textCodecReceiverOf(L: Lowerer, expr: ts.Expression): TextCodecCtor | null {
+    const direct = directTextCodecCtorOf(L, expr);
+    if (direct !== null) return direct;
+    const receiver = stripTypeCasts(expr);
+    if (!ts.isIdentifier(receiver)) return null;
+    const sym = L.resolveValueSymbol(receiver);
+    const decl = sym ? L.checker.valueDeclarationOf(sym) : undefined;
+    if (
+      !decl || !ts.isVariableDeclaration(decl) || decl.initializer === undefined ||
+      !ts.isVariableDeclarationList(decl.parent) || (decl.parent.flags & ts.NodeFlags.Const) === 0 ||
+      !textCodecBindingDecl(L, decl.name, decl.initializer)
+    ) {
+      return null;
+    }
+    // A closure can run before the const initializes (TDZ), and an
+    // imported binding can be observed during a module cycle; both need
+    // real runtime storage rather than this deliberately trivial rewrite.
+    const executionScope = (node: ts.Node): ts.Node => {
+      let child = node;
+      for (let cur = node.parent; ; child = cur, cur = cur.parent) {
+        if (ts.isFunctionLike(cur) || ts.isSourceFile(cur)) return cur;
+        // An instance field initializer runs when an object is constructed,
+        // not when its enclosing class expression evaluates. Treat it like
+        // a closure boundary: a later source position does not prove the
+        // codec declaration ran (a switch can enter a following case and
+        // instantiate the class while the binding is still in its TDZ).
+        if (
+          ts.isPropertyDeclaration(cur) && cur.initializer === child &&
+          (ts.getCombinedModifierFlags(cur) & ts.ModifierFlags.Static) === 0
+        ) {
+          return cur;
+        }
+      }
+    };
+    if (executionScope(receiver) !== executionScope(decl) || receiver.getStart() < decl.end) return null;
+    // All switch clauses share one lexical environment, but dispatch can
+    // enter a later clause without executing a const in an earlier one.
+    // TypeScript normally diagnoses the direct read; an @ts-expect-error
+    // can deliberately retain the runtime TDZ shape, so source order alone
+    // is not a sufficient proof. A codec declared in a clause is erasable
+    // only for uses inside that exact clause's subtree (nested switches are
+    // fine; closures and instance initializers already fail executionScope).
+    const switchClauseOf = (node: ts.Node): ts.CaseOrDefaultClause | null => {
+      for (let cur: ts.Node | undefined = node.parent; cur !== undefined; cur = cur.parent) {
+        if (ts.isCaseClause(cur) || ts.isDefaultClause(cur)) return cur;
+        if (ts.isFunctionLike(cur) || ts.isSourceFile(cur)) return null;
+      }
+      return null;
+    };
+    const declClause = switchClauseOf(decl);
+    if (declClause !== null) {
+      let insideDeclClause = false;
+      for (let cur: ts.Node | undefined = receiver; cur !== undefined; cur = cur.parent) {
+        if (cur === declClause) {
+          insideDeclClause = true;
+          break;
+        }
+      }
+      if (!insideDeclClause) return null;
+    }
+    return directTextCodecCtorOf(L, decl.initializer);
+  }
+
+/** The WHATWG encoder pair, COMPOSED or through an erasable const binding:
+   * `new TextDecoder().decode(bytes)`, `new TextEncoder().encode(s)`, and
+   * the idiomatic store-then-call equivalents. The codec object never
+   * exists (the crypto/Date precedent); bare construction and value uses
+   * are fenced with the composed hint. decode is the runtime's WHATWG
+   * utf-8 decode with the leading BOM stripped; a zero-argument decode()
+   * is "" like the spec's. encode IS Buffer.from(s, "utf8") — ScrStr
+   * storage is well-formed UTF-8, so the bytes are identical (lone
    * surrogates became U+FFFD at string construction, exactly what the
-   * spec's encoder emits). Null when this is neither composed form. */
+   * spec's encoder emits). Null when this is neither supported form. */
   export function lowerTextCodecCall(L: Lowerer, call: ts.CallExpression,
     access: ts.PropertyAccessExpression,): IrExpr | null {
     if (call.questionDotToken || access.questionDotToken) return null;
     const member = access.name.text;
     if (member !== "decode" && member !== "encode") return null;
-    const recv = access.expression;
-    if (!ts.isNewExpression(recv) || !ts.isIdentifier(recv.expression)) return null;
-    const sym = L.resolveValueSymbol(recv.expression);
-    const cls = sym?.name;
-    if (!sym || !L.isStdlibSymbol(sym)) return null;
+    const info = textCodecReceiverOf(L, access.expression);
+    if (info === null || !L.isStdlibMember(access)) return null;
+    const { cls, ctor: recv } = info;
     if (!(cls === "TextDecoder" && member === "decode") && !(cls === "TextEncoder" && member === "encode")) {
       return null;
     }

@@ -151,6 +151,10 @@ export interface LibrarySidecarConfig {
   initExport: string;
   updateExport: string;
   subscriptionsExport: string;
+  /** True only when `sidecar.subscriptions_export` is present in the
+   * profile. Omission keeps subscriptions optional; a declared name is a
+   * reference that must resolve to an exported function. */
+  subscriptionsExportDeclared: boolean;
   /** The profile-selected source-tree hashing contract. v1 implements
    * exactly one: "module-graph" (wyhash-64, seed 0xc0de5eed, over the
    * length-prefixed sorted module graph — canonical root-relative POSIX
@@ -158,11 +162,12 @@ export interface LibrarySidecarConfig {
   sourceHash: "module-graph";
   /** Ask 4's declared integer boundary slots, keyed by the sidecar's slot
    * path grammar (`Msg.count`, `Point.x`, `helpers.clamp.params[0]`,
-   * `helpers.clamp.return`). Each named slot must resolve to a NUMBER
-   * slot of the projected contract (refused at sidecar build otherwise),
-   * is spelled i64 in the emitted document's TypeRef/descriptor (the
-   * frozen format-1 type vocabulary has no u64 — unsigned-ness is a
-   * boundary-slot refinement, not a type-table concept), joins
+   * `helpers.clamp.return`). Each named slot must resolve to a bare or
+   * optional NUMBER slot of the projected contract (refused at sidecar
+   * build otherwise), is spelled i64 (or optional<i64>) in the emitted
+   * document's TypeRef/descriptor (the frozen format-1 type vocabulary has
+   * no u64 — unsigned-ness is a boundary-slot refinement, not a type-table
+   * concept), joins
    * `integer_slots` with its DECLARED class ({i64, u64} — the u64
    * declaration is the stricter obligation, and the attestation records
    * the class whose proof was discharged), and obligates every
@@ -174,6 +179,9 @@ export interface LibrarySidecarConfig {
 export interface LibraryProfile {
   profileFormat: 1;
   name: string;
+  /** The profile file that produced this configuration. Semantic
+   * designation errors anchor here, where the offending name is written. */
+  profilePath: string;
   /** Resolved absolute path of the ONE entry module. */
   entry: string;
   /** The pinned emission — no fallback concept exists on the library path. */
@@ -431,6 +439,7 @@ export function loadLibraryProfile(
         initExport: nameField("init_export", "init"),
         updateExport: nameField("update_export", "update"),
         subscriptionsExport: nameField("subscriptions_export", "subscriptions"),
+        subscriptionsExportDeclared: s["subscriptions_export"] !== undefined,
         sourceHash: "module-graph",
         integerSlots,
       };
@@ -561,6 +570,7 @@ export function loadLibraryProfile(
       profile: {
         profileFormat: 1,
         name,
+        profilePath,
         entry,
         emission,
         prefix,

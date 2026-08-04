@@ -849,6 +849,12 @@ ScrStr *scr_insp_dyn(ScrDyn *d, double recurse, double depth) {
       scr_throw_error(SCR_ERR_ERROR, ib_take(&out));
       return scr_str_new("", 0);
     }
+    case SCR_DYN_TYPED_REF: {
+      ScrDyn *materialized = scr_dyn_typed_ref_materialize(d);
+      ScrStr *out = scr_insp_dyn(materialized, recurse, depth);
+      scr_dyn_release(materialized);
+      return out;
+    }
     case SCR_DYN_PROMISE: {
       /* Node renders Promise { <pending> } / Promise { value } — the
        * settled-value rendering pulls in the whole inspector; fence

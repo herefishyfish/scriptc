@@ -5440,6 +5440,42 @@
    ],
    "diags": []
   },
+  "<repo>/tests/corpus/2666-array-to-sorted.ts": {
+   "order": [
+    "<repo>/tests/corpus/2666-array-to-sorted.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2667-array-to-sorted-any.ts": {
+   "order": [
+    "<repo>/tests/corpus/2667-array-to-sorted-any.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2668-stored-number-array-iterator.ts": {
+   "order": [
+    "<repo>/tests/corpus/2668-stored-number-array-iterator.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2669-array-copying-methods.ts": {
+   "order": [
+    "<repo>/tests/corpus/2669-array-copying-methods.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2670-uint8array-copy-iterate.ts": {
+   "order": [
+    "<repo>/tests/corpus/2670-uint8array-copy-iterate.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2671-array-copying-js.cjs": {
+   "order": [
+    "<repo>/tests/corpus/2671-array-copying-js.cjs"
+   ],
+   "diags": []
+  },
   "<repo>/tests/corpus/300-if-else.ts": {
    "order": [
     "<repo>/tests/corpus/300-if-else.ts"
@@ -7449,6 +7485,12 @@
    ],
    "diags": []
   },
+  "<repo>/tests/diagnostics/text-codec-value.ts": {
+   "order": [
+    "<repo>/tests/diagnostics/text-codec-value.ts"
+   ],
+   "diags": []
+  },
   "<repo>/tests/diagnostics/tuples.ts": {
    "order": [
     "<repo>/tests/diagnostics/tuples.ts"
@@ -7928,6 +7970,12 @@
   "<repo>/tests/fixtures/node-types/fenced.ts": {
    "order": [
     "<repo>/tests/fixtures/node-types/fenced.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/fixtures/node-types/fetch-static.ts": {
+   "order": [
+    "<repo>/tests/fixtures/node-types/fetch-static.ts"
    ],
    "diags": []
   },

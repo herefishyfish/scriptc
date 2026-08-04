@@ -76,6 +76,7 @@ import {
   overridesDtsPath,
   registerWorkspacePackage,
   SUPPORTED_NODE_MODULES,
+  tsgoPath,
   unsupportedModuleFeatureOf,
   workspacePackageOfPath,
 } from "./shared.js";
@@ -361,6 +362,15 @@ export interface LoadResult {
    * checkPreflight. */
   startupCrash?: StartupCrash | null;
   configDiags: ScrDiagnostic[];
+  /** Coverage-only external host modules: exact bare specifier → local
+   * declaration file. These participate in checker resolution but never
+   * become runtime module edges. */
+  externalTypes: ReadonlyMap<string, string>;
+  /** The mapped declarations plus their relative declaration-file closure,
+   * keyed by normalized file name and attributed to every owning external
+   * specifier. Multiple exact module names may deliberately share one
+   * declaration surface. */
+  externalTypeSpecifiersByFile: ReadonlyMap<string, readonly string[]>;
   projectWorld: () => ts.Program;
 }
 
@@ -383,7 +393,97 @@ export interface StartupCrash {
   loc: { file: string; start: number; end: number };
 }
 
-function loadProgram7(host: ts.Ts7Host, entryPath: string): LoadResult & { disposeAll: () => void } {
+/** True when a coverage mapping names one exact bare host module. TypeScript
+ * gives `paths` keys containing `*` pattern semantics, so accepting one here
+ * would silently broaden the mapping beyond the specifier the caller named. */
+export function isExactExternalTypeSpecifier(specifier: string): boolean {
+  return (
+    specifier !== "" &&
+    !specifier.startsWith(".") &&
+    !specifier.startsWith("/") &&
+    !specifier.startsWith("#") &&
+    !specifier.startsWith("node:") &&
+    !specifier.includes("*")
+  );
+}
+
+function externalHostModuleDiag7(specifier: string, node: ts.Node): ScrDiagnostic {
+  return unsupportedDiag(
+    "SC1010",
+    locOf7(node),
+    `the '${specifier}' external host module (types supplied by --external-types, but no runtime implementation or scriptc lowering was provided)`,
+    "the declaration mapping is analysis-only: coverage continues through project code, while executing this module requires an embedder integration with explicit runtime semantics",
+  );
+}
+
+/** Expand each mapped declaration entry through RELATIVE declaration
+ * dependencies. Declaration packages commonly expose a barrel index.d.ts;
+ * the structural types declared in its sibling files are part of the same
+ * checker-only host surface. Bare imports deliberately do not inherit this
+ * trust: they name a separate package/surface and need their own mapping. */
+function externalTypeFileClosure7(
+  program: ts.Program,
+  externalTypes: ReadonlyMap<string, string>,
+): ReadonlyMap<string, readonly string[]> {
+  const ownersByFile = new Map<string, Set<string>>();
+  const addOwner = (file: string, specifier: string): boolean => {
+    let owners = ownersByFile.get(file);
+    if (owners === undefined) {
+      owners = new Set();
+      ownersByFile.set(file, owners);
+    }
+    if (owners.has(specifier)) return false;
+    owners.add(specifier);
+    return true;
+  };
+  for (const [specifier, file] of externalTypes) {
+    addOwner(tsgoPath(resolve(file)), specifier);
+  }
+
+  const queue: { sf: ts.SourceFile; owner: string }[] = [];
+  for (const [owner, entry] of externalTypes) {
+    const file = tsgoPath(resolve(entry));
+    const sf = program.getSourceFile(file);
+    if (sf?.isDeclarationFile) queue.push({ sf, owner });
+  }
+  const visited = new Set<string>();
+  while (queue.length > 0) {
+    const { sf, owner } = queue.shift()!;
+    const file = tsgoPath(resolve(sf.fileName));
+    const visitKey = `${file}\0${owner}`;
+    if (visited.has(visitKey)) continue;
+    visited.add(visitKey);
+
+    const admit = (dep: ts.SourceFile | null): void => {
+      if (dep === null || !dep.isDeclarationFile) return;
+      const depFile = tsgoPath(resolve(dep.fileName));
+      if (!addOwner(depFile, owner)) return;
+      queue.push({ sf: dep, owner });
+    };
+    // SourceFile.imports includes import/export declarations, import =
+    // require(), and import("…") type nodes. Only relative edges inherit
+    // the mapped entry's ownership.
+    for (const node of sf.imports) {
+      if (ts.isStringLiteralLike(node) && isRelativeSpecifier(node.text)) {
+        admit(resolveImport7(program, sf, node.text));
+      }
+    }
+    // Triple-slash path references are the other declaration-local edge.
+    for (const ref of sf.referencedFiles) {
+      const depPath = tsgoPath(resolve(dirname(sf.fileName), ref.fileName));
+      admit(program.getSourceFile(depPath) ?? null);
+    }
+  }
+  return new Map(
+    [...ownersByFile].map(([file, owners]) => [file, [...owners]] as const),
+  );
+}
+
+function loadProgram7(
+  host: ts.Ts7Host,
+  entryPath: string,
+  externalTypes: ReadonlyMap<string, string> = new Map(),
+): LoadResult & { disposeAll: () => void } {
   const config = adoptProjectConfig7(host, entryPath);
   const nodeTypes = config.configFile ? resolveNodeTypes7(entryPath) : null;
   const platformTypes = resolvePlatformTypes7(entryPath);
@@ -412,12 +512,16 @@ function loadProgram7(host: ts.Ts7Host, entryPath: string): LoadResult & { dispo
   // so tsgo's OWN resolution of the bare specifiers lands on the same
   // source files the preflight resolver answers — the checker types the
   // driver against the package's real TypeScript, not its shipped .d.ts.
-  const paths = provenancePaths();
-  if (paths !== null || sourcePlatformName() === "android") {
+  const provenance = provenancePaths();
+  if (provenance !== null || externalTypes.size > 0 || sourcePlatformName() === "android") {
+    const paths: Record<string, string[]> = { ...(provenance ?? {}) };
+    for (const [specifier, declarationPath] of externalTypes) {
+      paths[specifier] = [declarationPath];
+    }
     options = {
       ...options,
       paths: {
-        ...(paths ?? {}),
+        ...paths,
         ...(sourcePlatformName() === "android"
           ? { "~/*": ["./*"] }
           : {}),
@@ -435,12 +539,15 @@ function loadProgram7(host: ts.Ts7Host, entryPath: string): LoadResult & { dispo
   const program = ts.createProgram([...coreRoots, overridesDtsPath()], options, host);
   const entry = program.getSourceFile(entryPath);
   if (!entry) throw new Error(`could not load ${entryPath}`);
+  const externalTypeSpecifiersByFile = externalTypeFileClosure7(program, externalTypes);
   let projectWorld: ts.Program | null = null;
   return {
     program,
     entry,
     moduleOrder: [],
     configDiags: config.diags,
+    externalTypes,
+    externalTypeSpecifiersByFile,
     projectWorld: () => (projectWorld ??= ts.createProgram(coreRoots, options, host)),
     disposeAll: () => {
       projectWorld?.dispose();
@@ -460,11 +567,39 @@ export function loadProgram(
      * modules this load (npm-static.ts owns the doctrine). Every load
      * RESETS the module state, so flagless loads always start clean. */
     npmStatic?: Iterable<string>;
+    /** Coverage-only type surfaces for modules supplied by an embedder.
+     * Exact bare specifiers only; values never become runtime edges. */
+    externalTypes?: ReadonlyMap<string, string> | Readonly<Record<string, string>> | undefined;
   },
 ): LoadResult & { dispose: () => void } {
   // Absolute from the start: tsgo's world is absolute-path-keyed (the CLI
   // resolves before calling; this covers direct API callers too).
   entryPath = resolve(entryPath);
+  const externalTypeEntries = opts?.externalTypes instanceof Map
+    ? [...opts.externalTypes]
+    : Object.entries(opts?.externalTypes ?? {});
+  const externalTypes = new Map<string, string>();
+  for (const [specifier, file] of externalTypeEntries) {
+    if (!isExactExternalTypeSpecifier(specifier)) {
+      throw new TypeError(
+        `invalid external type specifier ${JSON.stringify(specifier)} (expected an exact bare package specifier)`,
+      );
+    }
+    if (!/\.d\.(?:ts|mts|cts)$/.test(file)) {
+      throw new TypeError(
+        `invalid external type declaration ${JSON.stringify(file)} for ${JSON.stringify(specifier)} (expected a .d.ts, .d.mts, or .d.cts file)`,
+      );
+    }
+    const declarationPath = resolve(file);
+    try {
+      if (!statSync(declarationPath).isFile()) throw new Error("not a file");
+    } catch {
+      throw new TypeError(
+        `external type declaration for ${JSON.stringify(specifier)} does not name a readable file: ${declarationPath}`,
+      );
+    }
+    externalTypes.set(specifier, declarationPath);
+  }
   setNpmStaticPackages(opts?.npmStatic ?? []);
   // Workspace-package registrations reset per load (same discipline as the
   // npm-static set), then the opted-in names are probed UP FRONT: a
@@ -505,7 +640,7 @@ export function loadProgram(
       platformSourceSibling(path) !== null ? true : undefined,
   };
   const host = new ts.Ts7Host({ cwd: dirname(entryPath), fsShadow });
-  const load = loadProgram7(host, entryPath);
+  const load = loadProgram7(host, entryPath, externalTypes);
   return {
     ...load,
     dispose: () => {
@@ -1989,7 +2124,12 @@ function preflight7(load: LoadResult): {
         // fence); `import type x = require(...)` is pure type surface and
         // lowers to nothing.
         if (ts.isExternalModuleReference(stmt.moduleReference) && !stmt.isTypeOnly) {
-          diags.push(unsupportedDiag("SC1013", locOf7(stmt), "import = require(...) assignments"));
+          const spec = stmt.moduleReference.expression;
+          if (spec !== undefined && ts.isStringLiteralLike(spec) && load.externalTypes.has(spec.text)) {
+            diags.push(externalHostModuleDiag7(spec.text, stmt));
+          } else {
+            diags.push(unsupportedDiag("SC1013", locOf7(stmt), "import = require(...) assignments"));
+          }
         }
         continue;
       }
@@ -2012,6 +2152,10 @@ function preflight7(load: LoadResult): {
               pos: stmt.getStart(sf),
             });
           }
+          continue;
+        }
+        if (load.externalTypes.has(fromSpec)) {
+          diags.push(externalHostModuleDiag7(fromSpec, stmt));
           continue;
         }
         if (!isRelativeSpecifier(fromSpec)) {
@@ -2082,6 +2226,10 @@ function preflight7(load: LoadResult): {
       const specNode: ts.Expression | undefined = stmt.moduleSpecifier;
       if (specNode === undefined || !ts.isStringLiteral(specNode)) continue;
       const spec = specNode.text;
+      if (load.externalTypes.has(spec)) {
+        diags.push(externalHostModuleDiag7(spec, stmt));
+        continue;
+      }
       const isRelative = isRelativeSpecifier(spec);
       const isBare = !isRelative && !ambientModules.has(spec);
       // --npm-static: an opted-in package importing node:module admits
@@ -2330,6 +2478,9 @@ function preflight7(load: LoadResult): {
             );
             continue;
           }
+          if (load.externalTypes.has(req.spec)) {
+            continue;
+          }
           if (req.decl && ts.isArrayBindingPattern(req.decl.name)) {
             diags.push(unsupportedDiag("SC1012", loc, "array-destructuring require() bindings"));
             continue;
@@ -2402,6 +2553,9 @@ function preflight7(load: LoadResult): {
         for (const call of nestedBareRequiresOf7(sf)) {
           const spec = requireSpecOf7(call)!;
           const loc = { file: sf.fileName, start: call.getStart(sf), end: call.getEnd() };
+          if (load.externalTypes.has(spec)) {
+            continue;
+          }
           if (!isRelativeSpecifier(spec)) {
             // --npm-static: opted-in packages ride the program-module edge
             // (the statement-level require branch above).

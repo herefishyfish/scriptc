@@ -1299,7 +1299,30 @@ export type IrStmt =
  * from the end, clamping; omitted args omitted from `args` — backends fill
  * 0 / +Infinity, the strIntrinsic convention); ref elements retain into
  * the fresh array. */
-export type IrArrIntrinsicMethod = "length" | "push" | "pushSpread" | "pop" | "indexOf" | "includes" | "join" | "slice" | "shift" | "splice";
+export type IrArrIntrinsicMethod =
+  | "length"
+  | "push"
+  | "pushSpread"
+  | "pop"
+  | "indexOf"
+  | "includes"
+  | "join"
+  | "slice"
+  | "shift"
+  | "splice"
+  /** ES2023 copying methods. `toSpliced` receives [start, deleteCount,
+   * itemsArray], with omitted arguments completed by the frontend;
+   * `with` receives [index, value] and throws Node's catchable RangeError
+   * when the relative index is out of range. */
+  | "toReversed"
+  | "toSpliced"
+  | "with";
+
+/** Array intrinsics whose runtime implementation can raise a catchable
+ * exception (rather than the static tier's deliberate index traps). */
+export const MAY_THROW_ARR_METHODS: ReadonlySet<IrArrIntrinsicMethod> = new Set([
+  "with",
+]);
 
 /** The Map method/property surface (mirrors ambient/scriptc.d.ts) plus the
  * iteration primitives behind the forEach desugar. `forEach` itself is NOT
@@ -1438,6 +1461,16 @@ export type IrBytesIntrinsicMethod =
   | "get"
   | "slice"
   | "subarray"
+  /** Fresh Uint8Array copying methods. `with` takes [index, value] and
+   * throws a catchable RangeError for an invalid relative index. */
+  | "toReversed"
+  | "with"
+  /** Uint8Array.prototype.join(separator), with the omitted separator
+   * completed to "," by the frontend. */
+  | "join"
+  /** Drain numeric typed-array elements into a fresh number[]. Used by
+   * array spread and typed-array destructuring rest. */
+  | "toArray"
   | "setFrom"
   | "toString"
   | "readNum"
@@ -1505,6 +1538,7 @@ export type IrBytesIntrinsicMethod =
 /** The bytesIntrinsic methods that can raise a catchable error — backends'
  * may-throw analyses seed on these exactly like MAY_THROW_LIB_FNS. */
 export const MAY_THROW_BYTES_METHODS: ReadonlySet<IrBytesIntrinsicMethod> = new Set([
+  "with",
   "setFrom",
   "readNum",
   "writeNum",
@@ -1607,6 +1641,20 @@ export type IrLibFn =
   /** Metadata-resolved JNI static field read. Args: owner, name,
    * descriptor. */
   | "android.staticField"
+  /** Native static fetch and its Web-platform companions. fetch.start
+   * answers once the response head arrives; the response body readers
+   * consume the native body stream. AbortSignal and ReadableStream values
+   * are opaque checked-dynamic handles. */
+  | "fetch.start"
+  | "fetch.responseJson"
+  | "fetch.responseText"
+  | "fetch.responseBytes"
+  | "fetch.abortTimeout"
+  | "fetch.abortNow"
+  | "fetch.abortAny"
+  | "fetch.streamNew"
+  | "fetch.streamFrom"
+  | "fetch.readerRead"
   | "island.eval"
   /** Load an embedded npm package's runtime entry in the island (cached by
    * the engine's module registry) and take one export: args are the entry
@@ -3798,12 +3846,12 @@ export type IrLibFn =
   /** WHATWG TextDecoder.decode over u8 bytes (scr_bytes.c): utf-8 with
    * default options — the same maximal-subpart replacement decode as
    * Buffer.toString("utf8"), with the leading BOM stripped (the one
-   * behavioral difference; ignoreBOM defaults to false). Only the
-   * COMPOSED `new TextDecoder().decode(bytes)` form lowers — decoder
-   * values have no representation. TextEncoder.encode needs no libFn:
-   * `new TextEncoder().encode(s)` lowers to buffer.fromStr(s, "utf8")
-   * (identical bytes — ScrStr storage is well-formed UTF-8). Borrowed
-   * arg; owned (+1) string; never throws. */
+   * behavioral difference; ignoreBOM defaults to false). The composed
+   * `new TextDecoder().decode(bytes)` form and its same-scope const
+   * store-then-call twin lower — decoder values still have no general
+   * representation. TextEncoder.encode needs no libFn: its matching forms
+   * lower to buffer.fromStr(s, "utf8") (identical bytes — ScrStr storage
+   * is well-formed UTF-8). Borrowed arg; owned (+1) string; never throws. */
   | "text.decode"
   /** The wider sync fs slice (scr_lib.c), all throwing catchably with
    * Node's errno message shapes and `.code` stamped like the rest of
@@ -3987,7 +4035,10 @@ export type IrExpr =
   | { kind: "logical"; op: "&&" | "||"; left: IrExpr; right: IrExpr; type: IrType; loc: SrcLoc }
   | { kind: "strConcat"; left: IrExpr; right: IrExpr; type: IrType; loc: SrcLoc }
   | { kind: "strEq"; negated: boolean; left: IrExpr; right: IrExpr; type: IrType; loc: SrcLoc }
-  | { kind: "strCmp"; op: IrStrCmpOp; left: IrExpr; right: IrExpr; type: IrType; loc: SrcLoc }
+  /** String ordering. Ordinary source comparisons omit `utf16` and retain
+   * scriptc's documented code-point order; the default Array sort comparator
+   * sets it to request ECMAScript's UTF-16 code-unit order. */
+  | { kind: "strCmp"; op: IrStrCmpOp; left: IrExpr; right: IrExpr; utf16?: boolean; type: IrType; loc: SrcLoc }
   /** f64|bool → string, JS-exact (Number::toString / "true"/"false").
    * Union operands dispatch through the per-union ToString helper (arms
    * fenced to unit/string/f64/bool by the frontend); a CAUGHT operand is
@@ -4438,8 +4489,13 @@ export type IrExpr =
    * TypeError), the interned signature key (dynCheck's exact-unwrap fast
    * path), and `fnName` — the best-effort static spelling for inspect
    * ([Function: name]) and Node-shaped call errors. The operand is
-   * borrowed; the result is owned (+1). Never throws. */
-  | { kind: "dynFrom"; value: IrExpr; fnName?: string; type: IrType; loc: SrcLoc }
+   * borrowed; the result is owned (+1). Never throws. `liveRef` is the
+   * narrow Web-platform exception for record/array/bytes values (including
+   * mutable arms selected at runtime from a union) whose API contract
+   * exposes the same reference again (stream chunks and abort reasons): it
+   * emits a typed capsule with a live materializer instead of the ordinary
+   * deep copy. */
+  | { kind: "dynFrom"; value: IrExpr; fnName?: string; liveRef?: true; type: IrType; loc: SrcLoc }
   /** Island value → dyn conversion (`type` is always dyn; the operand
    * is always jsval): the jsval→dyn crossing — an 'any'-typed engine
    * value flowing into an 'unknown'/'object'/JS-residue slot wraps BY
@@ -4818,7 +4874,7 @@ export type IrExpr =
    * pinned prelude closures, not C reimplementations). `args` are
    * jsval-typed and borrowed. Result `type` per op: arithmetic
    * (add/sub/mul/div/mod/pow), unary neg/plus, getProp/getIdx,
-   * callMethod/callFn/globalGet → jsval (+1); comparisons
+   * callMethod/callFn/callFnThis/globalGet → jsval (+1); comparisons
    * (lt/le/gt/ge/eq/neq), truthy, not → bool; typeof, toStr → string (+1);
    * setProp/setIdx → void. `name` carries the property/method identifier
    * for getProp/setProp/callMethod/globalGet, absent otherwise. MAY THROW
@@ -4866,6 +4922,10 @@ export type IrJsOp =
   | "truthy" | "not" | "typeof" | "toStr"
   | "getProp" | "setProp" | "getIdx" | "setIdx"
   | "callMethod" | "callFn"
+  /** Calls an already-resolved island function with an explicit receiver.
+   * Args are (callee, receiver, ...arguments); this preserves computed
+   * method evaluation order without reading a getter twice. */
+  | "callFnThis"
   /** Spread application on an island callee — `f(...pre, ...s)`, the
    * rest-forwarding idiom (`(...args) => g(...args)` under --dynamic).
    * Args are exactly (callee, pre, spread): `pre` is the engine array of
@@ -4928,7 +4988,7 @@ export function jsOpResultKind(op: IrJsOp): "jsval" | "bool" | "string" | "void"
   switch (op) {
     case "add": case "sub": case "mul": case "div": case "mod": case "pow":
     case "neg": case "plus":
-    case "getProp": case "getIdx": case "callMethod": case "callFn":
+    case "getProp": case "getIdx": case "callMethod": case "callFn": case "callFnThis":
     case "callSpread":
     case "construct":
     case "globalGet":
@@ -5296,13 +5356,12 @@ export function canConvertToDyn(
   getUnion: (unionId: string) => IrUnionDef | undefined,
 ): boolean {
   if (isJsonSafeType(t, getRecord, getUnion)) return true;
-  // bytes<u8> is a dyn kind the walker boxes ANYWHERE (payload copied),
-  // including nested in records/arrays/unions — the tls/https options
-  // record's cert/key/ca Buffers. isJsonSafeType rejects nested bytes
-  // (no JSON-exact round trip), but dynFrom needs only that the walker
-  // can build the dyn value, which it can — so canConvertToDyn folds the
-  // bytes-bearing composites in beyond the JSON-safe core.
-  if (canBoxBytesComposite(t, getRecord, getUnion)) return true;
+  // bytes<u8> and boxable functions are dyn kinds the walker boxes
+  // ANYWHERE (bytes copied, functions held by identity), including nested
+  // in records/arrays/unions. isJsonSafeType rejects them, but dynFrom
+  // needs only that the walker can build the dyn value, so this composite
+  // fold extends the JSON-safe core.
+  if (canBoxDynComposite(t, getRecord, getUnion)) return true;
   if (t.kind === "bytes" && t.elem === "u8") return true;
   // %Error converts as the checked-dynamic tree's error encoding ({%error, name, message,
   // code?} — the caughtToDyn shape, scr_dyn_from_error): the dyn 'error'
@@ -5337,13 +5396,13 @@ export function canConvertToDyn(
   return false;
 }
 
-/** The bytes-bearing extension of the dynFrom domain: JSON-safe scalars
- * plus bytes<u8> anywhere, recursing through records (fields + index
- * value), arrays, and unit-armed unions — exactly the sc_td_* walker's
- * capability for the tls/https options-record shapes. Returns false for
- * a composite carrying any kind the walker cannot box (funcs, Maps,
- * handles nested in a record); those still fence. */
-function canBoxBytesComposite(
+/** The composite extension of the dynFrom domain: JSON-safe scalars plus
+ * bytes<u8> and boxable functions anywhere, recursing through records
+ * (fields + index value), arrays, and unit-armed unions — exactly the
+ * sc_td_* walker's capability. Returns false for a composite carrying a
+ * kind the walker cannot box (Maps or handles nested in a record); those
+ * still fence. */
+function canBoxDynComposite(
   t: IrType,
   getRecord: (shapeId: string) => IrRecordShape | undefined,
   getUnion: (unionId: string) => IrUnionDef | undefined,
@@ -5359,23 +5418,25 @@ function canBoxBytesComposite(
       return true;
     case "bytes":
       return t.elem === "u8";
+    case "func":
+      return canBoxFuncIntoDyn(t, getRecord, getUnion);
     case "array":
-      return canBoxBytesComposite(t.elem, getRecord, getUnion, visiting);
+      return canBoxDynComposite(t.elem, getRecord, getUnion, visiting);
     case "record": {
       const shape = getRecord(t.shapeId);
       if (!shape) return false;
       // Recursive shapes answer coinductively, like isJsonSafeType.
       if (visiting.has(t.shapeId)) return true;
       visiting.add(t.shapeId);
-      if (!shape.fields.every((f) => canBoxBytesComposite(f.type, getRecord, getUnion, visiting))) return false;
-      return !shape.indexValue || canBoxBytesComposite(shape.indexValue, getRecord, getUnion, visiting);
+      if (!shape.fields.every((f) => canBoxDynComposite(f.type, getRecord, getUnion, visiting))) return false;
+      return !shape.indexValue || canBoxDynComposite(shape.indexValue, getRecord, getUnion, visiting);
     }
     case "union": {
       const def = getUnion(t.unionId);
       if (!def) return false;
       if (visiting.has(t.unionId)) return true;
       visiting.add(t.unionId);
-      return def.arms.every((a) => canBoxBytesComposite(a, getRecord, getUnion, visiting));
+      return def.arms.every((a) => canBoxDynComposite(a, getRecord, getUnion, visiting));
     }
     default:
       return false;
@@ -5552,18 +5613,10 @@ export function moduleUsesRegex(mod: IrModule): boolean {
   return found;
 }
 
-/** True when the embedded npm graph references fetch — the link switch
- * that pulls scr_fetch.c + its socket/tls/zlib dependencies into the binary (cc.ts) and
- * has the emitted main call scr_fetch_install. A word-boundary scan over
- * the embedded SOURCES, erring toward linking: a false positive costs one
- * dylib reference; a false negative would leave embedded code without the
- * global at runtime. Static builds and fetch-free graphs keep their exact
- * historical link lines. */
-export function moduleUsesFetch(mod: IrModule): boolean {
-  const embedded = mod.embedded;
-  if (embedded && embedded.modules.some((m) => /\bfetch\b/.test(m.source))) return true;
-  // USER-code fetch (the island-backed ambient): its lowering reads the
-  // engine's fetch global — the same jsOp walk shape as moduleUsesZlib.
+/** True when the module contains an intrinsic whose implementation lives
+ * in scr_copying.c. This is the link switch that keeps the optional
+ * Array-copying and typed-array bridge TU out of unrelated binaries. */
+export function moduleUsesCopying(mod: IrModule): boolean {
   let found = false;
   const visit = (v: unknown): void => {
     if (found || v === null || typeof v !== "object") return;
@@ -5571,8 +5624,57 @@ export function moduleUsesFetch(mod: IrModule): boolean {
       for (const item of v) visit(item);
       return;
     }
-    const node = v as { kind?: unknown; op?: unknown; name?: unknown };
-    if (node.kind === "jsOp" && node.op === "globalGet" && node.name === "fetch") {
+    const node = v as { kind?: unknown; method?: unknown };
+    if (
+      node.kind === "arrIntrinsic" &&
+      (node.method === "toReversed" ||
+        node.method === "toSpliced" ||
+        node.method === "with")
+    ) {
+      found = true;
+      return;
+    }
+    if (
+      node.kind === "bytesIntrinsic" &&
+      (node.method === "toReversed" ||
+        node.method === "with" ||
+        node.method === "join" ||
+        node.method === "toArray")
+    ) {
+      found = true;
+      return;
+    }
+    for (const key of Object.keys(v)) visit((v as Record<string, unknown>)[key]);
+  };
+  visit(mod);
+  return found;
+}
+
+/** True when user code lowers static fetch or the embedded npm graph
+ * references dynamic fetch — the link switch that pulls scr_fetch.c +
+ * its socket/tls/zlib dependencies into the binary (cc.ts) and has the
+ * emitted main call scr_fetch_install. For embedded sources, use a
+ * word-boundary scan and err toward linking: a false positive costs one
+ * dylib reference; a false negative would leave embedded code without
+ * the global at runtime. Fetch-free graphs keep their exact historical
+ * link lines. */
+export function moduleUsesFetch(mod: IrModule): boolean {
+  const embedded = mod.embedded;
+  if (embedded && embedded.modules.some((m) => /\bfetch\b/.test(m.source))) return true;
+  // User-code fetch is either the engine global or the static libCall pair.
+  let found = false;
+  const visit = (v: unknown): void => {
+    if (found || v === null || typeof v !== "object") return;
+    if (Array.isArray(v)) {
+      for (const item of v) visit(item);
+      return;
+    }
+    const node = v as { kind?: unknown; op?: unknown; name?: unknown; fn?: unknown };
+    if (
+      (node.kind === "jsOp" && node.op === "globalGet" && node.name === "fetch") ||
+      (node.kind === "libCall" &&
+        typeof node.fn === "string" && node.fn.startsWith("fetch."))
+    ) {
       found = true;
       return;
     }
@@ -6473,6 +6575,10 @@ export const MAY_THROW_LIB_FNS: ReadonlySet<IrLibFn> = new Set([
   "android.construct",
   "android.call",
   "android.staticField",
+  "fetch.abortTimeout",
+  "fetch.abortAny",
+  "fetch.streamNew",
+  "fetch.streamFrom",
   "num.toFixed",
   "insp.jsonDyn",
   // diagnostics_channel: publish runs subscribers synchronously (a throw

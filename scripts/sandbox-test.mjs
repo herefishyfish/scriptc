@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import {
   sandboxImageConfig,
   sandboxRunnerConfig,
+  sandboxTestWorkerAllocation,
 } from "./sandbox-config.mjs";
 import {
   sandboxHostSchedule,
@@ -31,7 +32,21 @@ const laneCaseShardedFiles = [
 // It still case-shards across the selected lane so every corpus entry is
 // checked, but running the same sweep in the second lane adds no coverage.
 const invariantCaseShardedFiles = ["tests/harness/coverage.test.ts"];
-const caseShardedFiles = [...laneCaseShardedFiles, ...invariantCaseShardedFiles];
+// Native-cache invalidation cases mutate process-wide compiler inputs and
+// deliberately disable the immutable-toolchain memo used by the differential
+// corpus. Keep them in their own Vitest process, matching CI: co-scheduling
+// this file with the corpus can consume one of the corpus workers with the
+// strict (and intentionally expensive) production probe path.
+//
+// They are sanitizer-invariant and use their own shard variable so the
+// independent cases can spread across the once lane's Sandboxes without
+// colliding with corpus case selection.
+const cacheCaseShardedFiles = ["packages/compiler/src/backend/cc-cache.test.ts"];
+const caseShardedFiles = [
+  ...laneCaseShardedFiles,
+  ...invariantCaseShardedFiles,
+  ...cacheCaseShardedFiles,
+];
 
 // These files neither consume SCRIPTC_SAN nor delegate to a helper that does.
 // Run their full coverage once. Files absent from this allowlist remain in
@@ -183,7 +198,6 @@ const remoteWorkerCount = Number(testWorkers);
 if (!Number.isInteger(remoteWorkerCount) || remoteWorkerCount < 1) {
   throw new Error(`SCRIPTC_TEST_WORKERS must be a positive integer (got ${testWorkers})`);
 }
-const caseWorkers = String(Math.max(1, remoteWorkerCount - 1));
 const fileWorkers = "1";
 const localCaseShardCount = Number(localCaseShards);
 if (!Number.isInteger(localCaseShardCount) || localCaseShardCount < 1) {
@@ -503,6 +517,12 @@ async function allWorkers(phase, task, concurrency = workers.length) {
   console.log(`${phase} completed in ${((Date.now() - started) / 1000).toFixed(1)}s`);
 }
 
+async function runTaskQueue(tasks, concurrency) {
+  for (let offset = 0; offset < tasks.length; offset += concurrency) {
+    await Promise.all(tasks.slice(offset, offset + concurrency).map((task) => task()));
+  }
+}
+
 async function cleanup() {
   if (values.keep || created.size === 0) return;
   if (!cleanupPromise) {
@@ -612,6 +632,11 @@ try {
         ...laneCaseShardedFiles,
         ...(worker.lane === onceLane ? invariantCaseShardedFiles : []),
       ];
+      const runCacheCases = worker.lane === onceLane;
+      const { caseWorkers, sideConcurrency } = sandboxTestWorkerAllocation(
+        remoteWorkerCount,
+        runCacheCases ? 2 : 1,
+      );
       const cases = () =>
         execIn(
           worker,
@@ -620,7 +645,7 @@ try {
           {
             ...sharedTestEnv,
             SCRIPTC_TEST_SHARD: `${worker.shard}/${shardCount}`,
-            SCRIPTC_TEST_WORKERS: caseWorkers,
+            SCRIPTC_TEST_WORKERS: String(caseWorkers),
           },
           "cases",
         );
@@ -650,11 +675,33 @@ try {
           },
           "files",
         );
-      if (remoteWorkerCount === 1) {
+      const cacheCases = () =>
+        execIn(
+          worker,
+          "pnpm",
+          ["test", "--reporter=dot", ...cacheCaseShardedFiles],
+          {
+            ...sharedTestEnv,
+            SCRIPTC_CACHE_TEST_SHARD: `${worker.shard}/${shardCount}`,
+            // This is the strict production-path contract. Keep it out of
+            // the memoized corpus process and pin the opt-out explicitly,
+            // just as the GitHub Actions matrix does.
+            SCRIPTC_TEST_STABLE_TOOLCHAIN: "0",
+            SCRIPTC_TEST_WORKERS: "1",
+          },
+          "cache",
+        );
+      // The corpus owns the remaining pool while file/cache processes share
+      // the reserved side slots (serially when only one slot is available).
+      const sideTasks = [files, ...(runCacheCases ? [cacheCases] : [])];
+      if (sideConcurrency === 0) {
         await cases();
-        await files();
+        await runTaskQueue(sideTasks, 1);
       } else {
-        await Promise.all([cases(), files()]);
+        await Promise.all([
+          cases(),
+          runTaskQueue(sideTasks, sideConcurrency),
+        ]);
       }
     });
 

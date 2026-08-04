@@ -13,9 +13,9 @@ import type { CycleEdge } from "../program.js";
 import { invalidJsonModuleDiag, npmEmbedFailedDiag, requiresDynamicImportDiag } from "../../diagnostics/diagnostic.js";
 import { BOOL, DYN, IrClassDef, IrExpr, IrFunction, IrGlobal, IrRecordShape, IrStmt, IrType, IrUnionDef, JSVAL, RUNTIME_ERROR_CLASSES, STRING, SrcLoc, VOID, arrayOf, canConvertToDyn, isUnitType } from "../../ir/nodes.js";
 import { ENTRY_NAME, PoisonError, boundIdentifiersOf, dynFallbackType, dynUndefinedExpr, importCallHandleType, newFnCtx, uncheckedOverloadHandleCall } from "./lowerer.js";
-import { builtinMemberRequireDecl, builtinNamespaceDestructureModuleOf, createRequireBindingDecl, createRequireNamespaceDecl, createRequireSpecOf, isPromisifyCall } from "./lower-builtins.js";
+import { builtinMemberRequireDecl, builtinNamespaceDestructureModuleOf, createRequireBindingDecl, createRequireNamespaceDecl, createRequireSpecOf, isPromisifyCall, textCodecBindingDecl } from "./lower-builtins.js";
 import { bindingContextualGenericFnNodeOf, bindingGenericFnAliasInfoOf, bindingGenericFnInfoOf, bindingGenericFnNodeOf, deadUnmappableBinding, implicitLocalFnInfoOf, implicitLocalFnNodeOf, nullishGenericBindingUnitOf } from "./lower-calls.js";
-import { isVarDeclared, provenanceElidedConstDecl } from "./lower-stmts.js";
+import { isVarDeclared, numericIteratorSourceOf, provenanceElidedConstDecl } from "./lower-stmts.js";
 import { streamClassAliasDecl } from "./lower-stream.js";
 import { stdlibGlobalAliasDecl } from "./surfaces.js";
 import { collectNamespaceStmt, moduleNsConstAliasDecl, nsPathPrefix, trapDeclRootOf } from "./lower-namespaces.js";
@@ -255,6 +255,12 @@ export interface FileParts {
           continue;
         }
         const spec = specNode.text;
+        // --external-types owns this exact module interpretation. Even when
+        // an install happens to resolve the same name (or --npm-static auto
+        // selects its package), the declaration mapping promises no npm or
+        // island runtime implementation; the preflight/import-use SC1010
+        // fences are the whole story.
+        if (L.externalTypes.has(spec)) continue;
         const npm = resolveNpmImport(fp.sf.fileName, spec);
         // --npm-static: an opted-in package that made it through preflight
         // is a PROGRAM-MODULE dependency — its entry sits in the module
@@ -402,6 +408,10 @@ export interface FileParts {
         ts.isStringLiteralLike(node.arguments[0])
       ) {
         const spec = node.arguments[0].text;
+        if (L.externalTypes.has(spec)) {
+          ts.forEachChild(node, visit);
+          return;
+        }
         const mapKey = `${sf.fileName}\u0000${spec}`;
         if (!L.dynImports.has(mapKey)) {
           // The program's OWN modules first, by the checker's resolution
@@ -1068,6 +1078,19 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
         // probes below would otherwise claim the call-initializer shape
         // and put its fences on the build.
         if (provenanceElidedConstDecl(L, decl)) continue;
+        // A stored built-in numeric value iterator has no first-class
+        // global representation. Its same-%init for-of uses are backed by
+        // hidden source/cursor/done locals registered when the declaration
+        // lowers; skip the unmappable iterator global here so collection
+        // does not fence that statically closed protocol path.
+        // Cross-function or exported uses still fence at reference sites.
+        if (
+          isConst &&
+          ts.isIdentifier(decl.name) &&
+          numericIteratorSourceOf(L, decl.initializer) !== null
+        ) {
+          continue;
+        }
         // The trap/nullish/dead classification probes below resolve
         // symbols INSIDE the initializer, and resolution can fence (the
         // cross-block merged-namespace SC1090, resolveValueSymbol →
@@ -1250,6 +1273,10 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
         // stdlibGlobalAliasDecl; the statement lowering skips it by the
         // same test).
         if (isConst && stdlibGlobalAliasDecl(L, decl.name, decl.initializer)) continue;
+        // Stored default TextEncoder/TextDecoder instances are the same
+        // compile-time alias plumbing as their statement lowering: calls
+        // trace this const initializer, so no module global exists.
+        if (isConst && textCodecBindingDecl(L, decl.name, decl.initializer)) continue;
         // Destructuring declarations register EVERY bound identifier (the
         // desugar in the init function assigns the pre-registered globals,
         // exactly like plain declarations).

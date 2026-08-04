@@ -2,12 +2,472 @@
  * expression lands in a fresh C temp, with RC ownership tracked on the
  * emitter's frames (see the discipline comment in emitter core). */
 import type { CEmitter, Temp } from "./emitter.js";
-import { androidJavaClass, arrayOf, BOOL, BYTES_U8, bytesOf, canMarshalFuncIntoIsland, CHILDSTREAM_T, DYN, F64, IrExpr, IrRecordShape, IrType, islandPromisePayloadTag, isAndroidObjectType, isRefCounted, isUnitType, MAY_THROW_LIB_FNS, RUNTIME_ERROR_CLASSES, STRING, typeEquals } from "../../ir/nodes.js";
-import { boxAccess, BYTES_NUM_KIND_C, BYTES_NUM_VAR_C, bytesElemKindC, cDecl, cFnPtrCast, cNumberLiteral, cStringLiteral, cType, DV_GET_KIND_C, DV_SET_KIND_C, elemAccess, mapKeyAccess, mapKeyKindC, mapValKindC, retainCallC, vAdapters } from "./emit-types.js";
+import { androidJavaClass, arrayOf, BOOL, BYTES_U8, bytesOf, canMarshalFuncIntoIsland, CHILDSTREAM_T, DYN, F64, IrExpr, IrRecordShape, IrType, islandPromisePayloadTag, isAndroidObjectType, isRefCounted, isUnitType, MAY_THROW_LIB_FNS, RUNTIME_ERROR_CLASSES, STRING, typeEquals, typeKey } from "../../ir/nodes.js";
+import { boxAccess, BYTES_NUM_KIND_C, BYTES_NUM_VAR_C, bytesElemKindC, cDecl, cFnPtrCast, cNumberLiteral, cStringLiteral, cType, DV_GET_KIND_C, DV_SET_KIND_C, elemAccess, mapKeyAccess, mapKeyKindC, mapValKindC, releaseCallC, retainCallC, vAdapters } from "./emit-types.js";
 import { mangleClassNew, mangleClassRetain, mangleClassStruct, mangleField, mangleFnClosure, mangleFunction, mangleGlobal, mangleLocal, mangleRecordNew, mangleRecordStruct, mangleVtStruct } from "../mangle.js";
 import { OVERFLOW_MEMBER } from "./emit-shapes.js";
 import { dynDestrCheckHelper, dynIterNHelper, dynKeyGetHelper } from "./emit-walkers.js";
 import { genResultThunkFor } from "./emit-async.js";
+
+function streamTypedRefCommitAdapter(
+  E: CEmitter,
+  t: IrType,
+  snapshot: string,
+  defs: string[],
+): string {
+  if (t.kind === "bytes") {
+    const commit = `${snapshot}_commit`;
+    E.walkerProtos.push(
+      `static void ${commit}(void *sc_p, const ScrDyn *sc_d); /* commit live stream element ${typeKey(t)} */`,
+    );
+    defs.push(
+      `static void ${commit}(void *sc_p, const ScrDyn *sc_d) {`,
+      `  ScrBytes *sc_target = (ScrBytes *)sc_p;`,
+      `  ScrBytes *sc_next = ${E.dynCheckHelper(t)}(sc_d, NULL);`,
+      `  if (!sc_next) return;`,
+      `  scr_bytes_copy_contents(sc_target, sc_next);`,
+      `  scr_bytes_release(sc_next);`,
+      `}`,
+      ``,
+    );
+    return `&${commit}`;
+  }
+  if (t.kind === "array") {
+    const commit = `${snapshot}_commit`;
+    E.walkerProtos.push(
+      `static void ${commit}(void *sc_p, const ScrDyn *sc_d); /* commit live stream element ${typeKey(t)} */`,
+    );
+    defs.push(
+      `static void ${commit}(void *sc_p, const ScrDyn *sc_d) {`,
+      `  ScrArr *sc_target = (ScrArr *)sc_p;`,
+      `  ScrArr *sc_next = ${E.dynCheckHelper(t)}(sc_d, NULL);`,
+      `  if (!sc_next) return;`,
+      `  size_t sc_target_len = sc_target->len;`,
+      `  size_t sc_target_cap = sc_target->cap;`,
+      `  uint64_t *sc_target_data = sc_target->data;`,
+      `  sc_target->len = sc_next->len;`,
+      `  sc_target->cap = sc_next->cap;`,
+      `  sc_target->data = sc_next->data;`,
+      `  sc_next->len = sc_target_len;`,
+      `  sc_next->cap = sc_target_cap;`,
+      `  sc_next->data = sc_target_data;`,
+      `  scr_arr_release(sc_next);`,
+      `}`,
+      ``,
+    );
+    return `&${commit}`;
+  }
+  if (t.kind !== "record") return "NULL";
+  const shape = E.recordsById.get(t.shapeId);
+  if (!shape) {
+    throw new Error(`emitter bug: stream typed-ref commit of unknown shape ${t.shapeId}`);
+  }
+  const commit = `${snapshot}_commit`;
+  E.walkerProtos.push(
+    `static void ${commit}(void *sc_p, const ScrDyn *sc_d); /* commit live stream element ${typeKey(t)} */`,
+  );
+  defs.push(
+    `static void ${commit}(void *sc_p, const ScrDyn *sc_d) {`,
+    `  ${cDecl(t, "sc_target")} = (${cType(t).trim()})sc_p;`,
+    `  ${cDecl(t, "sc_next")} = ${E.dynCheckHelper(t)}(sc_d, NULL);`,
+    `  if (!sc_next) return;`,
+  );
+  for (const field of shape.fields) {
+    const member = mangleField(field.name);
+    defs.push(
+      `  {`,
+      `    ${cDecl(field.type, "sc_old")} = sc_target->${member};`,
+      `    sc_target->${member} = sc_next->${member};`,
+      `    sc_next->${member} = sc_old;`,
+      `  }`,
+    );
+  }
+  if (shape.indexValue) {
+    defs.push(
+      `  {`,
+      `    ScrMap *sc_old = sc_target->${OVERFLOW_MEMBER};`,
+      `    sc_target->${OVERFLOW_MEMBER} = sc_next->${OVERFLOW_MEMBER};`,
+      `    sc_next->${OVERFLOW_MEMBER} = sc_old;`,
+      `  }`,
+    );
+  }
+  defs.push(
+    `  ${releaseCallC(t, "sc_next")};`,
+    `}`,
+    ``,
+  );
+  return `&${commit}`;
+}
+
+interface StreamTypedRefAdapter {
+  snapshot: string;
+  commit: string;
+}
+
+interface StreamTypedRefContext {
+  prefix: string;
+  defs: string[];
+  adapters: Map<string, StreamTypedRefAdapter>;
+}
+
+function streamTypedRefEligible(t: IrType): boolean {
+  return t.kind === "record" || t.kind === "array" || t.kind === "bytes";
+}
+
+/** Build the live dyn view of one typed stream value. Mutable reference
+ * children are capsules of their own, so a write through `v.child.x` or
+ * `v.items[0]` commits directly to that child's static source instead of
+ * disappearing into the parent's detached snapshot. */
+function streamTypedRefAdapter(
+  E: CEmitter,
+  t: IrType,
+  ctx: StreamTypedRefContext,
+  preferredSnapshot?: string,
+): StreamTypedRefAdapter {
+  const key = typeKey(t);
+  const existing = ctx.adapters.get(key);
+  if (existing) return existing;
+  const snapshot = preferredSnapshot ??
+    `${ctx.prefix}_nested_${ctx.adapters.size}`;
+  const adapter: StreamTypedRefAdapter = { snapshot, commit: "NULL" };
+  /* Register before walking children: recursive record/array types refer
+   * back to this prototype without recursively generating helpers. */
+  ctx.adapters.set(key, adapter);
+  E.walkerProtos.push(
+    `static ScrDyn *${snapshot}(void *sc_p); /* materialize live stream value ${key} */`,
+  );
+  adapter.commit = streamTypedRefCommitAdapter(E, t, snapshot, ctx.defs);
+
+  const box = (child: IrType, expr: string): string => {
+    if (!streamTypedRefEligible(child)) {
+      return `${E.toDynHelper(child)}(${expr})`;
+    }
+    const nested = streamTypedRefAdapter(E, child, ctx);
+    const rc = vAdapters(child);
+    const childKey = typeKey(child);
+    const keyLit = cStringLiteral(Buffer.from(childKey, "utf8"));
+    return `scr_dyn_new_typed_ref(${expr}, &${rc.retain}, &${rc.release}, ${keyLit}, ${Buffer.byteLength(childKey, "utf8")}, &${nested.snapshot}, ${nested.commit})`;
+  };
+
+  const lines = [
+    `static ScrDyn *${snapshot}(void *sc_p) { /* materialize live stream value ${key} */`,
+    `  ${cDecl(t, "v")} = (${cType(t).trim()})sc_p;`,
+  ];
+  if (t.kind === "record") {
+    const shape = E.recordsById.get(t.shapeId);
+    if (!shape) {
+      throw new Error(
+        `emitter bug: stream typed-ref materialize of unknown shape ${t.shapeId}`,
+      );
+    }
+    const ordinary = shape.indexValue || shape.fields.some(
+      (field) => field.name === "handleEvent" && field.type.kind === "func",
+    );
+    if (ordinary) {
+      lines.push(`  return ${E.toDynHelper(t)}(v);`, `}`, ``);
+      ctx.defs.push(...lines);
+      return adapter;
+    }
+    if (shape.tuple) {
+      lines.push(`  ScrDyn *d = scr_dyn_new_arr();`);
+      const fields = [...shape.fields].sort(
+        (a, b) => Number(a.name) - Number(b.name),
+      );
+      for (const field of fields) {
+        lines.push(
+          `  scr_dyn_arr_push(d, ${box(field.type, `v->${mangleField(field.name)}`)});`,
+        );
+      }
+    } else {
+      lines.push(`  ScrDyn *d = scr_dyn_new_obj();`);
+      const byName = new Map(shape.fields.map((field) => [field.name, field]));
+      const order = shape.declaredOrder ?? shape.fields.map((field) => field.name);
+      const inOrder = new Set(order);
+      const fields = [
+        ...order.map((name) => byName.get(name)).filter((field) => field !== undefined),
+        ...shape.fields.filter((field) => !inOrder.has(field.name)),
+      ];
+      for (const field of fields) {
+        const keyLit = cStringLiteral(Buffer.from(field.name, "utf8"));
+        lines.push(
+          `  scr_dyn_obj_set(d, ${keyLit}, ${Buffer.byteLength(field.name, "utf8")}, ${box(field.type, `v->${mangleField(field.name)}`)});`,
+        );
+      }
+    }
+    lines.push(`  return d;`);
+  } else if (t.kind === "array") {
+    const elem = t.elem;
+    lines.push(
+      `  ScrDyn *d = scr_dyn_new_arr();`,
+      `  for (size_t sc_i = 0; sc_i < v->len; sc_i++) {`,
+    );
+    if (elem.kind === "f64") {
+      lines.push(
+        `    scr_dyn_arr_push(d, ${box(elem, "scr_arr_get_f64(v, (double)sc_i)")});`,
+      );
+    } else if (elem.kind === "bool") {
+      lines.push(
+        `    scr_dyn_arr_push(d, ${box(elem, "scr_arr_get_bool(v, (double)sc_i)")});`,
+      );
+    } else {
+      lines.push(
+        `    ${cDecl(elem, "sc_value")} = (${cType(elem).trim()})scr_arr_get_ref(v, (double)sc_i);`,
+        `    scr_dyn_arr_push(d, ${box(elem, "sc_value")});`,
+        `    ${releaseCallC(elem, "sc_value")};`,
+      );
+    }
+    lines.push(`  }`, `  return d;`);
+  } else {
+    lines.push(`  return ${E.toDynHelper(t)}(v);`);
+  }
+  lines.push(`}`, ``);
+  ctx.defs.push(...lines);
+  return adapter;
+}
+
+/** One per-type capsule adapter for Web API arguments whose JavaScript
+ * contract preserves the exact input reference. */
+function liveDynRefAdapter(
+  E: CEmitter,
+  t: IrType,
+): StreamTypedRefAdapter {
+  const key = typeKey(t);
+  const existing = E.liveDynRefAdapters.get(key);
+  if (existing) return existing;
+  if (!streamTypedRefEligible(t)) {
+    throw new Error(`emitter bug: live dyn ref of ${key}`);
+  }
+  const prefix = `sc_ldr_${E.liveDynRefAdapters.size}`;
+  const defs: string[] = [];
+  const adapter = streamTypedRefAdapter(
+    E,
+    t,
+    { prefix, defs, adapters: new Map() },
+    `${prefix}_materialize`,
+  );
+  E.liveDynRefAdapters.set(key, adapter);
+  E.walkerDefs.push(...defs);
+  return adapter;
+}
+
+/** A union itself is only the tagged box; the identity Web APIs expose is
+ * the selected mutable arm. Dispatch on the tag and point the typed capsule
+ * directly at that arm's payload. Non-mutable arms keep ordinary dynFrom
+ * semantics. */
+function liveDynUnionRefAdapter(
+  E: CEmitter,
+  t: IrType & { kind: "union" },
+): string {
+  const key = typeKey(t);
+  const existing = E.liveDynUnionRefAdapters.get(key);
+  if (existing) return existing;
+  const union = E.unionsById.get(t.unionId);
+  if (!union) {
+    throw new Error(`emitter bug: live dyn ref of unknown union ${t.unionId}`);
+  }
+  const mutableArms = union.arms
+    .map((arm, tag) => ({ arm, tag }))
+    .filter(({ arm }) => streamTypedRefEligible(arm));
+  if (mutableArms.length === 0) {
+    throw new Error(`emitter bug: live dyn ref of immutable union ${key}`);
+  }
+
+  const sym = `sc_ldu_${E.liveDynUnionRefAdapters.size}`;
+  E.liveDynUnionRefAdapters.set(key, sym);
+  const sig = `static ScrDyn *${sym}(ScrUnion *sc_u)`;
+  E.walkerProtos.push(`${sig}; /* materialize live union value ${key} */`);
+  const defs: string[] = [];
+  const adapters = new Map<number, StreamTypedRefAdapter>();
+  for (const { arm, tag } of mutableArms) {
+    const prefix = `${sym}_${tag}`;
+    adapters.set(
+      tag,
+      streamTypedRefAdapter(
+        E,
+        arm,
+        { prefix, defs, adapters: new Map() },
+        `${prefix}_materialize`,
+      ),
+    );
+  }
+
+  defs.push(`${sig} {`, `  switch (sc_u->tag) {`);
+  for (const { arm, tag } of mutableArms) {
+    const adapter = adapters.get(tag)!;
+    const rc = vAdapters(arm);
+    const armKey = typeKey(arm);
+    const keyLit = cStringLiteral(Buffer.from(armKey, "utf8"));
+    defs.push(
+      `  case ${tag}:`,
+      `    return scr_dyn_new_typed_ref(scr_union_peek(sc_u), &${rc.retain}, &${rc.release}, ${keyLit}, ${Buffer.byteLength(armKey, "utf8")}, &${adapter.snapshot}, ${adapter.commit});`,
+    );
+  }
+  defs.push(
+    `  default:`,
+    `    return ${E.toDynHelper(t)}(sc_u);`,
+    `  }`,
+    `}`,
+    ``,
+  );
+  E.walkerDefs.push(...defs);
+  return sym;
+}
+
+function streamFromArrayAdapter(
+  E: CEmitter,
+  t: IrType & { kind: "array" },
+): string {
+  const elem = t.elem;
+  const key = typeKey(elem);
+  const existing = E.streamFromArrayAdapters.get(key);
+  if (existing) return existing;
+  const sym = `sc_sfa_${E.streamFromArrayAdapters.size}`;
+  E.streamFromArrayAdapters.set(key, sym);
+  const sig = `static ScrDyn *${sym}(ScrArr *sc_a, double sc_i)`;
+  E.walkerProtos.push(`${sig}; /* ReadableStream.from array<${key}> */`);
+  const unionDef = elem.kind === "union"
+    ? E.unionsById.get(elem.unionId)
+    : undefined;
+  if (elem.kind === "union" && !unionDef) {
+    throw new Error(`emitter bug: streamFrom of unknown union ${elem.unionId}`);
+  }
+  const unionRefArms = unionDef?.arms
+    .map((arm, tag) => ({ arm, tag }))
+    .filter(({ arm }) =>
+      isRefCounted(arm) && arm.kind !== "dyn" && arm.kind !== "string"
+    ) ?? [];
+  const typedRef = isRefCounted(elem) &&
+    elem.kind !== "dyn" &&
+    elem.kind !== "string" &&
+    elem.kind !== "union";
+  const snapshot = `${sym}_materialize`;
+  const d: string[] = [];
+  let commit = "NULL";
+  if (typedRef) {
+    if (streamTypedRefEligible(elem)) {
+      const adapter = streamTypedRefAdapter(
+        E,
+        elem,
+        { prefix: snapshot, defs: d, adapters: new Map() },
+        snapshot,
+      );
+      commit = adapter.commit;
+    } else {
+      const snapshotSig = `static ScrDyn *${snapshot}(void *sc_p)`;
+      E.walkerProtos.push(`${snapshotSig}; /* materialize stream element ${key} */`);
+      d.push(
+        `${snapshotSig} {`,
+        `  return ${E.toDynHelper(elem)}((${cType(elem).trim()})sc_p);`,
+        `}`,
+        ``,
+      );
+      commit = streamTypedRefCommitAdapter(E, elem, snapshot, d);
+    }
+  }
+  const unionCommits = new Map<number, string>();
+  for (const { arm, tag } of unionRefArms) {
+    const armKey = typeKey(arm);
+    const armSnapshot = `${snapshot}_${tag}`;
+    const snapshotSig = `static ScrDyn *${armSnapshot}(void *sc_p)`;
+    E.walkerProtos.push(`${snapshotSig}; /* materialize stream union arm ${armKey} */`);
+    d.push(
+      `${snapshotSig} {`,
+      `  return ${E.toDynHelper(arm)}((${cType(arm).trim()})sc_p);`,
+      `}`,
+      ``,
+    );
+    unionCommits.set(
+      tag,
+      streamTypedRefCommitAdapter(E, arm, armSnapshot, d),
+    );
+  }
+  d.push(`${sig} { /* ReadableStream.from array<${key}> */`);
+  if (elem.kind === "f64") {
+    d.push(
+      `  return ${E.toDynHelper(elem)}(scr_arr_get_f64(sc_a, sc_i));`,
+    );
+  } else if (elem.kind === "bool") {
+    d.push(
+      `  return ${E.toDynHelper(elem)}(scr_arr_get_bool(sc_a, sc_i));`,
+    );
+  } else {
+    d.push(`  ${cDecl(elem, "sc_v")} = (${cType(elem).trim()})scr_arr_get_ref(sc_a, sc_i);`);
+    if (elem.kind === "union") {
+      d.push(`  ScrDyn *sc_d;`, `  switch (sc_v->tag) {`);
+      for (const { arm, tag } of unionRefArms) {
+        const armKey = typeKey(arm);
+        const rc = vAdapters(arm);
+        const keyLit = cStringLiteral(Buffer.from(armKey, "utf8"));
+        d.push(
+          `  case ${tag}:`,
+          `    sc_d = scr_dyn_new_typed_ref(scr_union_peek(sc_v), &${rc.retain}, &${rc.release}, ${keyLit}, ${Buffer.byteLength(armKey, "utf8")}, &${snapshot}_${tag}, ${unionCommits.get(tag) ?? "NULL"});`,
+          `    break;`,
+        );
+      }
+      d.push(
+        `  default:`,
+        `    sc_d = ${E.toDynHelper(elem)}(sc_v);`,
+        `    break;`,
+        `  }`,
+      );
+    } else if (typedRef) {
+      const rc = vAdapters(elem);
+      const keyLit = cStringLiteral(Buffer.from(key, "utf8"));
+      const keyLen = Buffer.byteLength(key, "utf8");
+      d.push(
+        `  ScrDyn *sc_d = scr_dyn_new_typed_ref(sc_v, &${rc.retain}, &${rc.release}, ${keyLit}, ${keyLen}, &${snapshot}, ${commit});`,
+      );
+    } else {
+      d.push(`  ScrDyn *sc_d = ${E.toDynHelper(elem)}(sc_v);`);
+    }
+    d.push(
+      `  ${releaseCallC(elem, "sc_v")};`,
+      `  return sc_d;`,
+    );
+  }
+  d.push(`}`, ``);
+  E.walkerDefs.push(...d);
+  return sym;
+}
+
+function dynPromiseAdapter(
+  E: CEmitter,
+  inner: IrType,
+): string {
+  if (!isRefCounted(inner) || inner.kind === "dyn") {
+    throw new Error(
+      `dynamic promise adapter requires a concrete reference type, got ${typeKey(inner)}`,
+    );
+  }
+  const key = typeKey(inner);
+  const existing = E.dynPromiseAdapters.get(key);
+  if (existing) return existing;
+  const sym = `sc_dpa_${E.dynPromiseAdapters.size}`;
+  E.dynPromiseAdapters.set(key, sym);
+  const sig = `static void ${sym}(ScrPromise *sc_dst, ScrPromise *sc_src)`;
+  E.walkerProtos.push(`${sig}; /* checked-dynamic promise exit ${key} */`);
+  let fulfill: string;
+  if (inner.kind === "string") {
+    fulfill = `scr_promise_fulfill_str(sc_dst, sc_v);`;
+  } else {
+    const rc = vAdapters(inner);
+    fulfill = `scr_promise_fulfill_ref(sc_dst, sc_v, &${rc.retain}, &${rc.release}, ${E.traceArgC(inner)});`;
+  }
+  E.walkerDefs.push(
+    `${sig} { /* checked-dynamic promise exit ${key} */`,
+    `  ScrDyn *sc_d = (ScrDyn *)scr_promise_payload_ref(sc_src);`,
+    `  ${cDecl(inner, "sc_v")} = ${E.dynCheckHelper(inner)}(sc_d, NULL);`,
+    `  scr_dyn_release(sc_d);`,
+    `  if (scr_exc_pending()) {`,
+    `    scr_promise_reject_pending(sc_dst);`,
+    `    return;`,
+    `  }`,
+    `  ${fulfill}`,
+    `}`,
+    ``,
+  );
+  return sym;
+}
 
 
 
@@ -566,7 +1026,8 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
       case "strCmp": {
         const l = E.emitExpr(e.left);
         const r = E.emitExpr(e.right);
-        return E.newTemp(e.type, `scr_str_cmp(${l.name}, ${r.name}) ${e.op} 0`);
+        const fn = e.utf16 === true ? "scr_str_cmp_u16" : "scr_str_cmp";
+        return E.newTemp(e.type, `${fn}(${l.name}, ${r.name}) ${e.op} 0`);
       }
       case "toString": {
         const v = E.emitExpr(e.operand);
@@ -915,6 +1376,27 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
             const end = e.args[1] ? E.emitExpr(e.args[1]).name : "INFINITY";
             return E.newTemp(e.type, `scr_arr_slice(${r.name}, ${start}, ${end})`);
           }
+          case "toReversed":
+            return E.newTemp(e.type, `scr_arr_to_reversed(${r.name})`);
+          case "toSpliced": {
+            const start = E.emitExpr(e.args[0]!);
+            const count = E.emitExpr(e.args[1]!);
+            const items = E.emitExpr(e.args[2]!);
+            return E.newTemp(
+              e.type,
+              `scr_arr_to_spliced(${r.name}, ${start.name}, ${count.name}, ${items.name})`,
+            );
+          }
+          case "with": {
+            const index = E.emitExpr(e.args[0]!);
+            const value = E.emitExpr(e.args[1]!);
+            const out = E.newTemp(
+              e.type,
+              `scr_arr_with_${acc}(${r.name}, ${index.name}, ${value.name})`,
+            );
+            E.emitPendingCheck();
+            return out;
+          }
           case "splice": {
             // The removal splice: the removed elements come back as a
             // fresh +1 array, their ownership MOVED out of the receiver
@@ -1035,6 +1517,23 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
               e.type,
               `scr_bytes_subarray(${r.name}, ${args[0]?.name ?? "0"}, ${args[1]?.name ?? "INFINITY"})`,
             );
+          case "toReversed":
+            return E.newTemp(e.type, `scr_bytes_to_reversed(${r.name})`);
+          case "with": {
+            const out = E.newTemp(
+              e.type,
+              `scr_bytes_with(${r.name}, ${args[0]!.name}, ${args[1]!.name})`,
+            );
+            E.emitPendingCheck();
+            return out;
+          }
+          case "join":
+            return E.newTemp(
+              e.type,
+              `scr_bytes_join(${r.name}, ${args[0]!.name})`,
+            );
+          case "toArray":
+            return E.newTemp(e.type, `scr_bytes_to_arr(${r.name})`);
           case "setFrom": {
             // dst.set(src, offset?) — void; throws Node's RangeError on
             // overflow (may-throw seed).
@@ -1708,6 +2207,20 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
           );
         }
         const v = E.emitExpr(e.value);
+        if (e.liveRef) {
+          if (v.type.kind === "union") {
+            const adapter = liveDynUnionRefAdapter(E, v.type);
+            return E.newTemp(e.type, `${adapter}(${v.name})`);
+          }
+          const adapter = liveDynRefAdapter(E, v.type);
+          const rc = vAdapters(v.type);
+          const key = typeKey(v.type);
+          const keyLit = cStringLiteral(Buffer.from(key, "utf8"));
+          return E.newTemp(
+            e.type,
+            `scr_dyn_new_typed_ref(${v.name}, &${rc.retain}, &${rc.release}, ${keyLit}, ${Buffer.byteLength(key, "utf8")}, &${adapter.snapshot}, ${adapter.commit})`,
+          );
+        }
         if (v.type.kind === "func") {
           // A closure boxes as the checked-dynamic tree's function kind: retained closure +
           // the per-signature call thunk + the interned signature key. The
@@ -2059,12 +2572,9 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
                 // engine's own typeof.
                 `(${d.name}->kind == SCR_DYN_OBJ || ${d.name}->kind == SCR_DYN_ARR || ${d.name}->kind == SCR_DYN_BYTES || ${d.name}->kind == SCR_DYN_HANDLE || ${d.name}->kind == SCR_DYN_PROMISE || ${d.name}->kind == SCR_DYN_NULL || scr_dyn_isl_typeof_is(${d.name}, "object"))`
               : e.test === "truthy"
-                ? // ToBoolean over the checked-dynamic tree: bool by value; number falsy for
-                  // 0, -0 (== 0 in C), and NaN (self-inequality); string
-                  // falsy when empty; obj/arr/bytes/func/handle always true;
-                  // JSVAL through the runtime's routed arm (the bigint 0n
-                  // edge); the remaining kinds (undefined, null) always false.
-                  `(${d.name}->kind == SCR_DYN_BOOL ? ${d.name}->v.b : ${d.name}->kind == SCR_DYN_NUM ? (${d.name}->v.num == ${d.name}->v.num && ${d.name}->v.num != 0) : ${d.name}->kind == SCR_DYN_STR ? ${d.name}->v.str->len != 0 : ${d.name}->kind == SCR_DYN_JSVAL ? scr_dyn_truthy(${d.name}) : (${d.name}->kind == SCR_DYN_OBJ || ${d.name}->kind == SCR_DYN_ARR || ${d.name}->kind == SCR_DYN_BYTES || ${d.name}->kind == SCR_DYN_FUNC || ${d.name}->kind == SCR_DYN_HANDLE || ${d.name}->kind == SCR_DYN_PROMISE))`
+                ? // Runtime ToBoolean includes typed-reference capsules and
+                  // keeps this backend in lockstep with LLVM.
+                  `scr_dyn_truthy(${d.name})`
                 : e.test === "error"
                   ? // `u instanceof Error`: the checked-dynamic tree's error encoding — an
                     // object carrying the reserved "%error" marker key
@@ -2377,6 +2887,70 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
               return finish(`scr_android_call_bool(${callArgs})`);
             }
             return finish(`scr_android_call_number(${callArgs})`);
+          case "fetch.start":
+            E.usesTimers = true;
+            return finish(`scr_fetch_static(${arg(0)}, ${arg(1)})`);
+          case "fetch.responseJson":
+            return finish(`scr_fetch_response_json(${arg(0)})`);
+          case "fetch.responseText":
+          case "fetch.responseBytes": {
+            if (e.type.kind !== "promise") {
+              throw new Error(`emitter bug: ${fn} result`);
+            }
+            const runtimeFn =
+              fn === "fetch.responseText"
+                ? "scr_fetch_response_text"
+                : "scr_fetch_response_bytes";
+            const source = E.newTemp(
+              { kind: "promise", inner: DYN },
+              `${runtimeFn}(${arg(0)})`,
+            );
+            const result = E.newTemp(e.type, `scr_promise_new()`);
+            const adapter = dynPromiseAdapter(E, e.type.inner);
+            E.line(
+              `scr_promise_race_add(${result.name}, ${source.name}, &${adapter});${E.srcComment(e.loc)}`,
+            );
+            return result;
+          }
+          case "fetch.abortTimeout":
+            E.usesTimers = true;
+            return finish(`scr_fetch_abort_timeout(${arg(0)})`);
+          case "fetch.abortNow":
+            return finish(`scr_fetch_abort_now(${arg(0)})`);
+          case "fetch.abortAny":
+            return finish(`scr_fetch_abort_any(${arg(0)})`);
+          case "fetch.streamNew":
+            E.usesTimers = true;
+            return finish(`scr_fetch_stream_new(${arg(0)})`);
+          case "fetch.streamFrom":
+            E.usesTimers = true;
+            if (e.args[0]!.type.kind === "array") {
+              const adapter = streamFromArrayAdapter(E, e.args[0]!.type);
+              return finish(
+                `scr_fetch_stream_from_array(${arg(0)}, &${adapter})`,
+              );
+            }
+            if (e.args[0]!.type.kind === "bytes") {
+              return finish(`scr_fetch_stream_from_bytes(${arg(0)})`);
+            }
+            if (e.args[0]!.type.kind === "string") {
+              return finish(`scr_fetch_stream_from_string(${arg(0)})`);
+            }
+            return finish(`scr_fetch_stream_from(${arg(0)})`);
+          case "fetch.readerRead": {
+            if (e.type.kind !== "promise" || e.type.inner.kind !== "record") {
+              throw new Error("emitter bug: fetch.readerRead result");
+            }
+            const source = E.newTemp(
+              { kind: "promise", inner: DYN },
+              `scr_fetch_reader_read(${arg(0)})`,
+            );
+            const result = E.newTemp(e.type, `scr_promise_new()`);
+            const adapter = dynPromiseAdapter(E, e.type.inner);
+            E.line(
+              `scr_promise_race_add(${result.name}, ${source.name}, &${adapter});${E.srcComment(e.loc)}`,
+            );
+            return result;
           }
           case "island.eval":
             // --dynamic builds only (the frontend fences the intrinsic, so
@@ -6567,6 +7141,12 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
             const pack = argPack(args.slice(1).map((x) => x.name));
             return finishFallible(
               `scr_jsval_call_method(${a(0)}, ${nameSym()}, ${args.length - 1}, ${pack})`,
+            );
+          }
+          case "callFnThis": {
+            const pack = argPack(args.slice(2).map((x) => x.name));
+            return finishFallible(
+              `scr_jsval_call_this(${a(0)}, ${a(1)}, ${args.length - 2}, ${pack})`,
             );
           }
           case "callFn": {

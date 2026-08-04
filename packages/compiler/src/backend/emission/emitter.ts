@@ -33,7 +33,7 @@ import type {
   IrUnionDef,
   SrcLoc,
 } from "../../ir/nodes.js";
-import { funcOf, isRefCounted, isUnitType, mapOf, moduleEmbedsCompressedNpm, moduleUsesDgram, moduleUsesDynInvoke, moduleEmbedsBuiltin, moduleUsesFetch, moduleUsesFsWatch, moduleUsesHttp2, moduleUsesHttpServer, moduleUsesNet, moduleUsesNodeTest, moduleUsesProcessEvents, moduleUsesStream, RUNTIME_EMITTER_CLASS, STRING, VOID } from "../../ir/nodes.js";
+import { funcOf, isRefCounted, isUnitType, mapOf, moduleEmbedsCompressedNpm, moduleUsesDgram, moduleUsesDynInvoke, moduleEmbedsBuiltin, moduleUsesFetch, moduleUsesFsWatch, moduleUsesHttp2, moduleUsesHttpServer, moduleUsesNet, moduleUsesNodeTest, moduleUsesProcessEvents, moduleUsesStream, moduleUsesTls, moduleUsesTlsCa, RUNTIME_EMITTER_CLASS, STRING, VOID } from "../../ir/nodes.js";
 import {
   mangleAsyncSpawn,
   mangleGenSpawn,
@@ -212,6 +212,22 @@ export class CEmitter {
    * read helpers (sc_rkg_*), per shapeId|result typeKey; dynamic-keyed
    * write helpers (sc_rks_*), per shapeId. */
   readonly toDynFns = new Map<string, string>();
+  /** ReadableStream.from typed-array element adapters, per element
+   * typeKey. The runtime retains the original array and calls one of these
+   * for each pull, preserving iterator-time reads without teaching the
+   * runtime the compiler's program-specific record/union layouts. */
+  readonly streamFromArrayAdapters = new Map<string, string>();
+  /** Identity-preserving static→dyn capsules used by Web APIs whose values
+   * remain directly observable (stream chunks and AbortSignal reasons). */
+  readonly liveDynRefAdapters = new Map<
+    string,
+    { snapshot: string; commit: string }
+  >();
+  /** Runtime-arm dispatchers for live references whose static type is a
+   * union. Mutable arms become typed capsules; scalar/unit arms retain the
+   * ordinary static-to-dyn conversion. */
+  readonly liveDynUnionRefAdapters = new Map<string, string>();
+  readonly dynPromiseAdapters = new Map<string, string>();
   /** The checked-dynamic function boundary's per-signature helpers (see
    * emit-walkers.ts): call thunks (sc_dfk_*), box builders (sc_dfb_*),
    * and dynCheck adapters (sc_dfa_*), each per func typeKey. */
@@ -737,6 +753,11 @@ export class CEmitter {
     // drains the engine's job queue at quiescence, so npm-importing
     // programs always run the loop, like Node always runs its own.
     const usesIsland = embedded !== undefined && embedded.modules.length > 0;
+    const snapshotsTlsCa =
+      moduleUsesTls(this.mod) ||
+      moduleUsesTlsCa(this.mod) ||
+      moduleEmbedsBuiltin(this.mod, "node:https") ||
+      moduleEmbedsBuiltin(this.mod, "node:tls");
     // A pending module root normally selects Node's exit status 13, but
     // an already-failed node:test run or an embedded process.exitCode has
     // higher precedence. Keep this expression shared with the ordinary
@@ -875,6 +896,10 @@ export class CEmitter {
       // node:stream (the emitter story — instanceof and dynamic teardown
       // both dispatch through them).
       ...streamVtStampLines(this),
+      // Node reads NODE_EXTRA_CA_CERTS and the referenced file during
+      // process initialization. Native fetch performs the same idempotent
+      // install from scr_fetch_install.
+      ...(snapshotsTlsCa ? [`  scr_tls_ca_install();`] : []),
       `  scr_lib_init(argc, argv);`,
       // Fetch-referencing programs register the native fetch bridge before any
       // island entry (the engine's lazy boot consults it): the ONLY

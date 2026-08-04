@@ -1,7 +1,7 @@
 /* Cheap whole-module may-throw analysis (see computeMayThrow). Pure function
  * of the IR module; the emitter consults the result to place unwind checks. */
-import type { IrBytesIntrinsicMethod, IrLibFn, IrModule } from "../../ir/nodes.js";
-import { MAY_THROW_BYTES_METHODS, MAY_THROW_LIB_FNS } from "../../ir/nodes.js";
+import type { IrArrIntrinsicMethod, IrBytesIntrinsicMethod, IrLibFn, IrModule } from "../../ir/nodes.js";
+import { MAY_THROW_ARR_METHODS, MAY_THROW_BYTES_METHODS, MAY_THROW_LIB_FNS } from "../../ir/nodes.js";
 
 /** Cheap may-throw analysis (cost discipline: functions that transitively
  * CANNOT throw pay for no pending-exception checks). A function may throw
@@ -176,6 +176,11 @@ export function computeMayThrow(mod: IrModule): { fns: Set<string>; indirect: bo
           // RangeErrors (Node's bounds discipline); the rest trap or
           // cannot fail.
           if (MAY_THROW_BYTES_METHODS.has(rec["method"] as IrBytesIntrinsicMethod)) {
+            f.throws = true;
+          }
+          break;
+        case "arrIntrinsic":
+          if (MAY_THROW_ARR_METHODS.has(rec["method"] as IrArrIntrinsicMethod)) {
             f.throws = true;
           }
           break;

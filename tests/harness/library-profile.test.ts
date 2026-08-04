@@ -239,6 +239,7 @@ describe("library profile sidecar section", () => {
       initExport: "init",
       updateExport: "update",
       subscriptionsExport: "subscriptions",
+      subscriptionsExportDeclared: false,
       sourceHash: "module-graph",
       integerSlots: [],
     });

@@ -86,6 +86,13 @@ void scr_bytes_release_v(void *b) { scr_bytes_release((ScrBytes *)b); }
 
 double scr_bytes_len(const ScrBytes *b) { return (double)b->len; }
 
+void scr_bytes_copy_contents(ScrBytes *dst, const ScrBytes *src) {
+  if (dst->elem != src->elem || dst->len != src->len) {
+    scr_trap("scriptc: typed array snapshot shape changed\n");
+  }
+  memcpy(dst->data, src->data, dst->len * scr_bytes_elem_size(dst->elem));
+}
+
 double scr_bytes_byte_len(const ScrBytes *b) {
   return (double)(b->len * scr_bytes_elem_size(b->elem));
 }
@@ -1503,4 +1510,3 @@ double scr_bytes_write_var(ScrBytes *b, double value, double offset, double byte
   }
   return offset + (double)width;
 }
-

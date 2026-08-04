@@ -2608,6 +2608,19 @@ static bool scr_http_client_parse_head(ScrHttpConn *conn, size_t head_len) {
     return false;
   }
 
+  /*
+   * Informational responses do not settle the request. Node emits an
+   * `information` event for these and keeps parsing until the final
+   * response; this runtime has no information listener surface yet, so
+   * consume the head and continue. 101 is the upgrade case below.
+   */
+  if (status >= 100 && status < 200 && status != 101) {
+    memmove(conn->buf, conn->buf + head_len, conn->len - head_len);
+    conn->len -= head_len;
+    scr_http_req_release(res);
+    return true;
+  }
+
   /* framing: HEAD requests and 204/304 responses have NO body; chunked
    * wins over Content-Length; neither means EOF-delimited */
   bool chunked = false;

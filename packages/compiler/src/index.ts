@@ -3,8 +3,8 @@ import { basename, dirname, join, resolve } from "node:path";
 import { CcCompileError, compileC, compileLibArchive, resolveCc, targetPlatform } from "./backend/cc.js";
 import { emitModule } from "./backend/emission/emitter.js";
 import { emitLlvmModule, LlvmUnsupportedError } from "./backend/llvm/emitter.js";
-import { checkerPanicDiag, ffiNativeBuildDiag, libAsyncExportDiag, libAsyncSurfaceDiag, libExportUnresolvedDiag, libGenericExportDiag, libIntBoundaryDiag, libNpmIneligibleDiag, libUnmappableSignatureDiag, iceDiag, isCheckerPanic, LIB_INBOUND_BYTES_TRAP_CODE, LIB_RUNTIME_TRAP_CODES, type ScrDiagnostic } from "./diagnostics/diagnostic.js";
-import { checkLibraryIntegerSlots, classSeed, hasIntSlots, type FnIntSlots, type IntSlotConfig } from "./library/int-infer.js";
+import { checkerPanicDiag, ffiNativeBuildDiag, libAsyncExportDiag, libAsyncSurfaceDiag, libExportUnresolvedDiag, libGenericExportDiag, libIntBoundaryDiag, libNpmIneligibleDiag, libSidecarDiag, libUnmappableSignatureDiag, iceDiag, isCheckerPanic, LIB_INBOUND_BYTES_TRAP_CODE, LIB_RUNTIME_TRAP_CODES, type ScrDiagnostic } from "./diagnostics/diagnostic.js";
+import { checkLibraryIntegerSlots, classSeed, hasIntSlots, numberCarrierKind, type FnIntSlots, type IntSlotConfig } from "./library/int-infer.js";
 import { loadLibraryProfile, profileRemediation, profileTeaching, type LibraryProfile } from "./library/profile.js";
 import { decorateLibraryRefusals, evaluateLibraryFences } from "./library/fence-eval.js";
 import { assembleTrapTeaching } from "./library/trap-teaching.js";
@@ -15,11 +15,13 @@ import {
   compilerReleaseVersion,
   libraryIdentityHashes,
   type SidecarIntegerSlotFacts,
+  type SidecarIrRecordPattern,
+  type SidecarIrTypePattern,
 } from "./library/sidecar.js";
 import { validateSidecar } from "./library/sidecar-validate.js";
 import { entryFunctionExports, type EntryExportInfo } from "./frontend/lib-exports.js";
 import { entryContractFacts, type ContractFacts } from "./frontend/lib-contract.js";
-import { moduleLibAsyncSurface, moduleLibNondeterministicSurface, moduleEmbedsBuiltin, moduleEmbedsCompressedNpm, moduleUsesAssert, moduleUsesDc, moduleUsesDgram, moduleUsesDynAsync, moduleUsesDynInvoke, moduleUsesEmitter, moduleUsesFetch, moduleUsesFsWatch, moduleUsesHttp2, moduleUsesHttpServer, moduleUsesInspect, moduleUsesNet, moduleUsesNodeTest, moduleUsesProcessEvents, moduleUsesQs, moduleUsesRegex, moduleUsesSearchParams, moduleUsesStream, moduleUsesSymbol, moduleUsesTls, moduleUsesTlsCa, moduleUsesZlib, type IrLibSection, type IrModule, type IrType, type SrcLoc } from "./ir/nodes.js";
+import { moduleLibAsyncSurface, moduleLibNondeterministicSurface, moduleEmbedsBuiltin, moduleEmbedsCompressedNpm, moduleUsesAssert, moduleUsesCopying, moduleUsesDc, moduleUsesDgram, moduleUsesDynAsync, moduleUsesDynInvoke, moduleUsesEmitter, moduleUsesFetch, moduleUsesFsWatch, moduleUsesHttp2, moduleUsesHttpServer, moduleUsesInspect, moduleUsesNet, moduleUsesNodeTest, moduleUsesProcessEvents, moduleUsesQs, moduleUsesRegex, moduleUsesSearchParams, moduleUsesStream, moduleUsesSymbol, moduleUsesTls, moduleUsesTlsCa, moduleUsesZlib, type IrLibSection, type IrModule, type IrRecordShape, type IrType, type SrcLoc } from "./ir/nodes.js";
 import { serializeModule } from "./ir/serialize.js";
 import { validateModule } from "./ir/validate.js";
 import { canonicalBuiltinModule, checkPreflight, isNodeTypesPath, loadProgram, locOf, requiresOf, resolveNpmImport, type LoadResult } from "./frontend/program.js";
@@ -47,6 +49,19 @@ export {
   type SurfaceManifest,
   type SurfaceManifestEntry,
 } from "./coverage/surface-manifest.js";
+export {
+  NODE24_FETCH_COMPAT_PROFILE,
+  type FetchCompatEvidence,
+  type FetchCompatFacet,
+  type FetchCompatInventory,
+  type FetchCompatInventoryEntry,
+  type FetchCompatInventoryExclusion,
+  type FetchCompatInventoryPlacement,
+  type FetchCompatInventoryStatus,
+  type FetchCompatOperation,
+  type FetchCompatOption,
+  type FetchCompatProfile,
+} from "./compat/fetch-profile.js";
 export { LIB_FN_SIGS, validateModule } from "./ir/validate.js";
 export { resolveLibraryFences, type LibraryFenceDecl, type ResolvedLibraryFence } from "./library/fence-eval.js";
 export {
@@ -92,7 +107,7 @@ export {
 export { validateSidecar } from "./library/sidecar-validate.js";
 export { BUILD_ID_SEED, SOURCE_HASH_SEED, hex16, lengthPrefixedStream, wyhash64 } from "./library/wyhash.js";
 export { ISLAND_SURFACE, type IslandFnEntry } from "./frontend/lowering/surfaces.js";
-export { ambientDtsPath, overridesDtsPath } from "./frontend/program.js";
+export { ambientDtsPath, isExactExternalTypeSpecifier, overridesDtsPath } from "./frontend/program.js";
 export { resolveProvenanceSources } from "./frontend/provenance.js";
 export {
   setProvenanceSources,
@@ -232,6 +247,11 @@ export interface AnalyzeOptions {
   npmStatic?: readonly string[] | "auto";
   /** Analyze with the outbound native bindings from this FFI manifest. */
   ffiProfilePath?: string;
+  /** Coverage-only external host type surfaces: exact bare module
+   * specifier → local declaration file. The checker uses the declarations
+   * to analyze project code, but imported runtime values remain explicit
+   * SC1010 blockers rather than being counted as executable. */
+  externalTypes?: Readonly<Record<string, string>>;
 }
 
 /* ── the frontend, one pipeline shape ───────────────────────────────────
@@ -376,6 +396,14 @@ function packagesNamedByDiag(message: string, optedIn: ReadonlySet<string>): Set
   return hits;
 }
 
+/** The package-wide --npm-static name containing an exact bare specifier.
+ * External mappings are exact (subpaths included), while npm-static owns a
+ * whole package, so any mapped subpath conflicts with that package opt-in. */
+function packageNameOfBareSpecifier(specifier: string): string {
+  const parts = specifier.split("/");
+  return specifier.startsWith("@") ? parts.slice(0, 2).join("/") : parts[0]!;
+}
+
 /** The one frontend, three npm postures: `undefined`/explicit package
  * lists and `"auto"` are the executable lane's (--npm-static; fallback =
  * island). `"lib"` is library mode's mandatory auto twin — the same
@@ -386,6 +414,7 @@ function packagesNamedByDiag(message: string, optedIn: ReadonlySet<string>): Set
 function runFrontend(
   entryPath: string,
   npmStatic?: readonly string[] | "auto" | "lib",
+  externalTypes?: Readonly<Record<string, string>>,
   sourcePlatform: string | null = null,
 ): Frontend {
   setSourcePlatform(sourcePlatform, entryPath);
@@ -393,19 +422,56 @@ function runFrontend(
   const npmSites = new Map<string, SrcLoc>();
   const judged = new Set<string>();
   let requested: string[] = [];
+  let reusableScout: ReturnType<typeof loadProgram> | null = null;
+  let reusablePreflight: ScrDiagnostic[] | null = null;
   if (npmStatic === "auto" || npmStatic === "lib") {
-    const scout = loadProgram(entryPath);
+    const scout = loadProgram(entryPath, { externalTypes });
+    let retained = false;
     try {
-      checkPreflight(scout);
+      const scoutPreflight = checkPreflight(scout);
       requested =
         npmStatic === "lib"
           ? detectAutoPackages(scout, statuses, "lib", judged, npmSites)
           : detectAutoPackages(scout, statuses);
+      // With no package to opt in, the scout already IS the final frontend:
+      // same roots, resolution posture, preflight, and module order. Retain it
+      // instead of spawning a second tsgo server and checking the whole graph
+      // again — the common library-mode path has no bare npm imports.
+      if (requested.length === 0) {
+        reusableScout = scout;
+        reusablePreflight = scoutPreflight;
+        retained = true;
+      }
     } finally {
-      scout.dispose();
+      if (!retained) scout.dispose();
     }
   } else if (npmStatic !== undefined) {
     requested = [...new Set(npmStatic)];
+  }
+
+  // One exact --external-types mapping makes the containing package an
+  // external host boundary, which cannot simultaneously be compiled as a
+  // package-wide --npm-static program graph. External wins; retain the
+  // ordinary npm-static fallback record so explicit and auto requests both
+  // explain why the package did not compile statically.
+  if (requested.length > 0 && externalTypes !== undefined) {
+    const externalSpecifiersByPackage = new Map<string, string[]>();
+    for (const specifier of Object.keys(externalTypes)) {
+      const pkg = packageNameOfBareSpecifier(specifier);
+      const specs = externalSpecifiersByPackage.get(pkg) ?? [];
+      specs.push(specifier);
+      externalSpecifiersByPackage.set(pkg, specs);
+    }
+    requested = requested.filter((pkg) => {
+      const specs = externalSpecifiersByPackage.get(pkg);
+      if (specs === undefined) return true;
+      statuses.push({
+        package: pkg,
+        status: "fallback",
+        detail: `mapped as an external host module by --external-types (${specs.map((s) => JSON.stringify(s)).join(", ")})`,
+      });
+      return false;
+    });
   }
 
   // The all-or-nothing fallback loop: a preflight diagnostic ANCHORED in
@@ -427,8 +493,8 @@ function runFrontend(
   // island with a note, never a failed gate. Explicit opt-ins degrade
   // exactly like auto's — "the user asked for these packages" buys the
   // attempt, not a broken build.
-  let load = loadProgram(entryPath, { npmStatic: requested });
-  let preflight = checkPreflight(load);
+  let load = reusableScout ?? loadProgram(entryPath, { npmStatic: requested, externalTypes });
+  let preflight = reusablePreflight ?? checkPreflight(load);
   // Library mode's fixpoint: the opted-in packages' files joined the
   // program just now, and THEIR bare edges (import statements and
   // top-level requires) name packages the scout could not see. Judge each
@@ -442,7 +508,7 @@ function runFrontend(
       if (grown.length === 0) break;
       requested = [...requested, ...grown];
       load.dispose();
-      load = loadProgram(entryPath, { npmStatic: requested });
+      load = loadProgram(entryPath, { npmStatic: requested, externalTypes });
       preflight = checkPreflight(load);
     }
   }
@@ -475,7 +541,7 @@ function runFrontend(
       statuses.push({ package: p, status: "fallback", detail: reasons.get(p)! });
     }
     load.dispose();
-    load = loadProgram(entryPath, { npmStatic: effective });
+    load = loadProgram(entryPath, { npmStatic: effective, externalTypes });
     preflight = checkPreflight(load);
   }
   // The last resort, ALL modes: an opt-in can change the PROGRAM's OWN
@@ -514,18 +580,18 @@ function runFrontend(
     // import sites), then reload with the survivors; interaction effects
     // that still fail drop everything left.
     for (const p of [...effective]) {
-      const probe = loadProgram(entryPath, { npmStatic: [p] });
+      const probe = loadProgram(entryPath, { npmStatic: [p], externalTypes });
       const probeDiags = checkPreflight(probe);
       probe.dispose();
       if (probeDiags.some((d) => d.code === "SC0001")) dropWithNote(p);
     }
     load.dispose();
-    load = loadProgram(entryPath, { npmStatic: effective });
+    load = loadProgram(entryPath, { npmStatic: effective, externalTypes });
     preflight = checkPreflight(load);
     if (preflight.some((d) => d.code === "SC0001") && effective.size > 0) {
       for (const p of [...effective]) dropWithNote(p);
       load.dispose();
-      load = loadProgram(entryPath, { npmStatic: effective });
+      load = loadProgram(entryPath, { npmStatic: effective, externalTypes });
       preflight = checkPreflight(load);
     }
   }
@@ -566,7 +632,12 @@ function runFrontend(
           (sf) => [sf.fileName, sf.text],
         ),
       ),
-    lower: (opts) => lowerToIr(finalLoad.program, finalLoad.entry, finalLoad.moduleOrder, { ...opts, startupCrash: finalLoad.startupCrash ?? null }),
+    lower: (opts) => lowerToIr(finalLoad.program, finalLoad.entry, finalLoad.moduleOrder, {
+      ...opts,
+      startupCrash: finalLoad.startupCrash ?? null,
+      externalTypes: finalLoad.externalTypes,
+      externalTypeSpecifiersByFile: finalLoad.externalTypeSpecifiersByFile,
+    }),
     npmStatic: statuses,
     npmImportSites: npmSites,
     dispose: finalLoad.dispose,
@@ -593,7 +664,7 @@ export function analyze(entryPath: string, opts: AnalyzeOptions = {}): AnalyzeRe
     }
     ffi = loaded.profile;
   }
-  const fe = runFrontend(entryPath, opts.npmStatic);
+  const fe = runFrontend(entryPath, opts.npmStatic, opts.externalTypes);
   try {
     const emptyStats = { statementsTotal: 0, statementsFailed: 0, statementsIsland: 0, functionsSkipped: 0 };
 
@@ -757,11 +828,18 @@ export async function compile(entryPath: string, opts: CompileOptions): Promise<
     await compileC({
       cPath,
       outPath: opts.outPath,
+      // The emitted TU's non-system dependencies are the runtime/vendor tree,
+      // which cc.ts fingerprints separately. Low-level arbitrary C omits this
+      // opt-in so same-path header edits can never hit a stale artifact.
+      cacheIdentity: "scriptc-generated-v1",
       sanitize: opts.sanitize ?? false,
       dynamic: opts.dynamic ?? false,
       // The link switch for scr_regex.c + libregexp: detected on the IR, so
       // regex-free programs keep the historical (pinned) command line.
       regex: moduleUsesRegex(lowered.module),
+      // Array copying methods and the typed-array bridges live in one
+      // optional TU, linked only when one of their IR intrinsics survives.
+      copying: moduleUsesCopying(lowered.module),
       // The link switch for scr_fetch.c (the native bridge over scr_net +
       // scr_tls + scr_http's client parser + zlib — cc.ts implies those
       // units into the link): embedded npm code that references fetch gets
@@ -884,7 +962,7 @@ export async function compileAndroid(
   // island. The Android host supplies the NativeScript runtime contract
   // (Java namespaces, metadata-backed JNI bindings and callbacks); it does
   // not reimplement Core's views or application behavior.
-  const fe = runFrontend(entryPath, opts.npmStatic, "android");
+  const fe = runFrontend(entryPath, opts.npmStatic, undefined, "android");
   let mod: IrModule;
   let entryText: string;
   try {
@@ -1161,17 +1239,107 @@ function libraryIntSlotConfig(profile: LibraryProfile): IntSlotConfig {
   return cfg;
 }
 
+/** Match the sidecar syntax's exact structural type projection against the
+ * frontend's interned IR registries. The pattern deliberately mirrors
+ * ShapeRegistry's identity: every field name and recursively mapped field
+ * type participates. Tagged payload records additionally accept omission
+ * of their `kind` field because the lowering may carry that discriminant
+ * only in the surrounding union tag. */
+function sidecarRecordMatcher(
+  mod: IrModule,
+): (pattern: SidecarIrRecordPattern, shape: IrRecordShape) => boolean {
+  const records = new Map((mod.records ?? []).map((shape) => [shape.id, shape]));
+  const unions = new Map((mod.unions ?? []).map((union) => [union.id, union]));
+
+  const recordMatches = (
+    pattern: SidecarIrRecordPattern,
+    shape: IrRecordShape,
+  ): boolean => {
+    if (shape.tuple === true || shape.indexValue !== undefined) return false;
+    const variants = [pattern.fields];
+    if (pattern.kindMayBeOmitted === true) {
+      variants.push(pattern.fields.filter((field) => field.name !== "kind"));
+    }
+    return variants.some(
+      (fields) =>
+        fields.length === shape.fields.length &&
+        fields.every((field) => {
+          const actual = shape.fields.find((candidate) => candidate.name === field.name);
+          return actual !== undefined && typeMatches(field.type, actual.type);
+        }),
+    );
+  };
+
+  const unionMatches = (
+    patterns: SidecarIrTypePattern[],
+    actual: IrType[],
+  ): boolean => {
+    if (patterns.length !== actual.length) return false;
+    const used = new Set<number>();
+    const visit = (index: number): boolean => {
+      if (index === patterns.length) return true;
+      for (let i = 0; i < actual.length; i++) {
+        if (used.has(i) || !typeMatches(patterns[index]!, actual[i]!)) continue;
+        used.add(i);
+        if (visit(index + 1)) return true;
+        used.delete(i);
+      }
+      return false;
+    };
+    return visit(0);
+  };
+
+  const typeMatches = (
+    pattern: SidecarIrTypePattern,
+    actual: IrType,
+  ): boolean => {
+    switch (pattern.kind) {
+      case "f64":
+      case "string":
+      case "bool":
+      case "nullT":
+      case "undefinedT":
+      case "dyn":
+        return actual.kind === pattern.kind;
+      case "bytes":
+        return actual.kind === "bytes" && actual.elem === pattern.elem;
+      case "array":
+        return actual.kind === "array" && typeMatches(pattern.elem, actual.elem);
+      case "record": {
+        if (actual.kind !== "record") return false;
+        const shape = records.get(actual.shapeId);
+        return shape !== undefined && recordMatches(pattern, shape);
+      }
+      case "union": {
+        if (actual.kind !== "union") return false;
+        const union = unions.get(actual.unionId);
+        return union !== undefined && unionMatches(pattern.arms, union.arms);
+      }
+    }
+  };
+
+  return (pattern, shape) => recordMatches(pattern, shape);
+}
+
 /** Merge the sidecar-resolved integer slots (ask 4) into the inference
  * config: helper slots key by function name and IR parameter index (the
  * projection already shifted past the model receiver); record-field
- * slots map onto every interned IR shape whose field-name set matches
- * the projected record's — shapes intern structurally, so a same-shaped
- * second type shares the obligation (a sound over-approximation). A
+ * slots map onto every interned IR shape whose complete structural field
+ * signature matches the projected record's. Shapes intern structurally,
+ * so a same-shaped second type shares the obligation. DECLARED paths with
+ * the same class coalesce while retaining every source path for verdicts;
+ * differing classes refuse because one lowered field cannot seed or check
+ * two distinct class contracts without arm provenance. A
  * record fact that matches no shape binds nothing: no compiled code
  * constructs the type (the contract surface — init/update/subscriptions
  * and every helper — is force-lowered whenever integer slots are
  * declared, so this is genuine vacuity, not dead-stripping). */
-function mergeSidecarIntSlots(cfg: IntSlotConfig, facts: SidecarIntegerSlotFacts, mod: IrModule): IntSlotConfig {
+function mergeSidecarIntSlots(
+  cfg: IntSlotConfig,
+  facts: SidecarIntegerSlotFacts,
+  mod: IrModule,
+): { ok: true; config: IntSlotConfig } | { ok: false; diagnostic: ScrDiagnostic } {
+  const recordMatches = sidecarRecordMatcher(mod);
   for (const h of facts.helpers) {
     const fn = mod.functions.find((f) => f.name === h.fnName);
     const arity = Math.max(fn?.params.length ?? 0, (h.index ?? 0) + 1);
@@ -1202,29 +1370,38 @@ function mergeSidecarIntSlots(cfg: IntSlotConfig, facts: SidecarIntegerSlotFacts
     }
   }
   for (const r of facts.records) {
-    const wanted = new Set(r.fieldNames);
-    const wantedSansKind = new Set(r.fieldNames.filter((n) => n !== "kind"));
     for (const shape of mod.records ?? []) {
-      if (shape.tuple === true || shape.indexValue !== undefined) continue;
-      const names = shape.fields.map((f) => f.name);
-      if (names.some((n) => n.startsWith("%"))) continue;
-      // The union discriminant may or may not materialize as a shape
-      // field depending on the arm's lowering; match either spelling.
-      const matches =
-        (names.length === wanted.size && names.every((n) => wanted.has(n))) ||
-        (names.length === wantedSansKind.size && names.every((n: string) => wantedSansKind.has(n)));
-      if (!matches) continue;
+      if (!recordMatches(r.shape, shape)) continue;
       const target = shape.fields.find((f) => f.name === r.targetField);
-      if (target === undefined || target.type.kind !== "f64") continue;
+      if (target === undefined || numberCarrierKind(target.type, mod) === null) continue;
       let m = cfg.records.get(shape.id);
       if (m === undefined) {
         m = new Map();
         cfg.records.set(shape.id, m);
       }
-      m.set(r.targetField, { cls: r.cls, path: r.path });
+      const existing = m.get(r.targetField);
+      if (existing !== undefined && existing.cls !== r.cls) {
+        const paths = [
+          ...existing.paths.map((path) => `'${path}' (${existing.cls})`),
+          `'${r.path}' (${r.cls})`,
+        ];
+        return {
+          ok: false,
+          diagnostic: libSidecarDiag(
+            `integer slots ${paths.join(" and ")} collapse to the same lowered record field '${r.targetField}' — their proof obligations cannot be kept distinct`,
+            r.loc,
+            "kind-tagged union arms and structurally identical records may share one lowered shape — same-class declarations coalesce, but differing classes require distinct structural shapes or at most one classified slot",
+          ),
+        };
+      }
+      if (existing === undefined) {
+        m.set(r.targetField, { cls: r.cls, paths: [r.path] });
+      } else if (!existing.paths.includes(r.path)) {
+        existing.paths.push(r.path);
+      }
     }
   }
-  return cfg;
+  return { ok: true, config: cfg };
 }
 
 export async function compileLibrary(opts: CompileLibraryOptions): Promise<CompileLibraryResult> {
@@ -1401,7 +1578,9 @@ export async function compileLibrary(opts: CompileLibraryOptions): Promise<Compi
       return fail(violations.map((v) => iceDiag(`sidecar self-check failed — ${v}`, { file: entryPath, start: 0, end: 0 })));
     }
     sidecarJson = built.json;
-    intCfg = mergeSidecarIntSlots(intCfg, built.integerSlotFacts, mod);
+    const merged = mergeSidecarIntSlots(intCfg, built.integerSlotFacts, mod);
+    if (!merged.ok) return fail([merged.diagnostic]);
+    intCfg = merged.config;
   }
 
   // Ask 4: the integer-boundary inference — every value that can reach a
@@ -1451,6 +1630,7 @@ export async function compileLibrary(opts: CompileLibraryOptions): Promise<Compi
   await compileLibArchive({
     cPath,
     outPath: archivePath,
+    cacheIdentity: "scriptc-generated-library-v1",
     sanitize: opts.sanitize ?? false,
     regex: moduleUsesRegex(mod),
     assert: moduleUsesAssert(mod),
@@ -1459,6 +1639,7 @@ export async function compileLibrary(opts: CompileLibraryOptions): Promise<Compi
     searchParams: moduleUsesSearchParams(mod),
     emitter: moduleUsesEmitter(mod),
     zlib: moduleUsesZlib(mod),
+    copying: moduleUsesCopying(mod),
   });
 
   // The sidecar lands beside the compiled object, written by the same

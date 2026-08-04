@@ -1,5 +1,8 @@
 import { expect, test } from "vitest";
-import { sandboxRunnerConfig } from "../../scripts/sandbox-config.mjs";
+import {
+  sandboxRunnerConfig,
+  sandboxTestWorkerAllocation,
+} from "../../scripts/sandbox-config.mjs";
 
 test("runner settings are read after loading the sandbox environment", () => {
   expect(
@@ -26,5 +29,24 @@ test("runner settings retain their documented defaults", () => {
     localTestWorkers: "2",
     localCaseShards: "2",
     sandboxTimeout: "45m",
+  });
+});
+
+test("test processes stay within the per-Sandbox worker budget", () => {
+  expect(sandboxTestWorkerAllocation(4, 1)).toEqual({
+    caseWorkers: 3,
+    sideConcurrency: 1,
+  });
+  expect(sandboxTestWorkerAllocation(4, 2)).toEqual({
+    caseWorkers: 2,
+    sideConcurrency: 2,
+  });
+  expect(sandboxTestWorkerAllocation(2, 2)).toEqual({
+    caseWorkers: 1,
+    sideConcurrency: 1,
+  });
+  expect(sandboxTestWorkerAllocation(1, 2)).toEqual({
+    caseWorkers: 1,
+    sideConcurrency: 0,
   });
 });

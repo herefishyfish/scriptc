@@ -375,9 +375,9 @@ console.log(greet("world"), 6 * 7);
     const dynamicSize = statSync(dyn.binaryPath).size;
     // The class is toolchain-specific and page-granular. The canonical
     // Ubuntu 24.04/clang Sandbox measures 387,600 bytes; Mach-O measures
-    // about 353KB. Each bound leaves roughly one native page of growth,
+    // about 376KB. Each bound stays in the compact native size class,
     // far below the >1MB jump measured when the engine is linked.
-    expect(staticSize).toBeLessThan(process.platform === "linux" ? 392_000 : 361_000);
+    expect(staticSize).toBeLessThan(process.platform === "linux" ? 392_000 : 378_000);
     expect(dynamicSize).toBeGreaterThan(500_000);
   });
 

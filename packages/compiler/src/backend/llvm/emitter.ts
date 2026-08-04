@@ -73,7 +73,7 @@ import type {
   IrUnionDef,
   SrcLoc,
 } from "../../ir/nodes.js";
-import { canMarshalFuncIntoIsland, CAUGHT, DYN, F64, islandCallbackRet, islandPromisePayloadTag, isRefCounted, isUnitType, MAY_THROW_LIB_FNS, moduleUsesDynInvoke, moduleUsesFetch, moduleUsesFsWatch, moduleUsesHttpServer, moduleUsesNet, moduleUsesProcessEvents, moduleUsesStream, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, STRING, typeEquals, typeKey, VOID } from "../../ir/nodes.js";
+import { canMarshalFuncIntoIsland, CAUGHT, DYN, F64, islandCallbackRet, islandPromisePayloadTag, isRefCounted, isUnitType, MAY_THROW_LIB_FNS, moduleUsesDynInvoke, moduleUsesFetch, moduleUsesFsWatch, moduleUsesHttpServer, moduleUsesNet, moduleUsesProcessEvents, moduleUsesStream, moduleUsesTls, moduleUsesTlsCa, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, STRING, typeEquals, typeKey, VOID } from "../../ir/nodes.js";
 import { computeMayThrow } from "../emission/may-throw.js";
 import { mangleArgPack, mangleAsyncSpawn, mangleClassNew, mangleClassObj, mangleClassRetain, mangleFnClosure, mangleFunction, mangleGenDrop, mangleGenResThunk, mangleGenSpawn, mangleGlobal, mangleLocal, mangleRecordNew, mangleRecordStruct, mangleResolveThunk, mangleTrampoline, mangleVtStruct, mangleWrapper } from "../mangle.js";
 import { BlockBuilder } from "./blocks.js";
@@ -88,6 +88,16 @@ import {
 import { DK, LlDyn } from "./dyn.js";
 import { LlvmUnsupportedError } from "./unsupported.js";
 import { LlWalkers } from "./walkers.js";
+
+interface LlStreamTypedRefAdapter {
+  snapshot: string;
+  commit: string;
+}
+
+interface LlStreamTypedRefContext {
+  prefix: string;
+  adapters: Map<string, LlStreamTypedRefAdapter>;
+}
 import {
   arrNewCall,
   boxAccess,
@@ -477,6 +487,16 @@ const LIB_FN_SYMS: Record<string, string> = {
   // defineProps throw Node's TypeErrors (all in the may-throw seed set —
   // the generic path emits the standard pending check). typeof and the
   // ambient-this read never throw. The fs dyn read is the sync-fs story.
+  "fetch.start": "scr_fetch_static",
+  "fetch.responseJson": "scr_fetch_response_json",
+  "fetch.responseText": "scr_fetch_response_text",
+  "fetch.responseBytes": "scr_fetch_response_bytes",
+  "fetch.abortTimeout": "scr_fetch_abort_timeout",
+  "fetch.abortNow": "scr_fetch_abort_now",
+  "fetch.abortAny": "scr_fetch_abort_any",
+  "fetch.streamNew": "scr_fetch_stream_new",
+  "fetch.streamFrom": "scr_fetch_stream_from",
+  "fetch.readerRead": "scr_fetch_reader_read",
   "json.parse": "scr_json_parse",
   "dyn.keySet": "scr_dyn_key_set",
   "dyn.iterPack": "scr_dyn_iter_pack",
@@ -754,6 +774,8 @@ const STREAM_CANONICAL_CBS: Record<string, ("r" | "w" | "f" | "d" | "t" | "l")[]
  * the stream/emitter slice of emit-exprs.ts's markings, applied before
  * dispatch so generic and special shapes share one table. */
 const USES_TIMERS_LIB_FNS = new Set<string>([
+  "fetch.start",
+  "fetch.abortTimeout", "fetch.streamNew", "fetch.streamFrom",
   "readable.new", "writable.new", "duplex.new", "transform.new", "passthrough.new",
   "readable.init", "writable.init", "duplex.init", "transform.init", "passthrough.init",
   "readable.newDyn", "writable.newDyn", "duplex.newDyn", "transform.newDyn", "passthrough.newDyn",
@@ -777,7 +799,7 @@ const USES_TIMERS_LIB_FNS = new Set<string>([
   "fs.existsChk",
   "http.createServer", "http.createServerEmpty",
   "http.request", "http.requestCb", "http.requestUrl", "http.requestUrlCb",
-  "https.requestUrl", "https.requestUrlCb",
+  "https.request", "https.requestCb", "https.requestUrl", "https.requestUrlCb",
   "http.requestConn", "http.requestConnCb",
   "http.agentNew", "http.requestAgent", "http.requestAgentCb",
   // The dyn-async slice (emit-exprs.ts's markings): fiber parks, the
@@ -904,6 +926,18 @@ class LlEmitter {
    * typeKey → thunk symbol (CEmitter.resolveThunks). */
   private readonly resolveThunks = new Map<string, string>();
   private readonly resolveThunkDefs: string[] = [];
+  /** ReadableStream.from adapters keep typed arrays by reference and box
+   * one current element per pull. */
+  private readonly streamFromArrayAdapters = new Map<string, string>();
+  /** Identity-preserving static→dyn capsules used by Web APIs whose values
+   * remain directly observable (stream chunks and AbortSignal reasons). */
+  private readonly liveDynRefAdapters = new Map<
+    string,
+    LlStreamTypedRefAdapter
+  >();
+  /** Runtime-arm dispatchers for live union values. */
+  private readonly liveDynUnionRefAdapters = new Map<string, string>();
+  private readonly dynPromiseAdapters = new Map<string, string>();
   readonly unionsById = new Map<string, IrUnionDef>();
   readonly recordsById = new Map<string, IrRecordShape>();
   readonly tracedShapes: Set<string>;
@@ -1180,6 +1214,8 @@ class LlEmitter {
     // any island entry (the engine's lazy boot consults it) — cc.ts
     // compiles scr_fetch.c on the same predicate.
     const usesFetch = moduleUsesFetch(this.mod);
+    const snapshotsTlsCa =
+      moduleUsesTls(this.mod) || moduleUsesTlsCa(this.mod);
     const hasRefGlobals = globals.some((g) => isRefCounted(g.type)) || fnValueProps.length > 0;
     // Declared NOW — the extern block flushes before main assembles.
     if (usesEvents) this.declare(`declare void @scr_events_install()`);
@@ -1191,6 +1227,9 @@ class LlEmitter {
     }
     if (usesHttp) this.declare(`declare void @scr_http_dyn_install()`);
     if (usesFetch) this.declare(`declare void @scr_fetch_install()`);
+    if (snapshotsTlsCa) {
+      this.declare(`declare void @scr_tls_ca_install()`);
+    }
     if (usesEvents && hasRefGlobals) {
       this.declare(`declare void @scr_run_exit_listeners(double)`);
       this.declare(`declare i32 @scr_exit_code_hint_get()`);
@@ -1457,6 +1496,7 @@ class LlEmitter {
       // fs.watch programs fill the loop's watch hooks the same way —
       // scr_watch.c links only when this line is emitted.
       ...(usesFsWatch ? [`  call void @scr_watch_install()`] : []),
+      ...(snapshotsTlsCa ? [`  call void @scr_tls_ca_install()`] : []),
       ...(usesFetch ? [`  call void @scr_fetch_install()`] : []),
       ...(usesNet ? [`  call void @scr_net_install()`, `  call void @scr_net_dyn_install()`] : []),
       ...(usesHttp ? [`  call void @scr_http_dyn_install()`] : []),
@@ -4092,11 +4132,12 @@ class LlEmitter {
       case "strCmp": {
         const l = this.emitExpr(e.left);
         const r = this.emitExpr(e.right);
-        this.declare(`declare i32 @scr_str_cmp(ptr, ptr)`);
+        const fn = e.utf16 === true ? "scr_str_cmp_u16" : "scr_str_cmp";
+        this.declare(`declare i32 @${fn}(ptr, ptr)`);
         const c = B.tmp();
         const t = B.tmp();
         const pred = { "<": "slt", "<=": "sle", ">": "sgt", ">=": "sge" }[e.op];
-        B.line(`${c} = call i32 @scr_str_cmp(ptr ${l.name}, ptr ${r.name})`);
+        B.line(`${c} = call i32 @${fn}(ptr ${l.name}, ptr ${r.name})`);
         B.line(`${t} = icmp ${pred} i32 ${c}, 0`);
         return { name: t, type: e.type };
       }
@@ -6073,6 +6114,37 @@ class LlEmitter {
           return this.own({ name: t, type: e.type });
         }
         const v = this.emitExpr(e.value);
+        if (e.liveRef) {
+          if (v.type.kind === "union") {
+            const adapter = this.liveDynUnionRefAdapter(v.type);
+            const boxed = B.tmp();
+            B.line(`${boxed} = call ptr @${adapter}(ptr ${v.name})`);
+            return this.own({ name: boxed, type: e.type });
+          }
+          if (!this.streamTypedRefEligible(v.type)) {
+            throw new Error(`llvm emitter bug: live dyn ref of ${typeKey(v.type)}`);
+          }
+          const key = typeKey(v.type);
+          let adapter = this.liveDynRefAdapters.get(key);
+          if (!adapter) {
+            const prefix = `sc_ldr_${this.liveDynRefAdapters.size}`;
+            adapter = this.streamTypedRefMaterializeAdapter(
+              v.type,
+              { prefix, adapters: new Map() },
+              `${prefix}_materialize`,
+            );
+            this.liveDynRefAdapters.set(key, adapter);
+          }
+          const rc = vAdapters(this, v.type);
+          this.declare(
+            `declare ptr @scr_dyn_new_typed_ref(ptr, ptr, ptr, ptr, i64, ptr, ptr)`,
+          );
+          const boxed = B.tmp();
+          B.line(
+            `${boxed} = call ptr @scr_dyn_new_typed_ref(ptr ${v.name}, ptr ${rc.retain}, ptr ${rc.release}, ptr ${this.cstr(key)}, i64 ${Buffer.byteLength(key, "utf8")}, ptr @${adapter.snapshot}, ptr ${adapter.commit})`,
+          );
+          return this.own({ name: boxed, type: e.type });
+        }
         if (v.type.kind === "func") {
           // A closure boxes as the checked-dynamic tree's function kind: retained closure +
           // the per-signature call thunk + the interned signature key. The
@@ -6788,6 +6860,15 @@ class LlEmitter {
         return fallible(() => {
           const t = B.tmp();
           B.line(`${t} = call ptr @scr_jsval_call(ptr ${a(0)}, i32 ${args.length - 1}, ptr ${pack})`);
+          return t;
+        });
+      }
+      case "callFnThis": {
+        const pack = argPack(args.slice(2).map((x) => x.name));
+        this.declare(`declare ptr @scr_jsval_call_this(ptr, ptr, i32, ptr)`);
+        return fallible(() => {
+          const t = B.tmp();
+          B.line(`${t} = call ptr @scr_jsval_call_this(ptr ${a(0)}, ptr ${a(1)}, i32 ${args.length - 2}, ptr ${pack})`);
           return t;
         });
       }
@@ -8813,6 +8894,39 @@ class LlEmitter {
         B.line(`${t} = call ptr @scr_arr_slice(ptr ${r.name}, double ${start}, double ${end})`);
         return this.own({ name: t, type: e.type });
       }
+      case "toReversed": {
+        this.declare(`declare ptr @scr_arr_to_reversed(ptr)`);
+        const t = B.tmp();
+        B.line(`${t} = call ptr @scr_arr_to_reversed(ptr ${r.name})`);
+        return this.own({ name: t, type: e.type });
+      }
+      case "toSpliced": {
+        const start = this.emitExpr(e.args[0]!);
+        const count = this.emitExpr(e.args[1]!);
+        const items = this.emitExpr(e.args[2]!);
+        this.declare(`declare ptr @scr_arr_to_spliced(ptr, double, double, ptr)`);
+        const t = B.tmp();
+        B.line(
+          `${t} = call ptr @scr_arr_to_spliced(ptr ${r.name}, double ${start.name}, ` +
+            `double ${count.name}, ptr ${items.name})`,
+        );
+        return this.own({ name: t, type: e.type });
+      }
+      case "with": {
+        const index = this.emitExpr(e.args[0]!);
+        const value = this.emitExpr(e.args[1]!);
+        this.declare(
+          `declare ptr @scr_arr_with_${acc}(ptr, double, ${accArg})`,
+        );
+        const t = B.tmp();
+        B.line(
+          `${t} = call ptr @scr_arr_with_${acc}(ptr ${r.name}, double ${index.name}, ` +
+            `${accTy} ${value.name})`,
+        );
+        const out = this.own({ name: t, type: e.type });
+        this.emitPendingCheck();
+        return out;
+      }
       case "splice": {
         // The removal splice: removed elements come back as a fresh +1
         // array, ownership MOVED out of the receiver. An omitted count
@@ -9260,6 +9374,38 @@ class LlEmitter {
           "scr_bytes_subarray",
           "ptr (ptr, double, double)",
           `ptr ${r.name}, double ${args[0]?.name ?? f64Lit(0)}, double ${args[1]?.name ?? F64_INF}`,
+          true,
+          false,
+        );
+      case "toReversed":
+        return call(
+          "scr_bytes_to_reversed",
+          "ptr (ptr)",
+          `ptr ${r.name}`,
+          true,
+          false,
+        );
+      case "with":
+        return call(
+          "scr_bytes_with",
+          "ptr (ptr, double, double)",
+          `ptr ${r.name}, double ${args[0]!.name}, double ${args[1]!.name}`,
+          true,
+          true,
+        );
+      case "join":
+        return call(
+          "scr_bytes_join",
+          "ptr (ptr, ptr)",
+          `ptr ${r.name}, ptr ${args[0]!.name}`,
+          true,
+          false,
+        );
+      case "toArray":
+        return call(
+          "scr_bytes_to_arr",
+          "ptr (ptr)",
+          `ptr ${r.name}`,
           true,
           false,
         );
@@ -9836,6 +9982,600 @@ class LlEmitter {
     B.terminate(`unreachable`);
   }
 
+  private dynPromiseAdapter(inner: IrType): string {
+    if (!isRefCounted(inner) || inner.kind === "dyn") {
+      throw new Error(
+        `dynamic promise adapter requires a concrete reference type, got ${typeKey(inner)}`,
+      );
+    }
+    const key = typeKey(inner);
+    const existing = this.dynPromiseAdapters.get(key);
+    if (existing) return existing;
+    const sym = `sc_dpa_${this.dynPromiseAdapters.size}`;
+    this.dynPromiseAdapters.set(key, sym);
+    this.declare(`declare ptr @scr_promise_payload_ref(ptr)`);
+    this.declare(`declare void @scr_dyn_release_v(ptr)`);
+    this.declare(`declare zeroext i1 @scr_exc_pending()`);
+    this.declare(`declare void @scr_promise_reject_pending(ptr)`);
+    const B = new BlockBuilder();
+    const dyn = B.tmp();
+    const value = B.tmp();
+    const pending = B.tmp();
+    B.line(`${dyn} = call ptr @scr_promise_payload_ref(ptr %src)`);
+    B.line(
+      `${value} = call ptr @${this.dyn.dynCheckHelper(inner)}(ptr ${dyn}, ptr null)`,
+    );
+    B.line(`call void @scr_dyn_release_v(ptr ${dyn})`);
+    B.line(`${pending} = call zeroext i1 @scr_exc_pending()`);
+    const fail = B.newLabel("sra.fail");
+    const ok = B.newLabel("sra.ok");
+    B.condBr(pending, fail, ok);
+    B.startBlock(fail);
+    B.line(`call void @scr_promise_reject_pending(ptr %dst)`);
+    B.terminate(`ret void`);
+    B.startBlock(ok);
+    if (inner.kind === "string") {
+      this.declare(`declare void @scr_promise_fulfill_str(ptr, ptr)`);
+      B.line(`call void @scr_promise_fulfill_str(ptr %dst, ptr ${value})`);
+    } else {
+      const rc = vAdapters(this, inner);
+      this.declare(`declare void @scr_promise_fulfill_ref(ptr, ptr, ptr, ptr, ptr)`);
+      B.line(
+        `call void @scr_promise_fulfill_ref(ptr %dst, ptr ${value}, ptr ${rc.retain}, ptr ${rc.release}, ptr ${traceArg(this, inner)})`,
+      );
+    }
+    B.terminate(`ret void`);
+    this.resolveThunkDefs.push(
+      `define internal void @${sym}(ptr %dst, ptr %src) ${FN_ATTRS} { ; checked-dynamic promise exit ${key}`,
+      B.render(),
+      `}`,
+      ``,
+    );
+    return sym;
+  }
+
+  private streamTypedRefCommitAdapter(
+    t: IrType,
+    snapshot: string,
+  ): string {
+    if (t.kind === "bytes") {
+      const commit = `${snapshot}_commit`;
+      const check = this.dyn.dynCheckHelper(t);
+      this.declare(`declare void @scr_bytes_copy_contents(ptr, ptr)`);
+      this.declare(`declare void @scr_bytes_release(ptr)`);
+      this.resolveThunkDefs.push(
+        `define internal void @${commit}(ptr %target, ptr %d) ${FN_ATTRS} { ; commit live stream element ${typeKey(t)}`,
+        `entry:`,
+        `  %next = call ptr @${check}(ptr %d, ptr null)`,
+        `  %missing = icmp eq ptr %next, null`,
+        `  br i1 %missing, label %done, label %copy`,
+        `copy:`,
+        `  call void @scr_bytes_copy_contents(ptr %target, ptr %next)`,
+        `  call void @scr_bytes_release(ptr %next)`,
+        `  br label %done`,
+        `done:`,
+        `  ret void`,
+        `}`,
+        ``,
+      );
+      return `@${commit}`;
+    }
+    if (t.kind === "array") {
+      const commit = `${snapshot}_commit`;
+      const check = this.dyn.dynCheckHelper(t);
+      this.declare(`declare void @scr_arr_release(ptr)`);
+      this.resolveThunkDefs.push(
+        `define internal void @${commit}(ptr %target, ptr %d) ${FN_ATTRS} { ; commit live stream element ${typeKey(t)}`,
+        `entry:`,
+        `  %next = call ptr @${check}(ptr %d, ptr null)`,
+        `  %missing = icmp eq ptr %next, null`,
+        `  br i1 %missing, label %done, label %swap`,
+        `swap:`,
+        `  %target_len_ptr = getelementptr inbounds %ScrArr, ptr %target, i64 0, i32 1`,
+        `  %next_len_ptr = getelementptr inbounds %ScrArr, ptr %next, i64 0, i32 1`,
+        `  %target_len = load i64, ptr %target_len_ptr`,
+        `  %next_len = load i64, ptr %next_len_ptr`,
+        `  store i64 %next_len, ptr %target_len_ptr`,
+        `  store i64 %target_len, ptr %next_len_ptr`,
+        `  %target_cap_ptr = getelementptr inbounds %ScrArr, ptr %target, i64 0, i32 2`,
+        `  %next_cap_ptr = getelementptr inbounds %ScrArr, ptr %next, i64 0, i32 2`,
+        `  %target_cap = load i64, ptr %target_cap_ptr`,
+        `  %next_cap = load i64, ptr %next_cap_ptr`,
+        `  store i64 %next_cap, ptr %target_cap_ptr`,
+        `  store i64 %target_cap, ptr %next_cap_ptr`,
+        `  %target_data_ptr = getelementptr inbounds %ScrArr, ptr %target, i64 0, i32 7`,
+        `  %next_data_ptr = getelementptr inbounds %ScrArr, ptr %next, i64 0, i32 7`,
+        `  %target_data = load ptr, ptr %target_data_ptr`,
+        `  %next_data = load ptr, ptr %next_data_ptr`,
+        `  store ptr %next_data, ptr %target_data_ptr`,
+        `  store ptr %target_data, ptr %next_data_ptr`,
+        `  call void @scr_arr_release(ptr %next)`,
+        `  br label %done`,
+        `done:`,
+        `  ret void`,
+        `}`,
+        ``,
+      );
+      return `@${commit}`;
+    }
+    if (t.kind !== "record") return "null";
+    const shape = this.recordsById.get(t.shapeId);
+    if (!shape) {
+      throw new Error(
+        `llvm emitter bug: stream typed-ref commit of unknown shape ${t.shapeId}`,
+      );
+    }
+    const commit = `${snapshot}_commit`;
+    const check = this.dyn.dynCheckHelper(t);
+    const lines = [
+      `define internal void @${commit}(ptr %target, ptr %d) ${FN_ATTRS} { ; commit live stream element ${typeKey(t)}`,
+      `entry:`,
+      `  %next = call ptr @${check}(ptr %d, ptr null)`,
+      `  %missing = icmp eq ptr %next, null`,
+      `  br i1 %missing, label %done, label %swap`,
+      `swap:`,
+    ];
+    const members = [
+      ...shape.fields.map((field, index) => ({
+        index: index + 1,
+        type: llFieldType(field.type),
+        name: field.name,
+      })),
+      ...(shape.indexValue
+        ? [{
+            index: shape.fields.length + 1,
+            type: "ptr" as const,
+            name: "[key: string] overflow",
+          }]
+        : []),
+    ];
+    members.forEach((member, index) => {
+      lines.push(
+        `  %tp${index} = getelementptr inbounds %${mangleRecordStruct(t.shapeId)}, ptr %target, i64 0, i32 ${member.index}`,
+        `  %np${index} = getelementptr inbounds %${mangleRecordStruct(t.shapeId)}, ptr %next, i64 0, i32 ${member.index}`,
+        `  %old${index} = load ${member.type}, ptr %tp${index} ; ${member.name}`,
+        `  %new${index} = load ${member.type}, ptr %np${index}`,
+        `  store ${member.type} %new${index}, ptr %tp${index}`,
+        `  store ${member.type} %old${index}, ptr %np${index}`,
+      );
+    });
+    lines.push(
+      `  call void ${releaseSym(this, t)}(ptr %next)`,
+      `  br label %done`,
+      `done:`,
+      `  ret void`,
+      `}`,
+      ``,
+    );
+    this.resolveThunkDefs.push(...lines);
+    return `@${commit}`;
+  }
+
+  /** Box the mutable payload of a union directly, preserving the identity
+   * that AbortSignal reasons and stream chunks expose. Scalar/unit arms use
+   * the ordinary union-to-dyn converter. */
+  private liveDynUnionRefAdapter(
+    t: IrType & { kind: "union" },
+  ): string {
+    const key = typeKey(t);
+    const existing = this.liveDynUnionRefAdapters.get(key);
+    if (existing) return existing;
+    const union = this.unionsById.get(t.unionId);
+    if (!union) {
+      throw new Error(
+        `llvm emitter bug: live dyn ref of unknown union ${t.unionId}`,
+      );
+    }
+    const mutableArms = union.arms
+      .map((arm, tag) => ({ arm, tag }))
+      .filter(({ arm }) => this.streamTypedRefEligible(arm));
+    if (mutableArms.length === 0) {
+      throw new Error(`llvm emitter bug: live dyn ref of immutable union ${key}`);
+    }
+
+    const sym = `sc_ldu_${this.liveDynUnionRefAdapters.size}`;
+    this.liveDynUnionRefAdapters.set(key, sym);
+    this.declare(
+      `declare ptr @scr_dyn_new_typed_ref(ptr, ptr, ptr, ptr, i64, ptr, ptr)`,
+    );
+    const adapters = new Map<number, LlStreamTypedRefAdapter>();
+    for (const { arm, tag } of mutableArms) {
+      const prefix = `${sym}_${tag}`;
+      adapters.set(
+        tag,
+        this.streamTypedRefMaterializeAdapter(
+          arm,
+          { prefix, adapters: new Map() },
+          `${prefix}_materialize`,
+        ),
+      );
+    }
+
+    const B = new BlockBuilder();
+    const tagPtr = B.tmp();
+    const tagValue = B.tmp();
+    B.line(
+      `${tagPtr} = getelementptr inbounds %ScrUnion, ptr %u, i64 0, i32 1`,
+    );
+    B.line(`${tagValue} = load i32, ptr ${tagPtr}`);
+    const fallback = B.newLabel("ldu.dyn");
+    const armLabels = mutableArms.map(() => B.newLabel("ldu.ref"));
+    B.terminate(
+      `switch i32 ${tagValue}, label %${fallback} [ ${mutableArms.map(({ tag }, index) => `i32 ${tag}, label %${armLabels[index]}`).join(" ")} ]`,
+    );
+    mutableArms.forEach(({ arm, tag }, index) => {
+      const adapter = adapters.get(tag)!;
+      const rc = vAdapters(this, arm);
+      const armKey = typeKey(arm);
+      B.startBlock(armLabels[index]!);
+      const payloadPtr = B.tmp();
+      const payload = B.tmp();
+      const boxed = B.tmp();
+      B.line(
+        `${payloadPtr} = getelementptr inbounds %ScrUnion, ptr %u, i64 0, i32 5`,
+      );
+      B.line(`${payload} = load ptr, ptr ${payloadPtr}`);
+      B.line(
+        `${boxed} = call ptr @scr_dyn_new_typed_ref(ptr ${payload}, ptr ${rc.retain}, ptr ${rc.release}, ptr ${this.cstr(armKey)}, i64 ${Buffer.byteLength(armKey, "utf8")}, ptr @${adapter.snapshot}, ptr ${adapter.commit})`,
+      );
+      B.terminate(`ret ptr ${boxed}`);
+    });
+    B.startBlock(fallback);
+    const boxed = B.tmp();
+    B.line(`${boxed} = call ptr @${this.dyn.toDynHelper(t)}(ptr %u)`);
+    B.terminate(`ret ptr ${boxed}`);
+    this.resolveThunkDefs.push(
+      `define internal ptr @${sym}(ptr %u) ${FN_ATTRS} { ; materialize live union value ${key}`,
+      B.render(),
+      `}`,
+      ``,
+    );
+    return sym;
+  }
+
+  private streamTypedRefEligible(t: IrType): boolean {
+    return t.kind === "record" || t.kind === "array" || t.kind === "bytes";
+  }
+
+  private streamTypedRefBoxValue(
+    B: BlockBuilder,
+    t: IrType,
+    value: string,
+    ctx: LlStreamTypedRefContext,
+  ): string {
+    const boxed = B.tmp();
+    if (!this.streamTypedRefEligible(t)) {
+      const valueTy = t.kind === "f64"
+        ? "double"
+        : t.kind === "bool"
+          ? "i1"
+          : "ptr";
+      B.line(
+        `${boxed} = call ptr @${this.dyn.toDynHelper(t)}(${valueTy} ${value})`,
+      );
+      return boxed;
+    }
+    const nested = this.streamTypedRefMaterializeAdapter(t, ctx);
+    const rc = vAdapters(this, t);
+    const key = typeKey(t);
+    this.declare(
+      `declare ptr @scr_dyn_new_typed_ref(ptr, ptr, ptr, ptr, i64, ptr, ptr)`,
+    );
+    B.line(
+      `${boxed} = call ptr @scr_dyn_new_typed_ref(ptr ${value}, ptr ${rc.retain}, ptr ${rc.release}, ptr ${this.cstr(key)}, i64 ${Buffer.byteLength(key, "utf8")}, ptr @${nested.snapshot}, ptr ${nested.commit})`,
+    );
+    return boxed;
+  }
+
+  /** LLVM twin of the C stream materializer: mutable reference children
+   * are their own typed capsules, so writes through a nested alias commit
+   * to the nested static source immediately. */
+  private streamTypedRefMaterializeAdapter(
+    t: IrType,
+    ctx: LlStreamTypedRefContext,
+    preferredSnapshot?: string,
+  ): LlStreamTypedRefAdapter {
+    const key = typeKey(t);
+    const existing = ctx.adapters.get(key);
+    if (existing) return existing;
+    const snapshot = preferredSnapshot ??
+      `${ctx.prefix}_nested_${ctx.adapters.size}`;
+    const adapter: LlStreamTypedRefAdapter = { snapshot, commit: "null" };
+    ctx.adapters.set(key, adapter);
+    adapter.commit = this.streamTypedRefCommitAdapter(t, snapshot);
+    const B = new BlockBuilder();
+
+    if (t.kind === "record") {
+      const shape = this.recordsById.get(t.shapeId);
+      if (!shape) {
+        throw new Error(
+          `llvm emitter bug: stream typed-ref materialize of unknown shape ${t.shapeId}`,
+        );
+      }
+      /* Keep the ordinary converter for index-signature/listener records;
+       * their source-identity and overflow walks have extra contracts.
+       * Declared-field records and tuples cover the live stream values. */
+      const ordinary = shape.indexValue || shape.fields.some(
+        (field) => field.name === "handleEvent" && field.type.kind === "func",
+      );
+      if (ordinary) {
+        const out = B.tmp();
+        B.line(`${out} = call ptr @${this.dyn.toDynHelper(t)}(ptr %p)`);
+        B.terminate(`ret ptr ${out}`);
+      } else if (shape.tuple) {
+        this.declare(`declare ptr @scr_dyn_new_arr()`);
+        this.declare(`declare void @scr_dyn_arr_push(ptr, ptr)`);
+        const out = B.tmp();
+        B.line(`${out} = call ptr @scr_dyn_new_arr()`);
+        const fields = [...shape.fields].sort(
+          (a, b) => Number(a.name) - Number(b.name),
+        );
+        for (const field of fields) {
+          const index = shape.fields.indexOf(field) + 1;
+          const fieldPtr = B.tmp();
+          const fieldValue = B.tmp();
+          B.line(`${fieldPtr} = getelementptr inbounds %${mangleRecordStruct(t.shapeId)}, ptr %p, i64 0, i32 ${index}`);
+          B.line(`${fieldValue} = load ${llFieldType(field.type)}, ptr ${fieldPtr}`);
+          const boxed = this.streamTypedRefBoxValue(
+            B,
+            field.type,
+            fieldValue,
+            ctx,
+          );
+          B.line(`call void @scr_dyn_arr_push(ptr ${out}, ptr ${boxed})`);
+        }
+        B.terminate(`ret ptr ${out}`);
+      } else {
+        this.declare(`declare ptr @scr_dyn_new_obj()`);
+        this.declare(`declare void @scr_dyn_obj_set(ptr, ptr, i64, ptr)`);
+        const out = B.tmp();
+        B.line(`${out} = call ptr @scr_dyn_new_obj()`);
+        const byName = new Map(shape.fields.map((field) => [field.name, field]));
+        const order = shape.declaredOrder ?? shape.fields.map((field) => field.name);
+        const inOrder = new Set(order);
+        const fields = [
+          ...order.map((name) => byName.get(name)).filter((field) => field !== undefined),
+          ...shape.fields.filter((field) => !inOrder.has(field.name)),
+        ];
+        for (const field of fields) {
+          const index = shape.fields.indexOf(field) + 1;
+          const fieldPtr = B.tmp();
+          const fieldValue = B.tmp();
+          B.line(`${fieldPtr} = getelementptr inbounds %${mangleRecordStruct(t.shapeId)}, ptr %p, i64 0, i32 ${index}`);
+          B.line(`${fieldValue} = load ${llFieldType(field.type)}, ptr ${fieldPtr}`);
+          const boxed = this.streamTypedRefBoxValue(
+            B,
+            field.type,
+            fieldValue,
+            ctx,
+          );
+          B.line(`call void @scr_dyn_obj_set(ptr ${out}, ptr ${this.cstr(field.name)}, i64 ${Buffer.byteLength(field.name, "utf8")}, ptr ${boxed})`);
+        }
+        B.terminate(`ret ptr ${out}`);
+      }
+    } else if (t.kind === "array") {
+      const elem = t.elem;
+      this.declare(`declare ptr @scr_dyn_new_arr()`);
+      this.declare(`declare void @scr_dyn_arr_push(ptr, ptr)`);
+      this.declare(`declare double @scr_arr_len(ptr)`);
+      const out = B.tmp();
+      B.line(`${out} = call ptr @scr_dyn_new_arr()`);
+      const len = B.tmp();
+      B.line(`${len} = call double @scr_arr_len(ptr %p)`);
+      const iSlot = B.slot();
+      B.entryAllocas.push(`${iSlot} = alloca double`);
+      B.line(`store double ${f64Lit(0)}, ptr ${iSlot}`);
+      const condition = B.newLabel("strm.c");
+      const body = B.newLabel("strm.b");
+      const done = B.newLabel("strm.e");
+      B.br(condition);
+      B.startBlock(condition);
+      const index = B.tmp();
+      const more = B.tmp();
+      B.line(`${index} = load double, ptr ${iSlot}`);
+      B.line(`${more} = fcmp olt double ${index}, ${len}`);
+      B.condBr(more, body, done);
+      B.startBlock(body);
+      let value: string;
+      if (elem.kind === "f64" || elem.kind === "bool") {
+        const valueTy = elem.kind === "f64" ? "double" : "i1";
+        this.declare(
+          `declare ${elem.kind === "bool" ? "zeroext i1" : valueTy} @scr_arr_get_${elem.kind}(ptr, double)`,
+        );
+        value = B.tmp();
+        B.line(`${value} = call ${valueTy} @scr_arr_get_${elem.kind}(ptr %p, double ${index})`);
+      } else {
+        this.declare(`declare ptr @scr_arr_get_ref(ptr, double)`);
+        value = B.tmp();
+        B.line(`${value} = call ptr @scr_arr_get_ref(ptr %p, double ${index}) ; +1`);
+      }
+      const boxed = this.streamTypedRefBoxValue(B, elem, value, ctx);
+      B.line(`call void @scr_dyn_arr_push(ptr ${out}, ptr ${boxed})`);
+      if (isRefCounted(elem)) {
+        B.line(`call void ${releaseSym(this, elem)}(ptr ${value})`);
+      }
+      const next = B.tmp();
+      B.line(`${next} = fadd double ${index}, ${f64Lit(1)}`);
+      B.line(`store double ${next}, ptr ${iSlot}`);
+      B.br(condition);
+      B.startBlock(done);
+      B.terminate(`ret ptr ${out}`);
+    } else {
+      const out = B.tmp();
+      B.line(`${out} = call ptr @${this.dyn.toDynHelper(t)}(ptr %p)`);
+      B.terminate(`ret ptr ${out}`);
+    }
+
+    this.resolveThunkDefs.push(
+      `define internal ptr @${snapshot}(ptr %p) ${FN_ATTRS} { ; materialize live stream value ${key}`,
+      B.render(),
+      `}`,
+      ``,
+    );
+    return adapter;
+  }
+
+  private streamFromArrayAdapter(
+    t: IrType & { kind: "array" },
+  ): string {
+    const elem = t.elem;
+    const key = typeKey(elem);
+    const existing = this.streamFromArrayAdapters.get(key);
+    if (existing) return existing;
+    const sym = `sc_sfa_${this.streamFromArrayAdapters.size}`;
+    this.streamFromArrayAdapters.set(key, sym);
+    const B = new BlockBuilder();
+    const unionDef = elem.kind === "union"
+      ? this.unionsById.get(elem.unionId)
+      : undefined;
+    if (elem.kind === "union" && !unionDef) {
+      throw new Error(`llvm emitter bug: streamFrom of unknown union ${elem.unionId}`);
+    }
+    const unionRefArms = unionDef?.arms
+      .map((arm, tag) => ({ arm, tag }))
+      .filter(({ arm }) =>
+        isRefCounted(arm) && arm.kind !== "dyn" && arm.kind !== "string"
+      ) ?? [];
+    const typedRef = isRefCounted(elem) &&
+      elem.kind !== "dyn" &&
+      elem.kind !== "string" &&
+      elem.kind !== "union";
+    const snapshot = `${sym}_materialize`;
+    let value: string;
+    if (elem.kind === "f64") {
+      this.declare(`declare double @scr_arr_get_f64(ptr, double)`);
+      value = B.tmp();
+      B.line(
+        `${value} = call double @scr_arr_get_f64(ptr %a, double %i)`,
+      );
+    } else if (elem.kind === "bool") {
+      this.declare(`declare zeroext i1 @scr_arr_get_bool(ptr, double)`);
+      value = B.tmp();
+      B.line(
+        `${value} = call i1 @scr_arr_get_bool(ptr %a, double %i)`,
+      );
+    } else {
+      this.declare(`declare ptr @scr_arr_get_ref(ptr, double)`);
+      value = B.tmp();
+      B.line(
+        `${value} = call ptr @scr_arr_get_ref(ptr %a, double %i) ; +1`,
+      );
+    }
+    let boxed: string;
+    const valueTy =
+      elem.kind === "f64" ? "double" : elem.kind === "bool" ? "i1" : "ptr";
+    if (elem.kind === "union") {
+      if (unionRefArms.length === 0) {
+        boxed = B.tmp();
+        B.line(
+          `${boxed} = call ptr @${this.dyn.toDynHelper(elem)}(ptr ${value})`,
+        );
+      } else {
+        this.declare(
+          `declare ptr @scr_dyn_new_typed_ref(ptr, ptr, ptr, ptr, i64, ptr, ptr)`,
+        );
+        const boxedSlot = B.slot();
+        B.entryAllocas.push(`${boxedSlot} = alloca ptr`);
+        const tagPtr = B.tmp();
+        const tagValue = B.tmp();
+        B.line(
+          `${tagPtr} = getelementptr inbounds %ScrUnion, ptr ${value}, i64 0, i32 1`,
+        );
+        B.line(`${tagValue} = load i32, ptr ${tagPtr}`);
+        const fallback = B.newLabel("sfa.union.dyn");
+        const join = B.newLabel("sfa.union.join");
+        const armLabels = unionRefArms.map(() => B.newLabel("sfa.union.ref"));
+        B.terminate(
+          `switch i32 ${tagValue}, label %${fallback} [ ${unionRefArms.map(({ tag }, i) => `i32 ${tag}, label %${armLabels[i]}`).join(" ")} ]`,
+        );
+        unionRefArms.forEach(({ arm, tag }, i) => {
+          const armKey = typeKey(arm);
+          const armSnapshot = `${snapshot}_${tag}`;
+          const armCommit = this.streamTypedRefCommitAdapter(
+            arm,
+            armSnapshot,
+          );
+          const rc = vAdapters(this, arm);
+          B.startBlock(armLabels[i]!);
+          const payloadPtr = B.tmp();
+          const payload = B.tmp();
+          const armBoxed = B.tmp();
+          B.line(
+            `${payloadPtr} = getelementptr inbounds %ScrUnion, ptr ${value}, i64 0, i32 5`,
+          );
+          B.line(`${payload} = load ptr, ptr ${payloadPtr}`);
+          B.line(
+            `${armBoxed} = call ptr @scr_dyn_new_typed_ref(ptr ${payload}, ptr ${rc.retain}, ptr ${rc.release}, ptr ${this.cstr(armKey)}, i64 ${Buffer.byteLength(armKey, "utf8")}, ptr @${armSnapshot}, ptr ${armCommit})`,
+          );
+          B.line(`store ptr ${armBoxed}, ptr ${boxedSlot}`);
+          B.br(join);
+          this.resolveThunkDefs.push(
+            `define internal ptr @${armSnapshot}(ptr %p) ${FN_ATTRS} { ; materialize stream union arm ${armKey}`,
+            `entry:`,
+            `  %d = call ptr @${this.dyn.toDynHelper(arm)}(ptr %p)`,
+            `  ret ptr %d`,
+            `}`,
+            ``,
+          );
+        });
+        B.startBlock(fallback);
+        const dynBoxed = B.tmp();
+        B.line(
+          `${dynBoxed} = call ptr @${this.dyn.toDynHelper(elem)}(ptr ${value})`,
+        );
+        B.line(`store ptr ${dynBoxed}, ptr ${boxedSlot}`);
+        B.br(join);
+        B.startBlock(join);
+        boxed = B.tmp();
+        B.line(`${boxed} = load ptr, ptr ${boxedSlot}`);
+      }
+    } else if (typedRef) {
+      boxed = B.tmp();
+      const rc = vAdapters(this, elem);
+      const keyPtr = this.cstr(key);
+      let commit: string;
+      if (this.streamTypedRefEligible(elem)) {
+        commit = this.streamTypedRefMaterializeAdapter(
+          elem,
+          { prefix: snapshot, adapters: new Map() },
+          snapshot,
+        ).commit;
+      } else {
+        commit = this.streamTypedRefCommitAdapter(elem, snapshot);
+        this.resolveThunkDefs.push(
+          `define internal ptr @${snapshot}(ptr %p) ${FN_ATTRS} { ; materialize stream element ${key}`,
+          `entry:`,
+          `  %d = call ptr @${this.dyn.toDynHelper(elem)}(ptr %p)`,
+          `  ret ptr %d`,
+          `}`,
+          ``,
+        );
+      }
+      this.declare(
+        `declare ptr @scr_dyn_new_typed_ref(ptr, ptr, ptr, ptr, i64, ptr, ptr)`,
+      );
+      B.line(
+        `${boxed} = call ptr @scr_dyn_new_typed_ref(ptr ${value}, ptr ${rc.retain}, ptr ${rc.release}, ptr ${keyPtr}, i64 ${Buffer.byteLength(key, "utf8")}, ptr @${snapshot}, ptr ${commit})`,
+      );
+    } else {
+      boxed = B.tmp();
+      B.line(
+        `${boxed} = call ptr @${this.dyn.toDynHelper(elem)}(${valueTy} ${value})`,
+      );
+    }
+    if (isRefCounted(elem)) {
+      B.line(`call void ${releaseSym(this, elem)}(ptr ${value})`);
+    }
+    B.terminate(`ret ptr ${boxed}`);
+    this.resolveThunkDefs.push(
+      `define internal ptr @${sym}(ptr %a, double %i) ${FN_ATTRS} { ; ReadableStream.from array<${key}>`,
+      B.render(),
+      `}`,
+      ``,
+    );
+    return sym;
+  }
+
   /** The claimed libCall slice: args are BORROWED (owned temps of the
    * current frame), refcounted results come back +1. LLVM types derive
    * from the call site's IR types (exactly the contract the C prototypes
@@ -9847,6 +10587,77 @@ class LlEmitter {
     const B = this.B;
     // Loop liveness first (one table for generic and special shapes).
     if (USES_TIMERS_LIB_FNS.has(e.fn)) this.usesTimers = true;
+    if (e.fn === "fetch.responseText" || e.fn === "fetch.responseBytes") {
+      if (e.type.kind !== "promise") {
+        throw new Error(`llvm emitter bug: ${e.fn} result`);
+      }
+      const response = this.emitExpr(e.args[0]!);
+      const runtimeFn =
+        e.fn === "fetch.responseText"
+          ? "scr_fetch_response_text"
+          : "scr_fetch_response_bytes";
+      this.declare(`declare ptr @${runtimeFn}(ptr)`);
+      this.declare(`declare ptr @scr_promise_new()`);
+      this.declare(`declare void @scr_promise_race_add(ptr, ptr, ptr)`);
+      const sourceRaw = B.tmp();
+      B.line(`${sourceRaw} = call ptr @${runtimeFn}(ptr ${response.name})`);
+      const source = this.own({
+        name: sourceRaw,
+        type: { kind: "promise", inner: DYN },
+      });
+      const resultRaw = B.tmp();
+      B.line(`${resultRaw} = call ptr @scr_promise_new()`);
+      const result = this.own({ name: resultRaw, type: e.type });
+      B.line(
+        `call void @scr_promise_race_add(ptr ${result.name}, ptr ${source.name}, ptr @${this.dynPromiseAdapter(e.type.inner)})`,
+      );
+      return result;
+    }
+    if (e.fn === "fetch.readerRead") {
+      if (e.type.kind !== "promise" || e.type.inner.kind !== "record") {
+        throw new Error("llvm emitter bug: fetch.readerRead result");
+      }
+      const reader = this.emitExpr(e.args[0]!);
+      this.declare(`declare ptr @scr_fetch_reader_read(ptr)`);
+      this.declare(`declare ptr @scr_promise_new()`);
+      this.declare(`declare void @scr_promise_race_add(ptr, ptr, ptr)`);
+      const sourceRaw = B.tmp();
+      B.line(
+        `${sourceRaw} = call ptr @scr_fetch_reader_read(ptr ${reader.name})`,
+      );
+      const source = this.own({
+        name: sourceRaw,
+        type: { kind: "promise", inner: DYN },
+      });
+      const resultRaw = B.tmp();
+      B.line(`${resultRaw} = call ptr @scr_promise_new()`);
+      const result = this.own({ name: resultRaw, type: e.type });
+      B.line(
+        `call void @scr_promise_race_add(ptr ${result.name}, ptr ${source.name}, ptr @${this.dynPromiseAdapter(e.type.inner)})`,
+      );
+      return result;
+    }
+    if (e.fn === "fetch.streamFrom") {
+      const source = this.emitExpr(e.args[0]!);
+      let sym = "scr_fetch_stream_from";
+      let extra = "";
+      if (source.type.kind === "array") {
+        sym = "scr_fetch_stream_from_array";
+        extra = `, ptr @${this.streamFromArrayAdapter(source.type)}`;
+      } else if (source.type.kind === "bytes") {
+        sym = "scr_fetch_stream_from_bytes";
+      } else if (source.type.kind === "string") {
+        sym = "scr_fetch_stream_from_string";
+      }
+      this.declare(
+        `declare ptr @${sym}(ptr${source.type.kind === "array" ? ", ptr" : ""})`,
+      );
+      const raw = B.tmp();
+      B.line(`${raw} = call ptr @${sym}(ptr ${source.name}${extra})`);
+      const out = this.own({ name: raw, type: e.type });
+      this.emitPendingCheck();
+      return out;
+    }
     // The handful with non-generic shapes first.
     if (e.fn === "error.argTypeThrow") {
       // Always throws with the runtime-rendered Received tail (the
@@ -11538,14 +12349,17 @@ class LlEmitter {
     }
     if (e.fn === "http.request" || e.fn === "http.requestCb" || e.fn === "http.requestUrl" || e.fn === "http.requestUrlCb" ||
         e.fn === "http.requestAgent" || e.fn === "http.requestAgentCb" ||
+        e.fn === "https.request" || e.fn === "https.requestCb" ||
         e.fn === "https.requestUrl" || e.fn === "https.requestUrlCb") {
       // The https URL row is the http one with the TLS entry point — same
-      // three arguments, same response-callback adapter. (The https
-      // OPTIONS forms are a separate, wider row and are not here yet.)
+      // three arguments, same response-callback adapter. The https options
+      // row is wider: rejectUnauthorized stays an i1, while its ScrStr or
+      // ScrBytes CA value expands to the runtime's raw pointer + length.
       const isTls = e.fn.startsWith("https.");
-      const isUrl = isTls || e.fn.startsWith("http.requestUrl");
+      const isUrl = e.fn.includes("requestUrl");
+      const isTlsOptions = isTls && !isUrl;
       const isAgent = e.fn.startsWith("http.requestAgent");
-      const cbIdx = isUrl ? 3 : isAgent ? 8 : 7;
+      const cbIdx = isUrl ? 3 : isTlsOptions ? 9 : isAgent ? 8 : 7;
       const hasCb = e.fn.endsWith("Cb");
       const args = e.args.map((a) => this.emitExpr(a));
       let cb = "null";
@@ -11560,14 +12374,40 @@ class LlEmitter {
         adapter = `@${sym}`;
       }
       const head = args.slice(0, cbIdx);
-      const decls = head.map((a) => (this.llType(a.type) === "i1" ? "i1 zeroext" : this.llType(a.type)));
-      const entry = isTls ? "scr_https_request_url"
+      const entry = isTlsOptions ? "scr_https_request"
+        : isTls ? "scr_https_request_url"
         : isUrl ? "scr_http_request_url"
         : isAgent ? "scr_http_request_agent" : "scr_http_request";
-      this.declare(`declare ptr @${entry}(${[...decls, "ptr", "ptr"].join(", ")})`);
+      let callArgs = head.map((a) => `${this.llType(a.type)} ${a.name}`);
+      if (isTlsOptions) {
+        const ca = args[8]!;
+        const caLenPtr = B.tmp();
+        const caLen = B.tmp();
+        let caData: string;
+        if (ca.type.kind === "string") {
+          caData = B.tmp();
+          B.line(`${caLenPtr} = getelementptr inbounds %ScrStr, ptr ${ca.name}, i64 0, i32 1`);
+          B.line(`${caLen} = load i64, ptr ${caLenPtr}`);
+          B.line(`${caData} = getelementptr inbounds i8, ptr ${ca.name}, i64 24`);
+        } else if (ca.type.kind === "bytes" && ca.type.elem === "u8") {
+          const caDataPtr = B.tmp();
+          caData = B.tmp();
+          B.line(`${caLenPtr} = getelementptr inbounds i8, ptr ${ca.name}, i64 8`);
+          B.line(`${caLen} = load i64, ptr ${caLenPtr}`);
+          B.line(`${caDataPtr} = getelementptr inbounds i8, ptr ${ca.name}, i64 24`);
+          B.line(`${caData} = load ptr, ptr ${caDataPtr}`);
+        } else {
+          throw new Error(`llvm emitter bug: ${e.fn} CA is not a string or Buffer`);
+        }
+        callArgs = [...callArgs.slice(0, 8), `ptr ${caData}`, `i64 ${caLen}`];
+        this.declare(`declare ptr @scr_https_request(ptr, double, ptr, ptr, double, ptr, i1 zeroext, i1 zeroext, ptr, i64, ptr, ptr)`);
+      } else {
+        const decls = head.map((a) => (this.llType(a.type) === "i1" ? "i1 zeroext" : this.llType(a.type)));
+        this.declare(`declare ptr @${entry}(${[...decls, "ptr", "ptr"].join(", ")})`);
+      }
       const t = B.tmp();
       B.line(
-        `${t} = call ptr @${entry}(${[...head.map((a) => `${this.llType(a.type)} ${a.name}`), `ptr ${cb}`, `ptr ${adapter}`].join(", ")})`,
+        `${t} = call ptr @${entry}(${[...callArgs, `ptr ${cb}`, `ptr ${adapter}`].join(", ")})`,
       );
       const out = this.own({ name: t, type: e.type });
       if (MAY_THROW_LIB_FNS.has(e.fn)) this.emitPendingCheck();

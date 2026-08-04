@@ -317,6 +317,10 @@ bool scr_str_eq(ScrStr *a, ScrStr *b);
  * <0, 0, >0. */
 int scr_str_cmp(ScrStr *a, ScrStr *b);
 
+/* ECMAScript string-list ordering: compare UTF-16 code units even though
+ * ScrStr stores well-formed UTF-8. Returns <0, 0, >0. */
+int scr_str_cmp_u16(ScrStr *a, ScrStr *b);
+
 /* ── class objects (classes as first-class values) ────────────────────
  * The class STATIC side as a runtime value: one emitted IMMORTAL static
  * per class the program takes as a value (`const X = C`, class
@@ -817,6 +821,16 @@ void scr_arr_set_ref(ScrArr *a, double i, void *v);
  * ToIntegerOrInfinity indices, negatives from the end, clamping; ref
  * elements retain into the copy. Borrows a. */
 ScrArr *scr_arr_slice(ScrArr *a, double start, double end);
+
+/* ES2023 copying methods. All borrow their inputs and return fresh +1
+ * shallow copies. with() raises Node's catchable RangeError for an invalid
+ * relative index; the ref variant retains the borrowed replacement. */
+ScrArr *scr_arr_to_reversed(const ScrArr *a);
+ScrArr *scr_arr_to_spliced(const ScrArr *a, double start,
+                           double delete_count, const ScrArr *items);
+ScrArr *scr_arr_with_f64(ScrArr *a, double index, double value);
+ScrArr *scr_arr_with_bool(ScrArr *a, double index, bool value);
+ScrArr *scr_arr_with_ref(ScrArr *a, double index, void *value);
 
 /* push returns the new length (JS-exact); _ref takes ownership. */
 double scr_arr_push_f64(ScrArr *a, double v);
@@ -2669,9 +2683,15 @@ typedef enum {
    * a silent wrong answer. The dyn→cell edge is NOT visible to the cycle
    * collector (the dyn→closure stance): a cycle dyn → cell → engine
    * object → host closure → dyn is merely never collected (the
-   * documented cross-boundary-cycle divergence). Enum position: LAST —
-   * the LLVM backend hardcodes the preceding kind numbers. */
+   * documented cross-boundary-cycle divergence). */
   SCR_DYN_JSVAL,
+  /* A compiler-owned typed reference in transit through a native Web
+   * stream. Unlike an ordinary typed→unknown conversion, this capsule
+   * retains the original value so a statically typed reader can recover
+   * its identity. `materialize` supplies the ordinary deep-copy view for
+   * consumers such as fetch request bodies that need a dyn chunk. Enum
+   * position: LAST — LLVM hardcodes every preceding kind number. */
+  SCR_DYN_TYPED_REF,
 } ScrDynKind;
 
 /* The handle-type tags the checked-dynamic tree can carry. The set is deliberately the
@@ -2687,12 +2707,27 @@ typedef enum {
   SCR_DYNH_H2_STREAM,  /* ScrH2Stream — Http2Stream (client & server) */
   SCR_DYNH_HTTP_CLIENT, /* ScrHttpClientReq — http.ClientRequest */
   SCR_DYNH_HTTP_AGENT,  /* ScrHttpAgent — http.Agent / https.Agent */
+  SCR_DYNH_ABORT_SIGNAL, /* native static-fetch AbortSignal */
+  SCR_DYNH_WEB_STREAM,   /* native WHATWG ReadableStream */
+  SCR_DYNH_WEB_READER,   /* native ReadableStreamDefaultReader */
+  SCR_DYNH_WEB_CONTROLLER, /* native ReadableStreamDefaultController */
+  SCR_DYNH_FETCH_RESPONSE, /* native static-fetch Response */
+  SCR_DYNH_FETCH_HEADERS, /* native static-fetch response Headers */
+  SCR_DYNH_EVENT,          /* native static-fetch abort Event */
   SCR_DYNH_COUNT,
 } ScrDynHandleTag;
 
 typedef struct ScrDyn ScrDyn;
 typedef struct ScrBytes ScrBytes; /* full definition below (C11 repeat) */
 typedef struct ScrClosure ScrClosure; /* full definition below (C11 repeat) */
+typedef struct ScrDynTypedCast {
+  const char *type_key;
+  size_t type_key_len;
+  void *ptr;
+  void *(*retain)(void *);
+  void (*release)(void *);
+  struct ScrDynTypedCast *next;
+} ScrDynTypedCast;
 typedef struct ScrJsval ScrJsval; /* opaque island cell (C11 repeat; the
                                    * always-linked dyn core never touches
                                    * its engine value — only the gated ops
@@ -2738,7 +2773,19 @@ struct ScrDyn {
     ScrStr *str; /* owned */
     ScrBytes *bytes; /* owned (SCR_DYN_BYTES) */
     struct { size_t len; size_t cap; ScrDyn **items; } arr;      /* owned */
-    struct { size_t len; size_t cap; ScrDynEntry *entries; } obj; /* owned */
+    struct {
+      size_t len;
+      size_t cap;
+      ScrDynEntry *entries;
+      /* Optional identity of the typed record that produced this ordinary
+       * deep-copy snapshot. EventTarget uses it to recognize the same
+       * EventListenerObject across repeated static→dyn crossings without
+       * changing generic dyn-object `===` semantics. */
+      /* Owned through source_access(source_identity, false). Callback
+       * interfaces may request a fresh snapshot with the true arm. */
+      void *source_identity;
+      ScrDyn *(*source_access)(void *, bool materialize);
+    } obj; /* owned */
     /* SCR_DYN_FUNC: the boxed closure (owned) + its call descriptor. `sig`
      * and `name` are static compiler-emitted literals (never freed); name
      * may be NULL (anonymous — inspect prints [Function (anonymous)]).
@@ -2753,6 +2800,23 @@ struct ScrDyn {
      * so a listener capturing its own boxed handle never cycles past the
      * settle — the settle-releases-listeners story. */
     struct { void *ptr; ScrDynHandleTag tag; } handle;
+    /* SCR_DYN_TYPED_REF: original static value + its compiler-emitted
+     * identity tag, RC adapters, and ordinary dyn snapshot adapter. */
+    struct {
+      void *ptr;
+      void *(*retain)(void *);
+      void (*release)(void *);
+      const char *type_key;
+      size_t type_key_len;
+      ScrDyn *(*materialize)(void *);
+      void (*commit)(void *, const ScrDyn *);
+      /* Both caches belong to this capsule. ReadableStream canonicalizes
+       * capsules for repeated source references, so the refreshed dyn view
+       * and every structurally converted static view keep JS reference
+       * identity while the source reference remains observable. */
+      ScrDyn *materialized;
+      ScrDynTypedCast *casts;
+    } typed_ref;
     /* SCR_DYN_PROMISE: the retained promise. The boundary contract: it
      * settles with a dyn payload (SCR_EXC_REF ScrDyn fulfillment or a
      * void fulfillment awaiters read as the undefined value) — the
@@ -2827,6 +2891,14 @@ ScrDyn *scr_dyn_new_num(double n);
 ScrDyn *scr_dyn_new_str(ScrStr *s);
 ScrDyn *scr_dyn_new_arr(void);
 ScrDyn *scr_dyn_new_obj(void);
+/* The ordinary deep-copy object plus a retained typed source. source_access
+ * releases that source when materialize=false and returns a fresh dyn snapshot
+ * when true. Generic dyn member reads and strict equality remain snapshot/node
+ * based; callback-interface consumers opt into the live arm explicitly. */
+ScrDyn *scr_dyn_new_obj_with_identity(
+    void *source, void *(*source_retain)(void *),
+    ScrDyn *(*source_access)(void *, bool materialize));
+bool scr_dyn_obj_same_source(const ScrDyn *a, const ScrDyn *b);
 /* Object.create(null): the fresh null-prototype dictionary (see the
  * null_proto flavor flag above). */
 ScrDyn *scr_dyn_new_obj_null_proto(void);
@@ -2836,6 +2908,26 @@ ScrDyn *scr_dyn_new_bytes_copy(const ScrBytes *b);
 /* The Buffer-flavored twin (stream chunks): string coercion/toString
  * decode utf8 instead of joining elements. */
 ScrDyn *scr_dyn_new_buffer_copy(const ScrBytes *b);
+/* Identity-preserving transit capsule used by ReadableStream.from over
+ * typed arrays. The constructor retains `ptr`; matching unbox returns +1.
+ * materialize lazily creates and then retains one detached dyn snapshot.
+ * The cast cache lets a non-exact dynCheck reuse one safe, compiler-built
+ * target view instead of raw-casting structurally different layouts. */
+ScrDyn *scr_dyn_new_typed_ref(
+    void *ptr, void *(*retain)(void *), void (*release)(void *),
+    const char *type_key, size_t type_key_len,
+    ScrDyn *(*materialize)(void *),
+    void (*commit)(void *, const ScrDyn *));
+bool scr_dyn_typed_ref_is(
+    const ScrDyn *d, const char *type_key, size_t type_key_len);
+void *scr_dyn_typed_ref_unbox(const ScrDyn *d); /* +1 */
+ScrDyn *scr_dyn_typed_ref_materialize(const ScrDyn *d); /* +1 */
+void scr_dyn_typed_ref_commit(ScrDyn *d);
+void *scr_dyn_typed_ref_cached_cast(
+    const ScrDyn *d, const char *type_key, size_t type_key_len); /* +1/NULL */
+void scr_dyn_typed_ref_cache_cast(
+    ScrDyn *d, const char *type_key, size_t type_key_len, void *ptr,
+    void *(*retain)(void *), void (*release)(void *));
 /* A fresh u8 COPY of a SCR_DYN_BYTES payload (+1) — the dynCheck
  * extraction (`u as Uint8Array`). */
 ScrBytes *scr_dyn_bytes_copy_out(const ScrDyn *d);
@@ -3123,9 +3215,10 @@ ScrDyn *scr_dyn_alloc_jsval(ScrJsval *cell, const ScrDynJsvalOps *ops);
 /* The installed ops (traps on a missing install — impossible unless a
  * JSVAL node was forged without the constructor). */
 const ScrDynJsvalOps *scr_dyn_jsval_ops(void);
-/* dynTest arms that need the ENGINE's answer on a JSVAL node. Each
- * answers false for every other kind (callers test unconditionally —
- * the emitted narrowing tests stay branch-free). Never throw. */
+/* dynTest arms that need the ENGINE's answer on a JSVAL node, or the
+ * materialized answer for a live typed-reference capsule. Each answers
+ * false for every other kind (callers test unconditionally — the emitted
+ * narrowing tests stay branch-free). Never throw. */
 bool scr_dyn_isl_typeof_is(const ScrDyn *d, const char *name);
 bool scr_dyn_isl_is_array(const ScrDyn *d);
 bool scr_dyn_isl_is_error(const ScrDyn *d);
@@ -3805,6 +3898,33 @@ ScrGen *scr_gen_of_fiber(ScrFiber *f);
 long scr_promise_live_count(void);
 #endif
 
+/* ── fetch (scr_fetch.c) ──────────────────────────────────────────────
+ * The native bridge over scr_net + scr_tls + scr_http's client parser.
+ * Static fetch(url) resolves at the response head with native Response
+ * and ReadableStream handles; Response.json consumes that same stream.
+ * AbortSignal and streaming request bodies stay native too. Under
+ * --dynamic the same TU boots the broader engine web surface. The
+ * emitted main calls scr_fetch_install in either form. */
+void scr_fetch_install(void);
+ScrPromise *scr_fetch_static(ScrStr *url, ScrDyn *init); /* +1 promise<Response handle> */
+ScrPromise *scr_fetch_response_json(ScrDyn *response); /* +1 promise<dyn> */
+ScrPromise *scr_fetch_response_text(ScrDyn *response); /* +1 promise<dyn> */
+ScrPromise *scr_fetch_response_bytes(ScrDyn *response); /* +1 promise<dyn> */
+/* Borrowed number; +1 AbortSignal handle or NULL pending. */
+ScrDyn *scr_fetch_abort_timeout(ScrDyn *delay);
+ScrDyn *scr_fetch_abort_now(ScrDyn *reason); /* borrowed reason; +1 handle */
+ScrDyn *scr_fetch_abort_any(ScrDyn *signals); /* borrowed array; +1 handle or NULL pending */
+ScrDyn *scr_fetch_stream_new(ScrDyn *source); /* borrowed source; +1 handle or NULL pending */
+ScrDyn *scr_fetch_stream_from(ScrDyn *iterable); /* borrowed iterable; +1 handle or NULL pending */
+ScrDyn *scr_fetch_stream_from_array(
+    ScrArr *iterable,
+    ScrDyn *(*item)(ScrArr *, double)); /* borrowed array/callback; +1 handle */
+ScrDyn *scr_fetch_stream_from_bytes(
+    ScrBytes *iterable); /* borrowed bytes; +1 handle */
+ScrDyn *scr_fetch_stream_from_string(
+    ScrStr *iterable); /* borrowed string; +1 handle */
+ScrPromise *scr_fetch_reader_read(ScrDyn *reader); /* borrowed handle; +1 */
+
 /* ── dynamic island (scr_island.c; --dynamic builds ONLY) ────────────
  * The embedded QuickJS-ng engine. Compiled and linked only under
  * -DSCR_DYNAMIC; static builds never reference these symbols (nor the
@@ -3934,18 +4054,12 @@ bool scr_island_timers_due(void);
 bool scr_island_timers_fire_due(void); /* true = fired at least one */
 void scr_island_timers_teardown(void);
 
-/* ── fetch (scr_fetch.c) ──────────────────────────────────────────────
- * The native bridge behind the island's fetch (scr_net + scr_tls +
- * scr_http's client parser + zlib), compiled and linked ONLY into
- * --dynamic builds whose graph references fetch. The emitted main calls
- * scr_fetch_install BEFORE any island entry; install registers the
- * bridge's hooks with the island, which boots the fetch glue with the
- * engine. The native bridge registers NO pending/poll hooks (its
+/* ── dynamic fetch hooks ──────────────────────────────────────────────
+ * The native bridge registers NO pending/poll hooks (its
  * transfers live on real sockets the loop's poller sleeps on); the curl
  * reference implementation (scr_fetch_curl.c, SCRIPTC_FETCH_CURL=1 —
  * one release as the flip's reference) still registers all four so the
  * loop can sleep on curl's fds. */
-void scr_fetch_install(void);
 void scr_island_set_fetch(void (*boot)(void *jsctx), bool (*pending)(void),
                            void (*poll)(double max_wait_ms), void (*teardown)(void));
 
@@ -4077,6 +4191,7 @@ ScrJsval *scr_jsval_destr_check(ScrJsval *v, const char *spell, const char *firs
 ScrJsval *scr_jsval_iter_n(ScrJsval *v, double n);
 int scr_jsval_set_idx(ScrJsval *o, ScrJsval *key, ScrJsval *v);
 ScrJsval *scr_jsval_call_method(ScrJsval *o, const ScrStr *name, int argc, ScrJsval **argv);
+ScrJsval *scr_jsval_call_this(ScrJsval *f, ScrJsval *receiver, int argc, ScrJsval **argv);
 /* `o.name?.(...)`: a nullish member answers the engine's undefined;
  * anything else calls with this = o (non-callables throw in the engine). */
 ScrJsval *scr_jsval_opt_call_method(ScrJsval *o, const ScrStr *name, int argc, ScrJsval **argv);
@@ -4467,11 +4582,25 @@ void scr_dataview_set(ScrBytes *b, double byte_off, double value, ScrDataViewGet
  * toward zero, wrap mod 2^8/2^32), f32 by double→float rounding. */
 double scr_bytes_get(const ScrBytes *b, double i);
 void scr_bytes_set(ScrBytes *b, double i, double v);
+/* Replace a live typed-array capsule's fixed-size payload from its dyn
+ * snapshot. Source and target have the same compiler-checked bytes type. */
+void scr_bytes_copy_contents(ScrBytes *dst, const ScrBytes *src);
 
 /* TypedArray.prototype.slice(start, end): relative indices clamp like
  * string/array slice (ToIntegerOrInfinity, negatives from the end); the
  * result is a fresh same-kind copy. Never throws. */
 ScrBytes *scr_bytes_slice(const ScrBytes *b, double start, double end); /* +1 */
+
+/* ES2023 typed-array copying methods. Both preserve the receiver's element
+ * kind and return a fresh +1 owner. with() raises Node's catchable
+ * "Invalid typed array index" RangeError for an invalid relative index. */
+ScrBytes *scr_bytes_to_reversed(const ScrBytes *b); /* +1 */
+ScrBytes *scr_bytes_with(const ScrBytes *b, double index, double value); /* +1 */
+
+/* Numeric typed-array iteration drained into number[], and Uint8Array.join.
+ * Inputs borrowed; results fresh +1. */
+ScrArr *scr_bytes_to_arr(const ScrBytes *b); /* +1 */
+ScrStr *scr_bytes_join(const ScrBytes *b, const ScrStr *separator); /* +1 */
 
 /* TypedArray.prototype.fill on non-u8 receivers: per-element fill with
  * the element write's coercion, slice-clamped relative indices; answers
@@ -5113,9 +5242,12 @@ long scr_secure_ctx_live_count(void);
  * /etc/ssl/cert.pem probe order scr_tls.c documents) stands in for both
  * Node's compiled-in Mozilla roots ('bundled', rootCertificates) and the
  * platform store ('system') — the established SEMANTICS divergence,
- * extended to introspection; 'extra' reads NODE_EXTRA_CA_CERTS. Arrays
- * are cached per type (+1 retained answers each call — Node's own
- * caching, and the identity the suite pins with strictEqual). */
+ * extended to introspection; 'extra' uses the NODE_EXTRA_CA_CERTS file
+ * captured before user code runs. Arrays are cached per type (+1 retained
+ * answers each call — Node's own caching, and the identity the suite pins
+ * with strictEqual). */
+void scr_tls_ca_install(void); /* snapshots NODE_EXTRA_CA_CERTS + file bytes */
+bool scr_tls_ca_extra_pem(const char **pem, size_t *len); /* borrowed launch snapshot */
 ScrArr *scr_tls_ca_get(ScrStr *type); /* +1; throws ERR_INVALID_ARG_VALUE on unknown types */
 ScrArr *scr_tls_ca_root(void);        /* +1; === getCACertificates("bundled") */
 /* Replaces the 'default' set: entries filter to their PEM certificate

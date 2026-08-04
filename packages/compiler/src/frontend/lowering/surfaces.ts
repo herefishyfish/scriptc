@@ -282,6 +282,10 @@ export const ARRAY_METHODS = new Set([
   "includes",
   "join",
   "slice",
+  "toReversed",
+  "toSpliced",
+  "toSorted",
+  "with",
 ]);
 
 /** The lowered Map<K, V> method surface. Like ARRAY_METHODS, membership is
@@ -1383,6 +1387,16 @@ export const BUILTIN_MODULE_FENCE_HINTS: Record<string, Record<string, string | 
         "console.log/info/debug (stdout) and console.error/warn (stderr) are the supported " +
         "console surface (arguments render with Node's console semantics: strings verbatim, " +
         "everything else through the static util.inspect)";
+    } else if (container === "TextEncoder") {
+      hint =
+        "the inline new TextEncoder().encode(s) form and same-scope const store-then-call " +
+        "(const encoder = new TextEncoder(); encoder.encode(s)) compile; captured/imported " +
+        "instances and other members need a runtime object representation";
+    } else if (container === "TextDecoder") {
+      hint =
+        "the inline new TextDecoder().decode(bytes) form and same-scope const store-then-call " +
+        "(const decoder = new TextDecoder(); decoder.decode(bytes)) compile; captured/imported " +
+        "instances, streaming state, and other members need a runtime object representation";
     } else if (member === "prototype") {
       hint =
         "prototype objects are not values here (method lookup is static) — call the method on an instance instead";

@@ -29,6 +29,23 @@ export function sandboxRunnerConfig(env) {
   };
 }
 
+/** Reserve one Vitest worker for each concurrently scheduled side process
+ * without ever starving the case-sharded corpus or exceeding the configured
+ * per-Sandbox worker budget. Extra side processes share the reserved slots. */
+export function sandboxTestWorkerAllocation(workerCount, sideTaskCount) {
+  if (!Number.isInteger(workerCount) || workerCount < 1) {
+    throw new Error("workerCount must be a positive integer");
+  }
+  if (!Number.isInteger(sideTaskCount) || sideTaskCount < 0) {
+    throw new Error("sideTaskCount must be a non-negative integer");
+  }
+  const sideConcurrency = Math.min(sideTaskCount, Math.max(0, workerCount - 1));
+  return {
+    caseWorkers: workerCount - sideConcurrency,
+    sideConcurrency,
+  };
+}
+
 export function sandboxImageConfig() {
   loadLocalEnv();
   // Keep tenancy explicit: a public clone must use a Vercel project its

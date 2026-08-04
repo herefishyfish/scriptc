@@ -1,12 +1,40 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
 import { createRequire } from "node:module";
-import { chmod, copyFile, mkdir, mkdtemp, readdir, readFile, rename, rm, stat, unlink, utimes, writeFile } from "node:fs/promises";
-import { availableParallelism, tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { access, chmod, copyFile, link, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, stat, unlink, utimes, writeFile } from "node:fs/promises";
+import { availableParallelism, homedir, tmpdir } from "node:os";
+import { basename, delimiter, dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
+
+/** Test lanes run against one immutable checkout and one immutable toolchain
+ * for the lifetime of each Vitest worker. Production deliberately rediscovers
+ * compiler/linker inputs on every invocation, but doing that thousands of
+ * times in the differential corpus costs far more than the compile itself.
+ * This test-only opt-in lets those workers reuse metadata probes for their
+ * session; the cache-correctness suite removes the flag and exercises the
+ * strict production path. */
+function stableTestToolchainSession(): boolean {
+  return process.env["SCRIPTC_TEST_STABLE_TOOLCHAIN"] === "1";
+}
+
+function stableTestMemo<T>(
+  cache: Map<string, Promise<T>>,
+  key: string,
+  probe: () => Promise<T>,
+): Promise<T> {
+  if (!stableTestToolchainSession()) return probe();
+  const existing = cache.get(key);
+  if (existing !== undefined) return existing;
+  const pending = probe();
+  cache.set(key, pending);
+  void pending.catch(() => {
+    if (cache.get(key) === pending) cache.delete(key);
+  });
+  return pending;
+}
 
 const RUNTIME_SOURCES = ["scr_number.c", "scr_string.c", "scr_array.c", "scr_bytes.c", "scr_bytes_io.c", "scr_map.c", "scr_closure.c", "scr_object.c", "scr_union.c", "scr_exception.c", "scr_error.c", "scr_console.c", "scr_lib.c", "scr_path.c", "scr_url.c", "scr_json.c", "scr_async.c", "scr_child.c", "scr_cycle.c"];
 
@@ -28,6 +56,125 @@ const MBEDTLS_VERSION = "3.6.7";
  * zlib-using programs CROSS-compile (zig has no target sysroot libz). */
 const ZLIB_VERSION = "1.3.1";
 
+/** Environment variables consumed by clang, its linker/subtools, or the
+ * platform SDK selection. They are implicit command-line inputs: changing one
+ * must never reuse an artifact produced under the old toolchain posture. */
+const TOOLCHAIN_ENV_KEYS = [
+  "COMPILER_PATH",
+  "GCC_EXEC_PREFIX",
+  "CPATH",
+  "C_INCLUDE_PATH",
+  "CPLUS_INCLUDE_PATH",
+  "OBJC_INCLUDE_PATH",
+  "OBJCPLUS_INCLUDE_PATH",
+  "LIBRARY_PATH",
+  "LD_LIBRARY_PATH",
+  "LD_RUN_PATH",
+  "DYLD_LIBRARY_PATH",
+  "DYLD_FRAMEWORK_PATH",
+  "DYLD_FALLBACK_LIBRARY_PATH",
+  "DYLD_FALLBACK_FRAMEWORK_PATH",
+  "SDKROOT",
+  "DEVELOPER_DIR",
+  "MACOSX_DEPLOYMENT_TARGET",
+  "IPHONEOS_DEPLOYMENT_TARGET",
+  "TVOS_DEPLOYMENT_TARGET",
+  "WATCHOS_DEPLOYMENT_TARGET",
+  "DRIVERKIT_DEPLOYMENT_TARGET",
+  "XROS_DEPLOYMENT_TARGET",
+  "CCC_OVERRIDE_OPTIONS",
+  "CCC_ADD_ARGS",
+  "CLANG_CONFIG_FILE_SYSTEM_DIR",
+  "CLANG_CONFIG_FILE_USER_DIR",
+  "CC",
+  "CFLAGS",
+  "CPPFLAGS",
+  "LDFLAGS",
+  "AR",
+  "RANLIB",
+  "CMAKE_GENERATOR",
+  "CMAKE_TOOLCHAIN_FILE",
+  "ZIG_LIB_DIR",
+  "ZIG_LIBC",
+  "SOURCE_DATE_EPOCH",
+  "ZERO_AR_DATE",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+] as const;
+
+/** Toolchain variables whose values name mutable files/directories consumed
+ * while compiling a TU (or can inject arbitrary compiler options). Hashing the
+ * value is insufficient: a header, SDK, config, compiler helper, or loaded
+ * dylib can change in place while the spelling remains stable. In that posture
+ * neither complete artifacts nor per-TU runtime objects are safe to reuse. */
+const MUTABLE_COMPILE_ENV_KEYS = [
+  "COMPILER_PATH",
+  "GCC_EXEC_PREFIX",
+  "CPATH",
+  "C_INCLUDE_PATH",
+  "CPLUS_INCLUDE_PATH",
+  "OBJC_INCLUDE_PATH",
+  "OBJCPLUS_INCLUDE_PATH",
+  "LD_LIBRARY_PATH",
+  "DYLD_LIBRARY_PATH",
+  "DYLD_FRAMEWORK_PATH",
+  "DYLD_FALLBACK_LIBRARY_PATH",
+  "DYLD_FALLBACK_FRAMEWORK_PATH",
+  "SDKROOT",
+  "DEVELOPER_DIR",
+  "CCC_OVERRIDE_OPTIONS",
+  "CCC_ADD_ARGS",
+  "CLANG_CONFIG_FILE_SYSTEM_DIR",
+  "CLANG_CONFIG_FILE_USER_DIR",
+  // The direct runtime build does not consume the conventional Make/CMake
+  // variables, but the lazily-built QuickJS prerequisite does. Their values
+  // can name mutable tools, headers, libraries, and toolchain files, so a
+  // stable spelling is not a safe persistent-cache identity.
+  "CC",
+  "CFLAGS",
+  "CPPFLAGS",
+  "LDFLAGS",
+  "AR",
+  "RANLIB",
+  "CMAKE_TOOLCHAIN_FILE",
+  // `zig cc` resolves its bundled headers/runtime through ZIG_LIB_DIR and a
+  // caller-selected native libc description through ZIG_LIBC. Both values name
+  // mutable compiler inputs whose contents can change behind a stable path.
+  "ZIG_LIB_DIR",
+  "ZIG_LIBC",
+] as const;
+
+/** These variables only redirect link-time inputs. Runtime objects remain
+ * reusable, but a complete executable could otherwise retain a library that
+ * was rebuilt in place behind the same search-path spelling. */
+const MUTABLE_LINK_ENV_KEYS = ["LIBRARY_PATH", "LD_RUN_PATH"] as const;
+
+export interface ToolchainEnvironmentCachePolicy {
+  completeArtifacts: boolean;
+  runtimeObjects: boolean;
+}
+
+export function toolchainEnvironmentCachePolicy(
+  env: NodeJS.ProcessEnv = process.env,
+): ToolchainEnvironmentCachePolicy {
+  const mutableCompileInput = MUTABLE_COMPILE_ENV_KEYS.some((name) => env[name] !== undefined);
+  const mutableLinkInput = MUTABLE_LINK_ENV_KEYS.some((name) => env[name] !== undefined);
+  return {
+    completeArtifacts: !mutableCompileInput && !mutableLinkInput,
+    runtimeObjects: !mutableCompileInput,
+  };
+}
+
+export function toolchainEnvironmentFingerprint(env: NodeJS.ProcessEnv = process.env): string {
+  const hash = createHash("sha256").update("toolchain-env-v1\0");
+  for (const name of TOOLCHAIN_ENV_KEYS) {
+    const value = env[name];
+    hash.update(name).update(value === undefined ? "\0unset\0" : "\0set\0").update(value ?? "").update("\0");
+  }
+  return hash.digest("hex");
+}
+
 export interface CcOptions {
   /** Path of the generated (or hand-written) program TU: a .c file, or the
    * LLVM backend's .ll — clang compiles IR text natively on the same
@@ -35,13 +182,25 @@ export interface CcOptions {
   cPath: string;
   /** Path of the native executable to produce. */
   outPath: string;
+  /** Additional identity for a translation unit whose complete non-system
+   * dependency graph is owned by the caller. Persistent caching is disabled
+   * when omitted: arbitrary C can depend on same-path edited headers and on
+   * compiler-visible source spelling (`__FILE__`), neither of which the
+   * top-level bytes alone can safely represent. scriptc's frontend supplies
+   * this for its generated C/LLVM IR; `--from-c` deliberately does not. */
+  cacheIdentity?: string;
   /** Build with ASan + the runtime RC audit (test/debug lane). */
   sanitize?: boolean;
   /** Additional native archives/objects, appended after the generated
-   * program TU so their symbols resolve outbound FFI calls. */
+   * program TU so their symbols resolve outbound FFI calls. These inputs can
+   * be thin archives or linker scripts with mutable transitive dependencies,
+   * so their builds bypass the complete-executable cache while still reusing
+   * cached runtime objects. */
   linkInputs?: readonly string[];
   /** Driver-neutral system library names, emitted as `-l<name>` after
-   * linkInputs. */
+   * linkInputs. Because the linker resolves these ambient names to files,
+   * their builds bypass the complete-executable cache while still reusing
+   * cached runtime objects. */
   systemLibraries?: readonly string[];
   /** Embed the dynamic-island engine (--dynamic): compiles scr_island.c,
    * defines SCR_DYNAMIC, and links the cached libqjs.a. Off = the static
@@ -54,13 +213,19 @@ export interface CcOptions {
    * JSContext there). Off = regex-free: the command line is exactly the
    * historical one, so regex-free binaries cannot change by a byte. */
   regex?: boolean;
+  /** The program uses one of the copying/typed-array bridge intrinsics
+   * implemented in scr_copying.c (index.ts detects them on the IR).
+   * Off keeps that optional TU out of unrelated binaries. */
+  copying?: boolean;
   /** The embedded npm graph references fetch (index.ts detects it on the
    * IR): compiles the NATIVE fetch bridge (scr_fetch.c over scr_net +
    * scr_tls + scr_http's client parser + zlib — the socket units join
    * the link implicitly, no libcurl anywhere), which builds for every
-   * target the socket units reach: hosts, linux cross, win32 cross. Only
-   * meaningful under `dynamic`; fetch-free builds keep their exact link
-   * line. SCRIPTC_FETCH_CURL=1 selects the retired curl reference instead
+   * target the socket units reach: hosts, linux cross, win32 cross.
+   * Static user-code fetch compiles the same TU without the engine; the
+   * broader web surface still uses its dynamic half. Fetch-free builds
+   * keep their exact link line. SCRIPTC_FETCH_CURL=1 selects the retired
+   * curl reference instead
    * (scr_fetch_curl.c + system libcurl on hosts / the generated soname
    * stub on linux cross targets — ensureCurlStub), kept compilable for
    * one release as the flip's reference. */
@@ -204,6 +369,8 @@ export class CcCompileError extends Error {
 }
 
 export function runtimeSrcDir(): string {
+  const testRoot = process.env["SCRIPTC_TEST_RUNTIME_SRC_DIR"];
+  if (testRoot !== undefined) return resolve(testRoot);
   const require = createRequire(import.meta.url);
   return join(dirname(require.resolve("@scriptc/runtime/package.json")), "src");
 }
@@ -305,8 +472,98 @@ export function targetPlatform(driver: CcDriver): string {
   return driver.target.includes("macos") || driver.target.includes("darwin") ? "darwin" : "other";
 }
 
+/** Architecture identity for host-native cache entries. Explicit cross targets
+ * already name their complete target triple; native builds need the process
+ * architecture too because one per-user cache can serve both native and
+ * emulated processes (arm64 and Rosetta on macOS, for example). */
+export function cacheTargetIdentity(
+  driver: Pick<CcDriver, "target">,
+  hostPlatform: NodeJS.Platform = process.platform,
+  hostArch: string = process.arch,
+): string {
+  return driver.target === null ? `native:${hostPlatform}:${hostArch}` : `cross:${driver.target}`;
+}
+
 function vendorEngineDir(): string {
   return join(runtimeSrcDir(), "..", "vendor", "quickjs-ng");
+}
+
+/** Vendor prerequisites have historically lived beside their source trees.
+ * The test-only override gives cache-ordering tests a disposable root without
+ * renaming package-local artifacts that parallel workers may be using. */
+function vendorBuildCacheRoot(): string {
+  const testRoot = process.env["SCRIPTC_TEST_VENDOR_CACHE_DIR"];
+  return testRoot === undefined
+    ? join(runtimeSrcDir(), "..", "vendor", ".cache")
+    : resolve(testRoot);
+}
+
+/** Cross targets already carry their architecture in the explicit triple.
+ * Host-native prerequisites need the same separation: a checkout/package can
+ * be used by both arm64 Node and Rosetta/x64 Node on macOS. */
+export function vendorCacheTargetFlavor(
+  driver: Pick<CcDriver, "target">,
+  hostPlatform: NodeJS.Platform = process.platform,
+  hostArch: string = process.arch,
+): string {
+  return driver.target === null ? `native-${hostPlatform}-${hostArch}` : driver.target;
+}
+
+/** Vendor prerequisites live outside the content-addressed build root, so
+ * their directory name must carry the same environment and resolved compiler
+ * identity as the artifacts that consume them. The short digest keeps the
+ * package-local path readable while preventing build-order contamination. */
+export function vendorCacheBuildIdentity(
+  environmentFingerprint: string,
+  compilerIdentity: string,
+): string {
+  return createHash("sha256")
+    .update("vendor-toolchain-v1\0")
+    .update(environmentFingerprint)
+    .update("\0")
+    .update(compilerIdentity)
+    .digest("hex")
+    .slice(0, 20);
+}
+
+const vendorCompilerIdentityFallbacks = new Map<string, string>();
+
+async function currentVendorCacheBuildIdentity(
+  driver: Pick<CcDriver, "argv" | "target">,
+  environmentFingerprint: string,
+): Promise<string> {
+  // Native vendor recipes additionally use bare clang/ar and CMake; cross
+  // recipes use the zig driver for compilation and `zig ar`. Include every
+  // executable that can affect the package-local prerequisite, not just the
+  // final program's driver.
+  const commands = [
+    driver.argv[0] ?? "clang",
+    ...(driver.target === null ? ["clang", "cc", "ar", "ranlib", "cmake"] : []),
+  ].filter((command, index, all) => all.indexOf(command) === index);
+  const identities = await Promise.all(
+    commands.map(async (command) => {
+      const spellingKey = `${environmentFingerprint}\0${command}`;
+      const resolved = await resolvedToolIdentity(command);
+      if (resolved !== null) vendorCompilerIdentityFallbacks.set(spellingKey, resolved);
+      return [
+        command,
+        resolved ??
+          vendorCompilerIdentityFallbacks.get(spellingKey) ??
+          `<unresolved>\0${command}`,
+      ].join("\0");
+    }),
+  );
+  return vendorCacheBuildIdentity(environmentFingerprint, identities.join("\x1f"));
+}
+
+function engineArchivePath(
+  sanitize: boolean,
+  driver: CcDriver,
+  buildIdentity: string,
+  cacheRoot: string = vendorBuildCacheRoot(),
+): string {
+  const flavor = `${sanitize ? "asan" : "plain"}-${vendorCacheTargetFlavor(driver)}-${buildIdentity}`;
+  return join(cacheRoot, `${QJS_COMMIT.slice(0, 12)}-${flavor}`, "libqjs.a");
 }
 
 async function fileExists(path: string): Promise<boolean> {
@@ -316,8 +573,37 @@ async function fileExists(path: string): Promise<boolean> {
   );
 }
 
+function privateSiblingPath(destination: string, label: string): string {
+  // Keep the temporary component independent of the caller's basename. A
+  // destination can validly consume the filesystem's entire NAME_MAX budget;
+  // appending or prepending that basename would make the atomic install fail.
+  return join(
+    dirname(destination),
+    `.scriptc-${label}-${process.pid}-${Math.random().toString(36).slice(2)}`,
+  );
+}
+
+/** Copy an artifact through a private sibling name, then atomically install it.
+ * The source can live on another filesystem (cache/temp roots commonly do), so
+ * a direct rename is not portable. */
+async function installArtifact(
+  source: string,
+  destination: string,
+  mode?: number,
+): Promise<void> {
+  await mkdir(dirname(destination), { recursive: true });
+  const tmp = privateSiblingPath(destination, "install");
+  try {
+    await copyFile(source, tmp);
+    if (mode !== undefined) await chmod(tmp, mode);
+    await rename(tmp, destination);
+  } finally {
+    await rm(tmp, { force: true }).catch(() => undefined);
+  }
+}
+
 /** The engine archive for one flavor, built lazily on the first --dynamic
- * compile (~10s) and cached under vendor/.cache/<commit>-<flavor>/ — unlike
+ * compile (~10s) and cached under vendor/.cache/<commit>-<flavor>-<target>-<toolchain>/ — unlike
  * the runtime's own sources (recompiled every build, ~100ms), the engine is
  * far too big to rebuild per compile. The plain flavor is ALWAYS MinSizeRel
  * regardless of the program's optimization level: measured binary delta is
@@ -334,12 +620,16 @@ async function fileExists(path: string): Promise<boolean> {
  * (QJS_ENGINE_SOURCES) compiled with `zig cc -target <triple>` under the
  * same flags CMake's MinSizeRel/Debug+ASan configurations apply, packed
  * with `zig ar`. Host builds keep the exact historical CMake recipe. */
-async function ensureEngineArchive(sanitize: boolean, driver: CcDriver): Promise<string> {
-  const flavor = `${sanitize ? "asan" : "plain"}${driver.target !== null ? `-${driver.target}` : ""}`;
+async function ensureEngineArchive(
+  sanitize: boolean,
+  driver: CcDriver,
+  buildIdentity: string,
+  cacheRoot: string = vendorBuildCacheRoot(),
+): Promise<string> {
+  const flavor = `${sanitize ? "asan" : "plain"}-${vendorCacheTargetFlavor(driver)}-${buildIdentity}`;
   const vendor = vendorEngineDir();
-  const cacheRoot = join(vendor, "..", ".cache");
-  const cacheDir = join(cacheRoot, `${QJS_COMMIT.slice(0, 12)}-${flavor}`);
-  const archive = join(cacheDir, "libqjs.a");
+  const archive = engineArchivePath(sanitize, driver, buildIdentity, cacheRoot);
+  const cacheDir = dirname(archive);
   if (await fileExists(archive)) return archive;
   if (driver.target !== null) return buildEngineArchiveCross(sanitize, driver, cacheRoot, cacheDir);
 
@@ -456,9 +746,23 @@ async function buildEngineArchiveCross(sanitize: boolean, driver: CcDriver, cach
  * never the ~620KB island. */
 const LRE_SOURCES = ["libregexp.c", "libunicode.c"];
 
+function lreObjectPaths(
+  sanitize: boolean,
+  driver: CcDriver,
+  buildIdentity: string,
+  cacheRoot: string = vendorBuildCacheRoot(),
+): string[] {
+  const flavor =
+    (sanitize ? "asan" : "plain") +
+    (driver.argv.length === 1 && driver.argv[0] === "clang" ? "" : "-zigcc") +
+    `-${vendorCacheTargetFlavor(driver)}-${buildIdentity}`;
+  const cacheDir = join(cacheRoot, `${QJS_COMMIT.slice(0, 12)}-lre-${flavor}`);
+  return LRE_SOURCES.map((f) => join(cacheDir, f.replace(/\.c$/, ".o")));
+}
+
 /** The libregexp objects for one flavor, compiled lazily on the first
  * regex-using static build (~1s) and cached like the engine archive —
- * vendor/.cache/<commit>-lre-<flavor>/*.o — with the same atomic-rename
+ * vendor/.cache/<commit>-lre-<flavor>-<target>-<toolchain>/*.o — with the same atomic-rename
  * publish (parallel first builds race safely; losers discard their work).
  * Plain is -Os (size class matters: the regex fence pins regex-using
  * binaries well under the engine class); asan matches the final link so
@@ -467,19 +771,23 @@ const LRE_SOURCES = ["libregexp.c", "libunicode.c"];
  * args — libregexp/libunicode are plain C11, so the cross story is exactly
  * the runtime sources' (no host-built inputs); vendored SOURCES are
  * untouched, only the build wiring knows about targets. */
-async function ensureLreObjects(sanitize: boolean, driver: CcDriver): Promise<string[]> {
+async function ensureLreObjects(
+  sanitize: boolean,
+  driver: CcDriver,
+  buildIdentity: string,
+  cacheRoot: string = vendorBuildCacheRoot(),
+): Promise<string[]> {
   // The flavor keys the DRIVER as well as the target: a zig-cc-built object
   // set must never be handed to a clang link (or vice versa) off a shared
-  // cache directory — the historical `lre-plain`/`lre-asan` names stay
-  // clang's alone.
+  // cache directory. Native targets include host platform + architecture so
+  // arm64 and Rosetta processes never exchange Mach-O objects.
   const flavor =
     (sanitize ? "asan" : "plain") +
     (driver.argv.length === 1 && driver.argv[0] === "clang" ? "" : "-zigcc") +
-    (driver.target !== null ? `-${driver.target}` : "");
+    `-${vendorCacheTargetFlavor(driver)}-${buildIdentity}`;
   const vendor = vendorEngineDir();
-  const cacheRoot = join(vendor, "..", ".cache");
-  const cacheDir = join(cacheRoot, `${QJS_COMMIT.slice(0, 12)}-lre-${flavor}`);
-  const objects = LRE_SOURCES.map((f) => join(cacheDir, f.replace(/\.c$/, ".o")));
+  const objects = lreObjectPaths(sanitize, driver, buildIdentity, cacheRoot);
+  const cacheDir = dirname(objects[0]!);
   if ((await Promise.all(objects.map(fileExists))).every(Boolean)) return objects;
 
   await mkdir(cacheRoot, { recursive: true });
@@ -523,24 +831,42 @@ function vendorZlibDir(): string {
  * Host builds never touch this list — they link the system libz. */
 const ZLIB_SOURCES = ["adler32.c", "compress.c", "crc32.c", "deflate.c", "infback.c", "inffast.c", "inflate.c", "inftrees.c", "trees.c", "uncompr.c", "zutil.c"];
 
+function zlibObjectPaths(
+  sanitize: boolean,
+  driver: CcDriver,
+  buildIdentity: string,
+  cacheRoot: string = vendorBuildCacheRoot(),
+): string[] {
+  const flavor =
+    (sanitize ? "asan" : "plain") +
+    (driver.argv.length === 1 && driver.argv[0] === "clang" ? "" : "-zigcc") +
+    `-${vendorCacheTargetFlavor(driver)}-${buildIdentity}`;
+  const cacheDir = join(cacheRoot, `zlib-${ZLIB_VERSION}-${flavor}`);
+  return ZLIB_SOURCES.map((f) => join(cacheDir, f.replace(/\.c$/, ".o")));
+}
+
 /** The zlib objects for one flavor, compiled lazily on the first zlib-using
  * CROSS build (~1s) and cached like the lre objects —
- * vendor/.cache/zlib-<version>-<flavor>/*.o — with the same atomic-rename
+ * vendor/.cache/zlib-<version>-<flavor>-<target>-<toolchain>/*.o — with the same atomic-rename
  * publish (parallel first builds race safely; losers discard their work).
  * Plain is -Os, asan matches the final link so the sanitized lane
  * instruments the codec too. The flavor keys the driver and target exactly
  * like the lre flavor: only cross builds call this today, but the keying
  * must never hand a zig-built object set to a clang link off a shared
  * directory. */
-async function ensureZlibObjects(sanitize: boolean, driver: CcDriver): Promise<string[]> {
+async function ensureZlibObjects(
+  sanitize: boolean,
+  driver: CcDriver,
+  buildIdentity: string,
+  cacheRoot: string = vendorBuildCacheRoot(),
+): Promise<string[]> {
   const flavor =
     (sanitize ? "asan" : "plain") +
     (driver.argv.length === 1 && driver.argv[0] === "clang" ? "" : "-zigcc") +
-    (driver.target !== null ? `-${driver.target}` : "");
+    `-${vendorCacheTargetFlavor(driver)}-${buildIdentity}`;
   const vendor = vendorZlibDir();
-  const cacheRoot = join(vendor, "..", ".cache");
-  const cacheDir = join(cacheRoot, `zlib-${ZLIB_VERSION}-${flavor}`);
-  const objects = ZLIB_SOURCES.map((f) => join(cacheDir, f.replace(/\.c$/, ".o")));
+  const objects = zlibObjectPaths(sanitize, driver, buildIdentity, cacheRoot);
+  const cacheDir = dirname(objects[0]!);
   if ((await Promise.all(objects.map(fileExists))).every(Boolean)) return objects;
 
   await mkdir(cacheRoot, { recursive: true });
@@ -589,9 +915,17 @@ const CURL_STUB_SYMBOLS = [
   "curl_url", "curl_url_cleanup", "curl_url_get", "curl_url_set",
 ];
 
+function curlStubDirPath(
+  driver: CcDriver,
+  buildIdentity: string,
+  cacheRoot: string = vendorBuildCacheRoot(),
+): string {
+  return join(cacheRoot, `curl-stub-${driver.target}-${buildIdentity}`);
+}
+
 /** The libcurl import stub for one CROSS target, generated lazily on the
  * first fetch-using cross build and cached like the zlib objects —
- * vendor/.cache/curl-stub-<target>/libcurl.so, atomic-rename publish. The
+ * vendor/.cache/curl-stub-<target>-<toolchain>/libcurl.so, atomic-rename publish. The
  * stub is empty definitions of CURL_STUB_SYMBOLS compiled `-shared` with
  * `-soname libcurl.so.4`: linking against it satisfies scr_fetch_curl.c's
  * references and records a plain `DT_NEEDED libcurl.so.4`, which the
@@ -600,9 +934,12 @@ const CURL_STUB_SYMBOLS = [
  * from the stub's bodies ever ships in the binary). One stub per target,
  * no sanitize flavor: the stub's code is never executed or instrumented,
  * and asan links against plain shared libraries freely. */
-async function ensureCurlStub(driver: CcDriver): Promise<string> {
-  const cacheRoot = join(vendorCurlDir(), "..", ".cache");
-  const cacheDir = join(cacheRoot, `curl-stub-${driver.target}`);
+async function ensureCurlStub(
+  driver: CcDriver,
+  buildIdentity: string,
+  cacheRoot: string = vendorBuildCacheRoot(),
+): Promise<string> {
+  const cacheDir = curlStubDirPath(driver, buildIdentity, cacheRoot);
   const lib = join(cacheDir, "libcurl.so");
   if (await fileExists(lib)) return cacheDir;
 
@@ -637,9 +974,19 @@ function vendorTlsDir(): string {
   return join(runtimeSrcDir(), "..", "vendor", "mbedtls");
 }
 
+function tlsArchivePath(
+  sanitize: boolean,
+  driver: CcDriver,
+  buildIdentity: string,
+  cacheRoot: string = vendorBuildCacheRoot(),
+): string {
+  const flavor = `${sanitize ? "asan" : "plain"}-${vendorCacheTargetFlavor(driver)}-${buildIdentity}`;
+  return join(cacheRoot, `mbedtls-${MBEDTLS_VERSION}-${flavor}`, "libmbedtls.a");
+}
+
 /** The mbedTLS archive for one flavor, compiled lazily on the first
  * TLS-using build (~15s over ~110 TUs, parallelized) and cached like the
- * engine archive — vendor/.cache/mbedtls-<version>-<flavor>/libmbedtls.a —
+ * engine archive — vendor/.cache/mbedtls-<version>-<flavor>-<target>-<toolchain>/libmbedtls.a —
  * with the same atomic-rename publish (parallel first builds race safely;
  * losers discard their work). Plain is -Os (the TLS stack is link-gated
  * but still wants its size class small); asan matches the final link so
@@ -652,14 +999,18 @@ function vendorTlsDir(): string {
  * TUs compile with `zig cc -target <triple>` and the archive is packed
  * with `zig ar` (llvm-ar — the host BSD ar has no business indexing ELF
  * objects). Host builds keep the exact historical clang + ar recipe. */
-async function ensureTlsArchive(sanitize: boolean, driver: CcDriver): Promise<string> {
-  const flavor = `${sanitize ? "asan" : "plain"}${driver.target !== null ? `-${driver.target}` : ""}`;
+async function ensureTlsArchive(
+  sanitize: boolean,
+  driver: CcDriver,
+  buildIdentity: string,
+  cacheRoot: string = vendorBuildCacheRoot(),
+): Promise<string> {
+  const flavor = `${sanitize ? "asan" : "plain"}-${vendorCacheTargetFlavor(driver)}-${buildIdentity}`;
   const compileArgv = driver.target !== null ? driver.argv : ["clang"];
   const arArgv = driver.target !== null ? [...driver.argv.slice(0, 1), "ar"] : ["ar"];
   const vendor = vendorTlsDir();
-  const cacheRoot = join(vendor, "..", ".cache");
-  const cacheDir = join(cacheRoot, `mbedtls-${MBEDTLS_VERSION}-${flavor}`);
-  const archive = join(cacheDir, "libmbedtls.a");
+  const archive = tlsArchivePath(sanitize, driver, buildIdentity, cacheRoot);
+  const cacheDir = dirname(archive);
   if (await fileExists(archive)) return archive;
 
   await mkdir(cacheRoot, { recursive: true });
@@ -703,8 +1054,9 @@ async function ensureTlsArchive(sanitize: boolean, driver: CcDriver): Promise<st
  * One `scriptc build --lib` invocation produces <name>.lib.a: the program TU
  * object plus exactly the runtime objects the program's IR gates in, every
  * TU compiled with -DSCR_LIB (the per-flavor discipline that keeps library
- * objects apart from executable-lane objects — here trivially, because library
- * builds compile fresh into the archive and never touch the object cache).
+ * objects apart from executable-lane objects). Persistent builds cache the
+ * completed archive by program-TU content and cache runtime objects separately,
+ * so an edit recompiles only the changed program object before re-archiving.
  * The base set narrows from the executable lane's unconditional sources:
  * scr_async.c (fibers, timers, the loop) and scr_child.c drop — the
  * async_free refusal already guarantees nothing references them — and
@@ -728,6 +1080,10 @@ export interface LibArchiveOptions {
   cPath: string;
   /** The archive to produce (<name>.lib.a). */
   outPath: string;
+  /** Caller-owned identity for the generated TU's complete non-system
+   * dependency graph. Omission bypasses persistent artifact/object caching,
+   * matching compileC's arbitrary-input safety boundary. */
+  cacheIdentity?: string;
   sanitize?: boolean;
   /** IR-detected link gates (the compileC precedent, refusal-narrowed). */
   regex?: boolean;
@@ -737,6 +1093,7 @@ export interface LibArchiveOptions {
   searchParams?: boolean;
   emitter?: boolean;
   zlib?: boolean;
+  copying?: boolean;
 }
 
 export async function compileLibArchive(opts: LibArchiveOptions): Promise<void> {
@@ -744,8 +1101,6 @@ export async function compileLibArchive(opts: LibArchiveOptions): Promise<void> 
   const driver = resolveCc();
   const sanitize = opts.sanitize ?? false;
   const regex = opts.regex ?? false;
-  const lreObjects = regex ? await ensureLreObjects(sanitize, driver) : [];
-  const zlibObjects = opts.zlib ? await ensureZlibObjects(sanitize, driver) : [];
   const sources = [
     ...LIB_RUNTIME_SOURCES,
     // win32 targets compile the libc-shim TU into the archive (stpcpy,
@@ -764,6 +1119,7 @@ export async function compileLibArchive(opts: LibArchiveOptions): Promise<void> 
     ...(opts.searchParams ? ["scr_url_params.c"] : []),
     ...(opts.emitter ? ["scr_events_emitter.c", "scr_dyn_handle.c"] : []),
     ...(opts.zlib ? ["scr_zlib.c"] : []),
+    ...(opts.copying ? ["scr_copying.c"] : []),
   ];
   const cflags = [
     "-std=c11",
@@ -777,104 +1133,1439 @@ export async function compileLibArchive(opts: LibArchiveOptions): Promise<void> 
     ...(regex ? ["-I", vendorEngineDir()] : []),
     ...(opts.zlib ? ["-I", vendorZlibDir()] : []),
   ];
+  const programCompilerArgs = opts.cPath.endsWith(".ll")
+    ? [...cflags, "-Wno-override-module"]
+    : cflags;
+  const programSourceExtension = opts.cPath.endsWith(".ll") ? ".ll" : ".c";
   const arArgv = driver.argv[0] === "zig" ? [driver.argv[0]!, "ar"] : ["ar"];
-  const buildDir = await mkdtemp(join(tmpdir(), "scriptc-lib-"));
-  try {
-    const objects: string[] = [];
-    const compileOne = async (src: string, objName: string): Promise<void> => {
-      const obj = join(buildDir, objName);
-      const args = [
-        ...driver.argv.slice(1),
-        ...cflags,
-        ...(src.endsWith(".ll") ? ["-Wno-override-module"] : []),
-        "-c", src,
-        "-o", obj,
-      ];
-      try {
-        await execFileAsync(driver.argv[0] ?? "clang", args);
-      } catch (err) {
-        const stderr = (err as { stderr?: string }).stderr ?? String(err);
-        throw new Error(
-          `${driver.argv.join(" ")} failed compiling ${src} for the library archive.\n` +
-            `This is a scriptc bug (generated/runtime C should always compile) unless the compiler itself is missing/broken.\n\n${stderr}`,
-        );
-      }
-      objects.push(obj);
-    };
-    const stem = basename(opts.cPath).replace(/\.(c|ll)$/, "");
-    await compileOne(opts.cPath, `${stem}.program.o`);
-    const width = Math.min(4, availableParallelism());
-    for (let i = 0; i < sources.length; i += width) {
-      await Promise.all(sources.slice(i, i + width).map((f) => compileOne(join(rtDir, f), f.replace(/\.c$/, ".o"))));
+  const cachePolicy = toolchainEnvironmentCachePolicy();
+  const configuredCacheRoot = cacheRootDir();
+  const toolchainEnv = toolchainEnvironmentFingerprint();
+  const persistentDriverCache =
+    cachePolicy.runtimeObjects &&
+    configuredCacheRoot !== null &&
+    await compilerDriverSupportsPersistentCache(driver, toolchainEnv);
+  // A library archive is compile-only from clang's perspective. Link-only
+  // search variables cannot affect it, but any mutable compilation input or
+  // opaque compiler wrapper makes every persistent tier unsafe to reuse. An
+  // opaque archiver narrows only the completed-archive tier below.
+  let root =
+    opts.cacheIdentity === undefined || !persistentDriverCache
+      ? null
+      : configuredCacheRoot;
+  if (root !== null) {
+    try {
+      await ensurePrivateCacheRoot(
+        root,
+        process.env["SCRIPTC_CACHE_DIR"] === undefined,
+      );
+    } catch {
+      root = null;
     }
-    objects.push(...lreObjects, ...zlibObjects);
-    await rm(opts.outPath, { force: true }); // `ar r` would append into a stale archive
-    await mkdir(dirname(opts.outPath), { recursive: true });
-    await execFileAsync(arArgv[0] ?? "ar", [...arArgv.slice(1), "rcs", opts.outPath, ...objects]);
-  } finally {
-    await rm(buildDir, { recursive: true, force: true });
   }
+  let implicitToolchain: string | null = null;
+  let runtimeCompilerInvocation: string | null = null;
+  let programCompilerInvocation: string | null = null;
+  if (persistentDriverCache) {
+    try {
+      implicitToolchain = await implicitToolchainFingerprint(driver, toolchainEnv);
+    } catch {
+      // An identity probe is cache machinery, never a reason a valid native
+      // compile should fail. Disable every persistent tier for this invocation.
+      root = null;
+    }
+  }
+  if (root !== null) {
+    try {
+      runtimeCompilerInvocation = await effectiveCompilerInvocationFingerprint(
+        driver,
+        toolchainEnv,
+        cflags,
+      );
+      programCompilerInvocation = programSourceExtension === ".ll"
+        ? await effectiveCompilerInvocationFingerprint(
+            driver,
+            toolchainEnv,
+            programCompilerArgs,
+            programSourceExtension,
+          )
+        : runtimeCompilerInvocation;
+    } catch {
+      // A wrapper that cannot expose its effective invocation can still build,
+      // but its outputs cannot safely participate in a persistent cache.
+      root = null;
+    }
+  }
+  const vendorBuildIdentity = await currentVendorCacheBuildIdentity(
+    driver,
+    `${toolchainEnv}\0${implicitToolchain ?? "<uncached>"}`,
+  );
+  const cacheCompleteArchive =
+    root !== null && await archiverSupportsPersistentCache(arArgv, driver);
+  let cachedArchive: string | null = null;
+  let compilerVersion = "";
+  let archiverVersion = "";
+  let runtimeHash = "";
+  let programDependencyHash = "";
+  let cachedProgramBytes: Buffer | null = null;
+  if (root !== null) {
+    try {
+      const [cv, fingerprint, programBytes] = await Promise.all([
+        ccVersionOnce(driver.argv, toolchainEnv, true),
+        runtimeFingerprint(rtDir),
+        readFile(opts.cPath),
+      ]);
+      compilerVersion = cv;
+      runtimeHash = fingerprint;
+      cachedProgramBytes = programBytes;
+      if (cacheCompleteArchive) {
+        const [av, programDependencies] = await Promise.all([
+          toolVersionOnce(arArgv, toolchainEnv, true),
+          translationUnitDependencyFingerprint(
+            driver,
+            cflags,
+            opts.cPath,
+            programBytes,
+            toolchainEnv,
+          ),
+        ]);
+        archiverVersion = av;
+        programDependencyHash = programDependencies;
+        const key = createHash("sha256")
+          // v7 adds effective compiler-wrapper invocations for the real runtime
+          // and program compile flavors.
+          .update("lib-v7\0")
+          .update(cacheTargetIdentity(driver)).update("\0")
+          .update(toolchainEnv).update("\0")
+          .update(implicitToolchain!).update("\0")
+          .update(runtimeCompilerInvocation!).update("\0")
+          .update(programCompilerInvocation!).update("\0")
+          .update(programDependencies).update("\0")
+          .update(opts.cacheIdentity!).update("\0")
+          .update(driver.argv.join("\x1f")).update("\0")
+          .update(cv).update("\0")
+          .update(fingerprint).update("\0")
+          .update(arArgv.join("\x1f")).update("\0")
+          .update(av).update("\0")
+          .update(cflags.join("\x1f")).update("\0")
+          .update(sources.join("\x1f")).update("\0")
+          // The compiler-visible spelling and resolved location are both inputs:
+          // __FILE__ observes the former, while relative includes follow the
+          // latter. Archive members also inherit the TU's basename.
+          .update(opts.cPath).update("\0")
+          .update(resolve(opts.cPath)).update("\0")
+          .update(programBytes)
+          .digest("hex");
+        cachedArchive = join(root, "lib", key);
+        const tmpOut = privateSiblingPath(opts.outPath, "lib-hit");
+        try {
+          await mkdir(dirname(opts.outPath), { recursive: true });
+          if (!(await copyValidCachedFile(cachedArchive, tmpOut))) {
+            throw new Error("invalid cached library archive");
+          }
+          // Match a fresh `ar` output under the caller's current umask. Cache
+          // entries may have been populated by a less restrictive shell.
+          await chmod(tmpOut, 0o666 & ~process.umask());
+          await rename(tmpOut, opts.outPath);
+          return;
+        } catch {
+          await rm(tmpOut, { force: true }).catch(() => undefined);
+          // Miss (or unreadable cache): compile below and publish best-effort.
+        }
+      }
+    } catch {
+      // Cache identity trouble is never a build failure. The fresh path below
+      // retains the historical compile-everything behavior.
+      cachedArchive = null;
+    }
+  }
+
+  const transientVendorRoot = persistentDriverCache && implicitToolchain !== null
+    ? null
+    : join(
+        tmpdir(),
+        `scriptc-lib-vendor-${process.pid}-${Math.random().toString(36).slice(2)}`,
+      );
+  const vendorCacheRoot = transientVendorRoot ?? vendorBuildCacheRoot();
+  try {
+    const lreObjects = regex
+      ? await ensureLreObjects(sanitize, driver, vendorBuildIdentity, vendorCacheRoot)
+      : [];
+    const zlibObjects = opts.zlib
+      ? await ensureZlibObjects(sanitize, driver, vendorBuildIdentity, vendorCacheRoot)
+      : [];
+    const buildDir = await mkdtemp(join(tmpdir(), "scriptc-lib-"));
+    try {
+      const compileOne = async (
+        src: string,
+        objName: string,
+        compilerVisibleSource?: string,
+      ): Promise<string> => {
+        const obj = join(buildDir, objName);
+        const args = [
+          ...driver.argv.slice(1),
+          ...cflags,
+          ...(compilerVisibleSource !== undefined
+            ? [
+                `-ffile-prefix-map=${src}=${compilerVisibleSource}`,
+                "-iquote",
+                dirname(resolve(compilerVisibleSource)),
+              ]
+            : []),
+          ...(src.endsWith(".ll") ? ["-Wno-override-module"] : []),
+          "-c", src,
+          "-o", obj,
+        ];
+        try {
+          await execFileAsync(driver.argv[0] ?? "clang", args);
+        } catch (err) {
+          const stderr = (err as { stderr?: string }).stderr ?? String(err);
+          throw new Error(
+            `${driver.argv.join(" ")} failed compiling ${src} for the library archive.\n` +
+              `This is a scriptc bug (generated/runtime C should always compile) unless the compiler itself is missing/broken.\n\n${stderr}`,
+          );
+        }
+        return obj;
+      };
+      const stem = basename(opts.cPath).replace(/\.(c|ll)$/, "");
+      const programSource =
+        cachedProgramBytes === null
+          ? opts.cPath
+          : join(buildDir, `program${opts.cPath.endsWith(".ll") ? ".ll" : ".c"}`);
+      if (cachedProgramBytes !== null) await writeFile(programSource, cachedProgramBytes);
+      const programObject = await compileOne(
+        programSource,
+        `${stem}.program.o`,
+        cachedProgramBytes === null ? undefined : opts.cPath,
+      );
+      let runtimeObjects: string[] | null = null;
+      let cacheInputsStable = true;
+      let objectImplicitVerification: Promise<boolean> | null = null;
+      const objectImplicitToolchainStillMatches = (): Promise<boolean> => {
+        objectImplicitVerification ??= Promise.all([
+          implicitToolchainFingerprint(driver, toolchainEnv),
+          effectiveCompilerInvocationFingerprint(driver, toolchainEnv, cflags),
+        ]).then(
+          ([currentImplicit, currentInvocation]) =>
+            currentImplicit === implicitToolchain &&
+            currentInvocation === runtimeCompilerInvocation,
+          () => false,
+        );
+        return objectImplicitVerification;
+      };
+      if (root !== null && compilerVersion !== "" && runtimeHash !== "") {
+        try {
+          const sourcePaths = sources.map((f) => join(rtDir, f));
+          const cached = await ensureRuntimeObjects(
+            root,
+            driver.argv,
+            cflags,
+            sourcePaths,
+            `lib-obj-v5\0${cacheTargetIdentity(driver)}\0${toolchainEnv}\0${implicitToolchain}\0${runtimeCompilerInvocation}\0${driver.argv.join(" ")}\0${compilerVersion}\0${runtimeHash}\0`,
+            async () =>
+              (await runtimeFingerprint(rtDir)) === runtimeHash &&
+              (await objectImplicitToolchainStillMatches()),
+          );
+          const staged = await stageRuntimeObjects(cached, join(buildDir, "cached-runtime"));
+          runtimeObjects = sourcePaths.map((path) => staged.get(path)!);
+        } catch (err) {
+          if (err instanceof CacheInputsChangedError) cacheInputsStable = false;
+          runtimeObjects = null;
+        }
+      }
+      if (runtimeObjects === null) {
+        runtimeObjects = [];
+        const width = Math.min(4, availableParallelism());
+        for (let i = 0; i < sources.length; i += width) {
+          runtimeObjects.push(
+            ...(await Promise.all(
+              sources.slice(i, i + width).map((f) =>
+                compileOne(join(rtDir, f), f.replace(/\.c$/, ".o")),
+              ),
+            )),
+          );
+        }
+      }
+      const objects = [programObject, ...runtimeObjects, ...lreObjects, ...zlibObjects];
+      // A cacheable build owns a private archive from `ar` through publication.
+      // The caller-visible output can be shared by another invocation without
+      // letting that invocation's bytes poison this key.
+      const archiveOutput =
+        cachedArchive === null ? opts.outPath : join(buildDir, "artifact.lib.a");
+      await rm(archiveOutput, { force: true }); // `ar r` would append into a stale archive
+      await mkdir(dirname(archiveOutput), { recursive: true });
+      await execFileAsync(arArgv[0] ?? "ar", [
+        ...arArgv.slice(1),
+        "rcs",
+        archiveOutput,
+        ...objects,
+      ]);
+      if (archiveOutput !== opts.outPath) await installArtifact(archiveOutput, opts.outPath);
+      let runtimeStillMatchesKey = false;
+      if (
+        cachedArchive !== null &&
+        root !== null &&
+        runtimeHash !== "" &&
+        programDependencyHash !== "" &&
+        compilerVersion !== "" &&
+        archiverVersion !== ""
+      ) {
+        const [currentRuntime, currentImplicit, currentRuntimeInvocation, currentProgramInvocation, currentProgramDependencies, currentCompiler, currentArchiver] =
+          await Promise.all([
+            runtimeFingerprint(rtDir).catch(() => null),
+            implicitToolchainFingerprint(driver, toolchainEnv).catch(() => null),
+            effectiveCompilerInvocationFingerprint(driver, toolchainEnv, cflags).catch(
+              () => null,
+            ),
+            effectiveCompilerInvocationFingerprint(
+              driver,
+              toolchainEnv,
+              programCompilerArgs,
+              programSourceExtension,
+            ).catch(() => null),
+            translationUnitDependencyFingerprint(
+              driver,
+              cflags,
+              opts.cPath,
+              cachedProgramBytes!,
+              toolchainEnv,
+            ).catch(() => null),
+            ccVersionOnce(driver.argv, toolchainEnv, true).catch(() => null),
+            toolVersionOnce(arArgv, toolchainEnv, true).catch(() => null),
+          ]);
+        runtimeStillMatchesKey =
+          cacheInputsStable &&
+          currentRuntime === runtimeHash &&
+          currentImplicit === implicitToolchain &&
+          currentRuntimeInvocation === runtimeCompilerInvocation &&
+          currentProgramInvocation === programCompilerInvocation &&
+          currentProgramDependencies === programDependencyHash &&
+          currentCompiler === compilerVersion &&
+          currentArchiver === archiverVersion;
+      }
+      if (cachedArchive !== null && root !== null && runtimeStillMatchesKey) {
+        try {
+          await publishCachedFile(archiveOutput, cachedArchive);
+        } catch {
+          // Publishing is best-effort; the requested archive is already valid.
+        }
+      }
+    } finally {
+      await rm(buildDir, { recursive: true, force: true });
+    }
+  } finally {
+    if (transientVendorRoot !== null) {
+      await rm(transientVendorRoot, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+  if (root !== null) await pruneCache(root).catch(() => undefined);
 }
 
-/* ------------------- build cache (opt-in via SCRIPTC_CACHE_DIR) ----------------
+/* -------------------------- persistent build cache ---------------------------
  * Content-addressed caches that let repeat builds of unchanged programs skip
- * clang entirely — the test lanes' dominant cost. Two keyspaces under the
- * cache root:
+ * payload code generation/linking — the test lanes' dominant cost. Executable
+ * lookups still run lightweight dependency and link-input metadata probes.
+ * Three keyspaces under the cache root:
  *
- *   bin/<key>       — whole program binaries. key = sha256(clang version,
- *                     runtime fingerprint (every .c/.h in the runtime src dir
- *                     plus the vendor pin QJS_COMMIT), the FULL normalized
- *                     command line, the emitted C bytes). Emitted C is
+ *   bin/<key>       — whole program binaries. key = sha256(resolved clang
+ *                     identity/version, target + compiler/linker environment,
+ *                     effective driver invocations for the real build flags,
+ *                     implicit system-header and resolved linker-input bytes,
+ *                     linker/assembler identities, runtime fingerprint
+ *                     (every .c/.h in the runtime src dir plus the vendor pin
+ *                     QJS_COMMIT), the caller's dependency identity, the
+ *                     compiler-visible TU path, Darwin output basename, the
+ *                     FULL normalized command line, and the emitted C bytes).
+ *                     Emitted C is
  *                     byte-stable by project invariant, so unchanged programs
  *                     hit; any flag difference — e.g. the sanitized lane's
  *                     -O1/-fsanitize=address/-DSCR_RC_AUDIT — lands in a
  *                     naturally distinct key. On a hit the cached binary is
  *                     copied and atomically renamed onto outPath (never an
- *                     in-place overwrite — see the hit path) and clang never
- *                     runs; the binary is still EXECUTED live by whoever
+ *                     in-place overwrite — see the hit path) after its digest
+ *                     is verified; the binary is still EXECUTED live by whoever
  *                     asked for it, so no comparison or sanitizer coverage
  *                     is ever skipped.
+ *
+ *   lib/<key>       — whole library archives. The identity covers the resolved
+ *                     compiler and archiver identities/versions, compiler/linker
+ *                     environment, effective build-flavor driver invocations,
+ *                     implicit toolchain inputs, runtime fingerprint,
+ *                     target/flags, gated source set, caller dependency
+ *                     identity, TU path, and program-TU bytes.
+ *                     Checksum-verified hits skip native code generation and ar.
  *
  *   obj/<set>/<f>.o — per-flavor runtime objects for cache-miss builds. The
  *                     historical single invocation recompiles every runtime
  *                     TU per program (~1.3s at -O2); with cached objects a
  *                     miss compiles ONLY the program's C and links (~0.15s).
+ *                     Library-mode -DSCR_LIB objects use a distinct flavor.
  *                     The clang driver hands every input the same option set,
  *                     so per-TU `-c` compiles with those options plus a final
- *                     link reproduce the single invocation exactly. Object
+ *                     link reproduce the single invocation exactly; the
+ *                     driver's effective invocation under that flavor also
+ *                     joins the object-set identity. Every
+ *                     cached object carries a verified digest. Object
  *                     compiles go through ccache when it is installed (silent
  *                     fallback when not).
  *
- * Escape hatches, honored in BOTH directions (no reads, no writes): leave
- * SCRIPTC_CACHE_DIR unset (the production default — the CLI never caches unless
- * asked; vitest.config.ts sets it for the test lanes) or set SCRIPTC_NO_CACHE=1.
- * Either way compileC issues the exact historical command line.
+ * Frontend-generated production builds supply a dependency identity and use a
+ * per-user platform cache by default. Arbitrary low-level TUs omit the identity
+ * and bypass this cache because their include graph is caller-owned.
+ * Compiler wrappers also bypass every persistent tier: a wrapper can branch on
+ * the real source/object topology and inject inputs no synthetic probe sees.
+ * Direct Clang/Zig drivers and Apple's immutable /usr/bin/clang handoff retain
+ * caching; wrapper-driven builds use private, invocation-local vendor outputs.
+ * Opaque archiver wrappers bypass completed library archives for the same
+ * reason while retaining safely keyed runtime objects.
+ * Builds with caller-supplied native link inputs (archive/object paths or
+ * `-l<name>` libraries) also bypass the whole binary cache: a thin archive,
+ * linker script, or ambient resolution can change transitively without
+ * changing the named input's bytes or spelling. Their runtime objects remain
+ * cached, and every invocation performs the final link against current inputs.
+ * SCRIPTC_CACHE_DIR overrides the root (the test lanes use this to stay
+ * repo-local); an explicitly empty value or SCRIPTC_NO_CACHE=1 disables reads
+ * and writes. With caching disabled compileC issues the exact historical
+ * command line.
  *
  * Eviction: size-capped LRU over the whole cache root (SCRIPTC_CACHE_MAX_MB,
- * default 4096) swept at most once per process after a write; reads bump
- * mtimes. The harness's oracle cache lives under the same root and is swept
- * by the same pass. Cache trouble is never a build failure — every cache
- * error falls back to a real compile. */
+ * default 4096). Explicit caps are checked after every successful write; the
+ * large default is swept on the first and every 64th write so corpus/watch
+ * loops do not repeatedly walk a growing tree. Reads bump mtimes. The harness's
+ * oracle cache lives under the same root and is swept by the same pass. Cache
+ * trouble is never a build failure — every cache error falls back to a real
+ * compile. */
+
+/** Resolve the build cache without touching the filesystem. Exported from this
+ * internal module so its platform and override behavior can be pinned directly. */
+export function resolveBuildCacheRoot(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+  userHome: string = homedir(),
+): string | null {
+  if (env["SCRIPTC_NO_CACHE"] === "1") return null;
+  const configured = env["SCRIPTC_CACHE_DIR"];
+  if (configured !== undefined) return configured === "" ? null : resolve(configured);
+
+  const xdg = env["XDG_CACHE_HOME"];
+  if (xdg !== undefined && xdg !== "") return resolve(xdg, "scriptc", "build");
+  if (platform === "win32") {
+    const local = env["LOCALAPPDATA"];
+    if (local !== undefined && local !== "") return resolve(local, "scriptc", "cache", "build");
+  }
+  return platform === "darwin"
+    ? resolve(userHome, "Library", "Caches", "scriptc", "build")
+    : resolve(userHome, ".cache", "scriptc", "build");
+}
 
 function cacheRootDir(): string | null {
-  if (process.env["SCRIPTC_NO_CACHE"] === "1") return null;
-  const dir = process.env["SCRIPTC_CACHE_DIR"];
-  return dir !== undefined && dir !== "" ? dir : null;
+  return resolveBuildCacheRoot();
+}
+
+/** The production cache can contain complete user executables/archives with
+ * embedded source literals or comptime values. Its root is therefore private
+ * regardless of the caller's ordinary output umask. Windows inherits the
+ * per-user LOCALAPPDATA ACL. POSIX platform-default roots are hardened for
+ * upgrades; an arbitrary existing SCRIPTC_CACHE_DIR override is never chmod'd
+ * and participates only when its caller-provided mode is already private. */
+async function ensurePrivateCacheRoot(
+  root: string,
+  hardenExisting: boolean,
+): Promise<void> {
+  const existing = await stat(root).then(
+    (info) => info,
+    (error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    },
+  );
+  if (existing !== null && !existing.isDirectory()) {
+    throw new Error("native cache root is not a directory");
+  }
+  if (
+    process.platform !== "win32" &&
+    existing !== null &&
+    !hardenExisting &&
+    (existing.mode & 0o077) !== 0
+  ) {
+    throw new Error("existing native cache override is not private");
+  }
+  await mkdir(root, { recursive: true, mode: 0o700 });
+  if (process.platform !== "win32" && (existing === null || hardenExisting)) {
+    await chmod(root, 0o700);
+  }
 }
 
 const ccVersionMemos = new Map<string, Promise<string>>();
-function ccVersionOnce(argv: string[]): Promise<string> {
-  const key = argv.join("\x1f");
-  let memo = ccVersionMemos.get(key);
-  if (memo === undefined) {
-    // cwd: the version probe must not touch the caller's directory —
-    // `zig cc --version` (zig 0.16) drops an empty a.o wherever it runs.
-    memo = execFileAsync(argv[0] ?? "clang", [...argv.slice(1), "--version"], { cwd: tmpdir() }).then(
-      (r) => r.stdout.split("\n", 1)[0] ?? "",
+
+interface ResolvedTool {
+  canonicalPath: string;
+  cacheIdentity: string;
+  fileIdentity: string;
+}
+
+/** Resolve the executable the OS will select for an argv[0] spelling. The
+ * path and inode metadata join the version output below: two PATH postures
+ * must not share cache entries merely because both drivers call themselves
+ * `clang` or print the same upstream version. ctime catches an in-place tool
+ * replacement even when a package manager preserves its size and mtime. */
+async function resolvedTool(
+  command: string,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<ResolvedTool | null> {
+  const hasSeparator = command.includes("/") || command.includes("\\");
+  const configuredPath = (env["PATH"] ?? (process.platform === "win32" ? "" : "/usr/bin:/bin"))
+    .split(delimiter);
+  const pathEntries = hasSeparator
+    ? [""]
+    : process.platform === "win32"
+      ? ["", dirname(process.execPath), ...configuredPath]
+      : configuredPath;
+  const windowsExtensions =
+    process.platform === "win32" && extname(command) === ""
+      ? (env["PATHEXT"] ?? ".COM;.EXE;.BAT;.CMD").split(";").filter((extension) => extension !== "")
+      : [""];
+  for (const entry of pathEntries) {
+    const directory = entry.startsWith('"') && entry.endsWith('"') ? entry.slice(1, -1) : entry;
+    const base = hasSeparator
+      ? isAbsolute(command) ? command : resolve(command)
+      : join(directory === "" ? process.cwd() : directory, command);
+    for (const extension of windowsExtensions) {
+      const candidate = `${base}${extension}`;
+      try {
+        await access(candidate, process.platform === "win32" ? fsConstants.F_OK : fsConstants.X_OK);
+        const [canonical, info] = await Promise.all([realpath(candidate), stat(candidate)]);
+        if (!info.isFile()) continue;
+        const fileIdentity = [
+          canonical,
+          info.dev,
+          info.ino,
+          info.size,
+          info.mtimeMs,
+          info.ctimeMs,
+        ].join("\0");
+        return {
+          canonicalPath: canonical,
+          fileIdentity,
+          cacheIdentity: [resolve(candidate), fileIdentity].join("\0"),
+        };
+      } catch {
+        // Keep searching PATH/PATHEXT exactly as process spawning would.
+      }
+    }
+  }
+  return null;
+}
+
+async function resolvedToolIdentity(
+  command: string,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<string | null> {
+  return (await resolvedTool(command, env))?.cacheIdentity ?? null;
+}
+
+const directCompilerDriverMemos = new Map<string, boolean>();
+
+/** `/usr/bin/clang` on Darwin is Apple's immutable driver shim: its `-###`
+ * trace names the selected Xcode/CommandLineTools clang rather than the shim
+ * itself. The ordinary implicit-toolchain fingerprint below captures that
+ * selected executable and its dependencies, so this trusted system handoff is
+ * the one intentional exception to the same-executable rule. */
+function isAppleSystemClangHandoff(
+  driver: ResolvedTool,
+  effectiveCompiler: ResolvedTool,
+): boolean {
+  return process.platform === "darwin" &&
+    driver.canonicalPath === "/usr/bin/clang" &&
+    basename(effectiveCompiler.canonicalPath) === "clang";
+}
+
+/** Persistent caches require an inspectable compiler driver. A general
+ * wrapper can branch on the real source/object paths or argument topology and
+ * inject inputs only into the final invocation; no synthetic metadata probe
+ * can safely represent that behavior. Accept direct Clang/Zig drivers (plus
+ * Apple's system shim) and conservatively keep wrapper-driven builds on the
+ * uncached path. */
+async function compilerDriverSupportsPersistentCache(
+  driver: Pick<CcDriver, "argv" | "targetArgs" | "target">,
+  environmentFingerprint: string,
+): Promise<boolean> {
+  // Cache-race tests exercise publication below an intentionally instrumented
+  // wrapper. This is deliberately undocumented and test-scoped.
+  if (process.env["SCRIPTC_TEST_TRUST_COMPILER_WRAPPER"] === "1") return true;
+
+  const driverKey = [
+    environmentFingerprint,
+    driver.argv.join("\x1f"),
+    driver.target ?? "<native>",
+    driver.targetArgs.join("\x1f"),
+  ].join("\0");
+  const compiler = driver.argv[0] ?? "clang";
+  const resolvedDriver = await resolvedTool(compiler);
+  // A prior dependency list cannot prove that name resolution is unchanged:
+  // a new header in an earlier search directory leaves every previously
+  // resolved file untouched. Require the driver to be present so each cache
+  // invocation can rediscover its complete dependency graph.
+  if (resolvedDriver === null) return false;
+  const probeKey = `${driverKey}\0${resolvedDriver.fileIdentity}`;
+  const memoized = directCompilerDriverMemos.get(probeKey);
+  if (memoized !== undefined) return memoized;
+
+  const probeDir = await mkdtemp(join(tmpdir(), "scriptc-driver-probe-"));
+  let direct = false;
+  try {
+    const source = join(probeDir, "empty.c");
+    const object = join(probeDir, "empty.o");
+    await writeFile(source, "int scriptc_driver_probe;\n");
+    const trace = await execFileAsync(
+      compiler,
+      [
+        ...driver.argv.slice(1),
+        ...driver.targetArgs,
+        "-###",
+        "-std=c11",
+        "-c",
+        source,
+        "-o",
+        object,
+      ],
+      { cwd: probeDir, maxBuffer: 16 * 1024 * 1024 },
     );
+    const effectiveSpellings: string[] = [];
+    for (const line of `${trace.stdout}\n${trace.stderr}`.split(/\r?\n/)) {
+      const tokens = driverTraceCandidates(line);
+      const cc1 = tokens.indexOf("-cc1");
+      if (cc1 > 0) effectiveSpellings.push(tokens[cc1 - 1]!);
+    }
+    if (effectiveSpellings.length === 1) {
+      const effectiveCompiler = await resolvedTool(effectiveSpellings[0]!);
+      direct = effectiveCompiler !== null &&
+        (effectiveCompiler.fileIdentity === resolvedDriver.fileIdentity ||
+          isAppleSystemClangHandoff(resolvedDriver, effectiveCompiler));
+    }
+  } catch {
+    direct = false;
+  } finally {
+    await rm(probeDir, { recursive: true, force: true }).catch(() => undefined);
+  }
+  directCompilerDriverMemos.set(probeKey, direct);
+  return direct;
+}
+
+/** Complete library archives may skip `ar`, so the selected archiver must be
+ * as inspectable as the compiler. `zig ar` is the already-validated Zig
+ * executable. For the host spelling, accept only the immutable platform
+ * tool locations; a PATH wrapper can branch on the real member topology or
+ * inject mutable inputs that `ar --version` cannot expose. Other archivers
+ * retain runtime-object reuse but rebuild the program member and archive. */
+async function archiverSupportsPersistentCache(
+  arArgv: readonly string[],
+  driver: Pick<CcDriver, "argv">,
+): Promise<boolean> {
+  if (
+    arArgv.length === 2 &&
+    arArgv[0] === driver.argv[0] &&
+    arArgv[1] === "ar" &&
+    driver.argv[0] === "zig"
+  ) {
+    return true;
+  }
+  if (arArgv.length !== 1) return false;
+  const archiver = await resolvedTool(arArgv[0] ?? "ar");
+  if (archiver === null || !/(?:^|-)ar$/.test(basename(archiver.canonicalPath))) {
+    return false;
+  }
+  if (archiver.canonicalPath.startsWith("/usr/bin/") || archiver.canonicalPath.startsWith("/bin/")) {
+    return true;
+  }
+  return process.platform === "darwin" &&
+    /^\/Applications\/Xcode[^/]*\.app\/Contents\/Developer\/Toolchains\/[^/]+\.xctoolchain\/usr\/bin\/[^/]*ar$/.test(
+      archiver.canonicalPath,
+    );
+}
+
+export async function ccVersionOnce(
+  argv: string[],
+  environmentFingerprint: string = toolchainEnvironmentFingerprint(),
+  fresh: boolean = false,
+): Promise<string> {
+  const spellingKey = `${environmentFingerprint}\0${argv.join("\x1f")}`;
+  const executableIdentity = await resolvedToolIdentity(argv[0] ?? "clang");
+  const key = `${spellingKey}\0${executableIdentity ?? "<unresolved>"}`;
+  const probe = (): Promise<string> =>
+    // `zig cc --version` (zig 0.16) drops an empty a.o in its cwd. A private
+    // probe directory avoids both caller pollution and the cross-process /
+    // cross-user collision a fixed tmpdir()/a.o would create on Linux.
+    (async () => {
+      const probeDir = await mkdtemp(join(tmpdir(), "scriptc-cc-version-"));
+      try {
+        const r = await execFileAsync(
+          argv[0] ?? "clang",
+          [...argv.slice(1), "--version"],
+          { cwd: probeDir },
+        );
+        return `${executableIdentity ?? "<unresolved>"}\0${`${r.stdout}\n${r.stderr}`.trim()}`;
+      } finally {
+        await rm(probeDir, { recursive: true, force: true }).catch(() => undefined);
+      }
+    })();
+  const requireFreshProbe = fresh && !stableTestToolchainSession();
+  let memo = requireFreshProbe && executableIdentity !== null ? probe() : ccVersionMemos.get(key);
+  if (memo === undefined) {
+    memo = probe();
+    ccVersionMemos.set(key, memo);
+  } else if (requireFreshProbe) {
     ccVersionMemos.set(key, memo);
   }
   return memo;
+}
+
+const toolVersionMemos = new Map<string, Promise<string>>();
+const toolVersionFallbacks = new Map<string, Promise<string>>();
+async function toolVersionOnce(
+  argv: string[],
+  environmentFingerprint: string = toolchainEnvironmentFingerprint(),
+  fresh: boolean = false,
+): Promise<string> {
+  const spellingKey = `${environmentFingerprint}\0${argv.join("\x1f")}`;
+  const executableIdentity = await resolvedToolIdentity(argv[0] ?? "ar");
+  if (executableIdentity === null) {
+    const fallback = toolVersionFallbacks.get(spellingKey);
+    if (fallback !== undefined) return fallback;
+  }
+  const key = `${spellingKey}\0${executableIdentity ?? "<unresolved>"}`;
+  const probe = (): Promise<string> =>
+    execFileAsync(argv[0] ?? "ar", [...argv.slice(1), "--version"]).then(
+      (r) => `${executableIdentity ?? "<unresolved>"}\0${`${r.stdout}\n${r.stderr}`.trim()}`,
+      (err: { stdout?: string; stderr?: string; message?: string }) =>
+        `${executableIdentity ?? "<unresolved>"}\0${`${err.stdout ?? ""}\n${err.stderr ?? ""}`.trim() || err.message || key}`,
+    );
+  let memo = fresh && executableIdentity !== null ? probe() : toolVersionMemos.get(key);
+  if (memo === undefined) {
+    memo = probe();
+    toolVersionMemos.set(key, memo);
+  } else if (fresh) {
+    toolVersionMemos.set(key, memo);
+  }
+  if (executableIdentity !== null) toolVersionFallbacks.set(spellingKey, memo);
+  return memo;
+}
+
+interface ImplicitToolchainProbe {
+  compilerIdentity: string;
+  compilerInvocation: string;
+  dependencies: string[];
+  dependencyFingerprint: string;
+  tools: { spelling: string; identity: string | null }[];
+}
+
+interface ImplicitLinkerProbe {
+  compilerIdentity: string;
+  linkerInvocation: string;
+  dependencies: string[];
+  dependencyFingerprint: string;
+  linker: { spelling: string; identity: string | null };
+}
+
+function parseMakeDependencies(output: string, cwd: string = process.cwd()): string[] {
+  const flattened = output.replace(/\\\r?\n/g, " ");
+  const separator = flattened.indexOf(": ");
+  if (separator < 0) throw new Error("compiler dependency probe returned no make rule");
+  const input = flattened.slice(separator + 2);
+  const paths: string[] = [];
+  let current = "";
+  let escaped = false;
+  for (const char of input) {
+    if (escaped) {
+      current += char;
+      escaped = false;
+    } else if (char === "\\") {
+      escaped = true;
+    } else if (/\s/.test(char)) {
+      if (current !== "") {
+        paths.push(current.replace(/\$\$/g, "$"));
+        current = "";
+      }
+    } else {
+      current += char;
+    }
+  }
+  if (escaped) current += "\\";
+  if (current !== "") paths.push(current.replace(/\$\$/g, "$"));
+  return [...new Set(paths.map((path) => resolve(cwd, path)))].sort();
+}
+
+function normalizedProbeInvocation(
+  result: { stdout: string; stderr: string },
+  probeDir: string,
+): string {
+  return `${result.stdout}\n${result.stderr}`
+    // Probe-local paths vary on every invocation and carry no toolchain
+    // identity. Both ordinary and shell-escaped Windows spellings can appear
+    // in a driver's quoted trace.
+    .split(probeDir).join("<probe>")
+    .split(probeDir.replace(/\\/g, "\\\\")).join("<probe>")
+    .trim();
+}
+
+interface EffectiveCompilerInvocationProbe {
+  compilerIdentity: string;
+  invocation: string;
+  dependencies: string[];
+  dependencyFingerprint: string;
+}
+
+/** The effective cc1 invocation and injected dependencies for the flags used
+ * by real runtime/program compiles. The broad implicit-toolchain probe below
+ * intentionally uses a target-wide synthetic TU so it can discover every
+ * owned system header, but that generic command is not sufficient identity for
+ * a wrapper that injects flags or preincluded files only for a particular build
+ * flavor (for example, only when it sees -O2 or -DSCR_DYNAMIC). */
+async function effectiveCompilerInvocationFingerprintFresh(
+  driver: Pick<CcDriver, "argv">,
+  environmentFingerprint: string,
+  compileArgs: readonly string[],
+  sourceExtension: ".c" | ".ll" = ".c",
+): Promise<string> {
+  const compiler = driver.argv[0] ?? "clang";
+  const compilerIdentity = await resolvedToolIdentity(compiler);
+  if (compilerIdentity === null) {
+    throw new Error("compiler unavailable before effective invocation identity was established");
+  }
+  let probe: EffectiveCompilerInvocationProbe;
+  {
+    const probeDir = await mkdtemp(join(tmpdir(), "scriptc-effective-cc-probe-"));
+    try {
+      const source = join(probeDir, `program${sourceExtension}`);
+      const output = join(probeDir, "program.o");
+      await writeFile(
+        source,
+        sourceExtension === ".ll"
+          ? "define i32 @scriptc_effective_probe() { ret i32 0 }\n"
+          : "int scriptc_effective_probe(void) { return 0; }\n",
+      );
+      const prefix = [...driver.argv.slice(1), ...compileArgs];
+      const [invocation, dependencyResult] = await Promise.all([
+        execFileAsync(
+          compiler,
+          [...prefix, "-###", "-c", source, "-o", output],
+          { cwd: probeDir, maxBuffer: 16 * 1024 * 1024 },
+        ),
+        sourceExtension === ".c"
+          ? execFileAsync(compiler, [...prefix, "-M", source], {
+              cwd: probeDir,
+              maxBuffer: 16 * 1024 * 1024,
+            })
+          : Promise.resolve(null),
+      ]);
+      const dependencies =
+        dependencyResult === null
+          ? []
+          : parseMakeDependencies(dependencyResult.stdout, probeDir).filter(
+              (path) => path !== resolve(source),
+            );
+      probe = {
+        compilerIdentity,
+        invocation: normalizedProbeInvocation(invocation, probeDir),
+        dependencies,
+        dependencyFingerprint: await fingerprintDependencyFiles(dependencies),
+      };
+    } finally {
+      await rm(probeDir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
+  return createHash("sha256")
+    .update("effective-compiler-invocation-v2\0")
+    .update(environmentFingerprint)
+    .update("\0")
+    .update(probe.compilerIdentity)
+    .update("\0")
+    .update(driver.argv.join("\x1f"))
+    .update("\0")
+    .update(compileArgs.join("\x1f"))
+    .update("\0")
+    .update(sourceExtension)
+    .update("\0")
+    .update(probe.invocation)
+    .update("\0")
+    .update(probe.dependencies.join("\x1f"))
+    .update("\0")
+    .update(probe.dependencyFingerprint)
+    .digest("hex");
+}
+
+const stableEffectiveCompilerInvocationMemos = new Map<string, Promise<string>>();
+function effectiveCompilerInvocationFingerprint(
+  driver: Pick<CcDriver, "argv">,
+  environmentFingerprint: string,
+  compileArgs: readonly string[],
+  sourceExtension: ".c" | ".ll" = ".c",
+): Promise<string> {
+  const key = [
+    environmentFingerprint,
+    driver.argv.join("\x1f"),
+    compileArgs.join("\x1f"),
+    sourceExtension,
+  ].join("\0");
+  return stableTestMemo(stableEffectiveCompilerInvocationMemos, key, () =>
+    effectiveCompilerInvocationFingerprintFresh(
+      driver,
+      environmentFingerprint,
+      compileArgs,
+      sourceExtension,
+    ),
+  );
+}
+
+async function nativeSourceFiles(
+  directory: string,
+  recursive: boolean,
+  include: (name: string) => boolean = (name) => name.endsWith(".c") || name.endsWith(".h"),
+): Promise<string[]> {
+  const files: string[] = [];
+  const walk = async (current: string): Promise<void> => {
+    const entries = await readdir(current, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      const path = join(current, entry.name);
+      if (entry.isDirectory() && recursive) await walk(path);
+      else if (entry.isFile() && include(entry.name)) files.push(path);
+    }
+  };
+  await walk(directory);
+  return files.sort();
+}
+
+/** Every system-header spelling consumed by a source tree scriptc owns. The
+ * dependency probe preprocesses these spellings with the selected driver and
+ * hashes the resolved files. Runtime-local and vendored source/header bytes
+ * have their own content/version identities; scanning every owned file for
+ * angle includes closes the system-header gap in separately built QuickJS,
+ * libregexp, mbedTLS, zlib, curl, and Ryū translation units. */
+export async function implicitDependencyProbeIncludes(rtDir: string): Promise<string[]> {
+  const vendor = join(rtDir, "..", "vendor");
+  const quickjsSources = new Set([...QJS_ENGINE_SOURCES, ...LRE_SOURCES]);
+  const zlibSources = new Set(ZLIB_SOURCES);
+  const fileGroups = await Promise.all([
+    nativeSourceFiles(rtDir, false),
+    nativeSourceFiles(join(vendor, "ryu"), false),
+    nativeSourceFiles(
+      join(vendor, "quickjs-ng"),
+      false,
+      (name) => name.endsWith(".h") || quickjsSources.has(name),
+    ),
+    nativeSourceFiles(join(vendor, "mbedtls", "include"), true),
+    nativeSourceFiles(join(vendor, "mbedtls", "library"), true),
+    nativeSourceFiles(
+      join(vendor, "zlib"),
+      false,
+      (name) => name.endsWith(".h") || zlibSources.has(name),
+    ),
+    nativeSourceFiles(join(vendor, "curl", "include"), true, (name) => name.endsWith(".h")),
+  ]);
+  const includes = new Set<string>();
+  for (const path of fileGroups.flat()) {
+    const source = await readFile(path, "utf8");
+    for (const match of source.matchAll(/^\s*#\s*include\s*<([^>]+)>/gm)) {
+      includes.add(`<${match[1]!}>`);
+    }
+  }
+  return [...includes].sort();
+}
+
+function implicitDependencyIncludeDirective(include: string): string {
+  const targetCondition =
+    include === "<cpuid.h>" || include === "<immintrin.h>"
+      ? " && (defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64))"
+      : include === "<intrin.h>"
+        ? " && defined(_WIN32)"
+        : include === "<arm64_neon.h>" || include === "<arm_acle.h>" || include === "<arm_neon.h>"
+          ? " && (defined(__arm__) || defined(__aarch64__) || defined(_M_ARM) || defined(_M_ARM64))"
+          : "";
+  return `#if __has_include(${include})${targetCondition}\n#include ${include}\n#endif\n`;
+}
+
+async function fingerprintDependencyFiles(paths: readonly string[]): Promise<string> {
+  const hash = createHash("sha256").update("implicit-dependencies-v1\0");
+  for (let i = 0; i < paths.length; i += 128) {
+    const batch = paths.slice(i, i + 128);
+    const contents = await Promise.all(batch.map((path) => readFile(path)));
+    for (let j = 0; j < batch.length; j++) {
+      hash.update(batch[j]!).update("\0").update(contents[j]!).update("\0");
+    }
+  }
+  return hash.digest("hex");
+}
+
+interface TranslationUnitDependencyProbe {
+  compilerIdentity: string;
+  dependencies: string[];
+  dependencyFingerprint: string;
+}
+
+/** Exact headers selected while preprocessing the caller's translation unit.
+ * The shared toolchain probe covers the runtime/vendor trees, but compileC is
+ * also a public API: an opted-in caller can include a system or header-only SDK
+ * surface that no runtime source names. Probe an invocation-private snapshot
+ * of the keyed bytes with the real compile flags, preserving the original
+ * quote-include directory and compiler-visible source spelling. */
+async function translationUnitDependencyFingerprintFresh(
+  driver: Pick<CcDriver, "argv">,
+  cflags: readonly string[],
+  sourcePath: string,
+  sourceBytes: Buffer,
+  environmentFingerprint: string,
+): Promise<string> {
+  if (sourcePath.endsWith(".ll")) {
+    return createHash("sha256").update("translation-unit-dependencies-v1\0llvm-ir").digest("hex");
+  }
+
+  const compiler = driver.argv[0] ?? "clang";
+  const compilerIdentity = await resolvedToolIdentity(compiler);
+  if (compilerIdentity === null) {
+    throw new Error("compiler unavailable before translation-unit dependencies were established");
+  }
+  let probe: TranslationUnitDependencyProbe;
+  {
+    const probeDir = await mkdtemp(join(tmpdir(), "scriptc-tu-probe-"));
+    try {
+      const snapshot = join(probeDir, "program.c");
+      await writeFile(snapshot, sourceBytes);
+      const result = await execFileAsync(
+        compiler,
+        [
+          ...driver.argv.slice(1),
+          // The real source directory is searched before every caller-supplied
+          // -iquote/-I directory. Put its surrogate first to preserve that
+          // precedence after moving the keyed bytes into the probe directory.
+          "-iquote",
+          dirname(resolve(sourcePath)),
+          ...cflags,
+          `-ffile-prefix-map=${snapshot}=${sourcePath}`,
+          "-M",
+          snapshot,
+        ],
+        { cwd: probeDir, maxBuffer: 16 * 1024 * 1024 },
+      );
+      const ownPaths = new Set([resolve(snapshot), resolve(sourcePath)]);
+      const dependencies = parseMakeDependencies(result.stdout, probeDir).filter(
+        (path) => !ownPaths.has(path),
+      );
+      probe = {
+        compilerIdentity,
+        dependencies,
+        dependencyFingerprint: await fingerprintDependencyFiles(dependencies),
+      };
+    } finally {
+      await rm(probeDir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
+  return createHash("sha256")
+    .update("translation-unit-dependencies-v1\0")
+    .update(environmentFingerprint)
+    .update("\0")
+    .update(probe.compilerIdentity)
+    .update("\0")
+    .update(probe.dependencies.join("\x1f"))
+    .update("\0")
+    .update(probe.dependencyFingerprint)
+    .digest("hex");
+}
+
+const stableTranslationUnitDependencyMemos = new Map<string, Promise<string>>();
+function translationUnitDependencyFingerprint(
+  driver: Pick<CcDriver, "argv">,
+  cflags: readonly string[],
+  sourcePath: string,
+  sourceBytes: Buffer,
+  environmentFingerprint: string,
+): Promise<string> {
+  const key = createHash("sha256")
+    .update(environmentFingerprint)
+    .update("\0")
+    .update(driver.argv.join("\x1f"))
+    .update("\0")
+    .update(cflags.join("\x1f"))
+    .update("\0")
+    .update(sourcePath)
+    .update("\0")
+    .update(resolve(sourcePath))
+    .update("\0")
+    .update(sourceBytes)
+    .digest("hex");
+  return stableTestMemo(stableTranslationUnitDependencyMemos, key, () =>
+    translationUnitDependencyFingerprintFresh(
+      driver,
+      cflags,
+      sourcePath,
+      sourceBytes,
+      environmentFingerprint,
+    ),
+  );
+}
+
+/** Identity of implicit compiler inputs that do not appear in buildArgs:
+ * default SDK/system headers and the assembler/linker selected by the driver.
+ * Small preprocessor dependency probes include every header spelling used by
+ * the runtime when it is available for the selected target (and therefore the
+ * vendored headers those TUs consume), then hash the exact dependency bytes.
+ * Vendored source snapshots remain keyed by their version pins. When the
+ * compiler is available, dependency discovery runs afresh so an SDK/config
+ * change that redirects includes cannot hide behind an unchanged old path
+ * list. Dependency discovery must succeed on every cache-enabled invocation;
+ * a prior path list cannot reveal a new higher-priority header. */
+async function implicitToolchainFingerprintFresh(
+  driver: Pick<CcDriver, "argv" | "targetArgs" | "target">,
+  environmentFingerprint: string,
+): Promise<string> {
+  let probe: ImplicitToolchainProbe;
+  const compiler = driver.argv[0] ?? "clang";
+  const compilerIdentity = await resolvedToolIdentity(compiler);
+  if (compilerIdentity === null) {
+    throw new Error("compiler unavailable before implicit toolchain identity was established");
+  }
+  {
+    const probeDir = await mkdtemp(join(tmpdir(), "scriptc-toolchain-probe-"));
+    try {
+      const dependencyIncludes = await implicitDependencyProbeIncludes(runtimeSrcDir());
+      // Clang's GNU cpuid.h and Windows intrin.h both define `__cpuid` with
+      // incompatible signatures. Real TUs select only one context; preserve
+      // that isolation while still discovering both targets' dependency sets.
+      const sourceGroups = [
+        dependencyIncludes.filter((include) => include !== "<intrin.h>"),
+        dependencyIncludes.filter((include) => include === "<intrin.h>"),
+      ].filter((group) => group.length > 0);
+      const sources = sourceGroups.map((_, index) => join(probeDir, `empty-${index}.c`));
+      const driverSource = join(probeDir, "driver-empty.c");
+      const driverOutput = join(probeDir, "driver-output.o");
+      await Promise.all([
+        ...sources.map((source, index) =>
+          writeFile(source, sourceGroups[index]!.map(implicitDependencyIncludeDirective).join("")),
+        ),
+        writeFile(driverSource, "int scriptc_driver_probe;\n"),
+      ]);
+      const prefix = [...driver.argv.slice(1), ...driver.targetArgs];
+      const probeArgs = [
+        ...prefix,
+        "-std=c11",
+        "-D_GNU_SOURCE",
+        "-D_XOPEN_SOURCE=700",
+        "-I", runtimeSrcDir(),
+        "-I", vendorEngineDir(),
+        "-I", join(vendorTlsDir(), "include"),
+        "-I", join(vendorTlsDir(), "library"),
+        "-I", vendorZlibDir(),
+        "-I", join(vendorCurlDir(), "include"),
+        "-M",
+      ];
+      const [dependencyResults, linker, assembler, compilerInvocation] = await Promise.all([
+        Promise.all(
+          sources.map((source) =>
+            execFileAsync(compiler, [...probeArgs, source], {
+              cwd: probeDir,
+              maxBuffer: 16 * 1024 * 1024,
+            }),
+          ),
+        ),
+        execFileAsync(compiler, [...prefix, "-print-prog-name=ld"], { cwd: probeDir }),
+        execFileAsync(compiler, [...prefix, "-print-prog-name=as"], { cwd: probeDir }),
+        // `-###` exposes the effective cc1 invocation after compiler-driver
+        // config and ordinary wrappers have injected their implicit flags. A
+        // wrapper can read environment variables unknown to scriptc; hashing
+        // this trace keeps those flags from hiding behind an unchanged wrapper
+        // executable/version and dependency set.
+        execFileAsync(
+          compiler,
+          [...prefix, "-std=c11", "-###", "-c", driverSource, "-o", driverOutput],
+          { cwd: probeDir, maxBuffer: 16 * 1024 * 1024 },
+        ),
+      ]);
+      const toolSpellings = [linker.stdout.trim(), assembler.stdout.trim()].filter(
+        (value, index, all) => value !== "" && all.indexOf(value) === index,
+      );
+      const sourceSet = new Set(sources);
+      const dependencyPaths = [
+        ...new Set(
+          dependencyResults
+            .flatMap((dependencies) => parseMakeDependencies(dependencies.stdout))
+            .filter((path) => !sourceSet.has(path)),
+        ),
+      ].sort();
+      probe = {
+        compilerIdentity: compilerIdentity ?? `<unresolved>\0${compiler}`,
+        compilerInvocation: normalizedProbeInvocation(compilerInvocation, probeDir),
+        dependencies: dependencyPaths,
+        dependencyFingerprint: await fingerprintDependencyFiles(dependencyPaths),
+        tools: await Promise.all(
+          toolSpellings.map(async (spelling) => ({
+            spelling,
+            identity: await resolvedToolIdentity(spelling),
+          })),
+        ),
+      };
+    } finally {
+      await rm(probeDir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
+  const hash = createHash("sha256")
+    .update("implicit-toolchain-v2\0")
+    .update(environmentFingerprint)
+    .update("\0")
+    .update(probe.compilerIdentity)
+    .update("\0")
+    .update(probe.compilerInvocation)
+    .update("\0")
+    .update(driver.argv.join("\x1f"))
+    .update("\0")
+    .update(driver.targetArgs.join("\x1f"))
+    .update("\0")
+    .update(probe.dependencies.join("\x1f"))
+    .update("\0")
+    .update(probe.dependencyFingerprint)
+    .update("\0");
+  for (const tool of probe.tools) {
+    const currentIdentity = await resolvedToolIdentity(tool.spelling);
+    hash
+      .update(tool.spelling)
+      .update("\0")
+      .update(currentIdentity ?? tool.identity ?? "<unresolved>")
+      .update("\0");
+  }
+  return hash.digest("hex");
+}
+
+const stableImplicitToolchainMemos = new Map<string, Promise<string>>();
+function implicitToolchainFingerprint(
+  driver: Pick<CcDriver, "argv" | "targetArgs" | "target">,
+  environmentFingerprint: string,
+): Promise<string> {
+  const key = [
+    environmentFingerprint,
+    driver.argv.join("\x1f"),
+    driver.target ?? "<native>",
+    driver.targetArgs.join("\x1f"),
+    runtimeSrcDir(),
+  ].join("\0");
+  return stableTestMemo(stableImplicitToolchainMemos, key, () =>
+    implicitToolchainFingerprintFresh(driver, environmentFingerprint),
+  );
+}
+
+function linkTraceCandidate(line: string): string[] {
+  const trimmed = line.trim().replace(/^(?:LOAD|load)\s+/, "");
+  if (trimmed === "") return [];
+  const unquoted =
+    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+      ? trimmed.slice(1, -1)
+      : trimmed;
+  const candidates = [unquoted];
+  const member = unquoted.lastIndexOf("(");
+  if (member > 0 && unquoted.endsWith(")")) candidates.push(unquoted.slice(0, member));
+  return candidates;
+}
+
+function driverTraceCandidates(line: string): string[] {
+  const candidates: string[] = [];
+  for (const match of line.matchAll(/"((?:\\.|[^"\\])*)"|'([^']*)'|(\S+)/g)) {
+    const token = (match[1] ?? match[2] ?? match[3] ?? "").replace(/\\(["\\])/g, "$1");
+    if (token !== "") candidates.push(token);
+  }
+  return candidates;
+}
+
+export async function parseLinkTraceFiles(
+  output: string,
+  cwd: string,
+  excludedRoot: string,
+  driverDryRun: boolean = false,
+): Promise<string[]> {
+  const files = new Set<string>();
+  for (const line of output.split(/\r?\n/)) {
+    const candidates = driverDryRun ? driverTraceCandidates(line) : linkTraceCandidate(line);
+    for (const candidate of candidates) {
+      const path = isAbsolute(candidate) ? candidate : resolve(cwd, candidate);
+      if (path === excludedRoot || path.startsWith(`${excludedRoot}/`) || path.startsWith(`${excludedRoot}\\`)) {
+        continue;
+      }
+      const info = await stat(path).catch(() => null);
+      if (info?.isFile()) {
+        files.add(path);
+        // Traditional `-Wl,-t` output has one dependency per line, while
+        // Zig's COFF `-###` fallback prints the entire lld-link argv on one
+        // line. Keep scanning every dry-run token so CRT/import/runtime
+        // libraries after the first path also join the fingerprint.
+        if (!driverDryRun) break;
+      }
+    }
+  }
+  return [...files].sort();
+}
+
+/** Exact files selected by the compiler driver's implicit link. A tiny
+ * target object plus the linker's trace mode resolves CRT objects, compiler
+ * runtimes, linker scripts, SDK stubs/import libraries, and every ambient
+ * default library without guessing platform search layouts. The caller adds
+ * build-flavor flags such as ASan and scriptc's own fixed `-l` arguments.
+ * Every cache-enabled invocation performs a fresh trace; a prior resolved path
+ * list cannot reveal a newly selected higher-priority linker input. */
+async function implicitLinkerFingerprintFresh(
+  driver: Pick<CcDriver, "argv" | "targetArgs" | "target">,
+  environmentFingerprint: string,
+  linkArgs: readonly string[],
+  effectiveInvocationArgs?: readonly string[],
+  traceInvocationArgs?: readonly string[],
+): Promise<string> {
+  const invocationArgs =
+    effectiveInvocationArgs ?? [...driver.targetArgs, ...linkArgs];
+  const traceArgs = traceInvocationArgs ?? [...driver.targetArgs, ...linkArgs];
+  const compiler = driver.argv[0] ?? "clang";
+  const compilerIdentity = await resolvedToolIdentity(compiler);
+  if (compilerIdentity === null) {
+    throw new Error("compiler unavailable before implicit linker identity was established");
+  }
+  let probe: ImplicitLinkerProbe;
+  {
+    const probeDir = await mkdtemp(join(tmpdir(), "scriptc-linker-probe-"));
+    try {
+      const source = join(probeDir, "empty.c");
+      const object = join(probeDir, "empty.o");
+      const output = join(probeDir, process.platform === "win32" ? "empty.exe" : "empty");
+      await writeFile(source, "int main(void) { return 0; }\n");
+      const prefix = [...driver.argv.slice(1), ...driver.targetArgs];
+      const [, linker] = await Promise.all([
+        execFileAsync(
+          compiler,
+          [...prefix, "-std=c11", "-c", source, "-o", object],
+          { cwd: probeDir },
+        ),
+        execFileAsync(
+          compiler,
+          [...prefix, "-print-prog-name=ld"],
+          { cwd: probeDir },
+        ),
+      ]);
+      // Unlike the compile-only toolchain trace, this exposes options a
+      // compiler wrapper/config injects only for link invocations (rpaths,
+      // subsystem/stack settings, --defsym, and peers). Resolved input files
+      // alone cannot represent those output-affecting flags.
+      const driverInvocation = await execFileAsync(
+        compiler,
+        [...driver.argv.slice(1), ...invocationArgs, object, "-###", "-o", output],
+        { cwd: probeDir, maxBuffer: 32 * 1024 * 1024 },
+      );
+      // The dry run exposes absolute files a wrapper injects for this exact
+      // build flavor. Its unresolved -l spellings are supplemented by the
+      // real trace below, which runs with the same flavor flags but omits
+      // not-yet-materialized scriptc-owned vendor prerequisites.
+      const driverDependencies = await parseLinkTraceFiles(
+        `${driverInvocation.stdout}\n${driverInvocation.stderr}`,
+        probeDir,
+        probeDir,
+        true,
+      );
+      let tracedDependencies: string[] = [];
+      try {
+        const trace = await execFileAsync(
+          compiler,
+          [...driver.argv.slice(1), ...traceArgs, object, "-Wl,-t", "-o", output],
+          { cwd: probeDir, maxBuffer: 32 * 1024 * 1024 },
+        );
+        tracedDependencies = await parseLinkTraceFiles(
+          `${trace.stdout}\n${trace.stderr}`,
+          probeDir,
+          probeDir,
+        );
+      } catch (error) {
+        // Zig's COFF linker deliberately rejects GNU ld's `-t`, but `zig cc
+        // -###` prints its fully resolved lld-link input list (CRT and every
+        // import/compiler-runtime library as absolute cache paths). Other
+        // drivers' dry runs commonly leave `-lc`/`-lSystem` unresolved, so
+        // they must not use this fallback as a complete artifact identity.
+        if (driver.argv[0] !== "zig" || driver.argv[1] !== "cc") throw error;
+      }
+      const dependencies = [...new Set([...driverDependencies, ...tracedDependencies])].sort();
+      if (dependencies.length === 0) {
+        throw new Error("linker trace reported no resolved input files");
+      }
+      const linkerSpelling = linker.stdout.trim();
+      probe = {
+        compilerIdentity,
+        linkerInvocation: normalizedProbeInvocation(driverInvocation, probeDir),
+        dependencies,
+        dependencyFingerprint: await fingerprintDependencyFiles(dependencies),
+        linker: {
+          spelling: linkerSpelling,
+          identity: linkerSpelling === "" ? null : await resolvedToolIdentity(linkerSpelling),
+        },
+      };
+    } finally {
+      await rm(probeDir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
+  const linkerIdentity =
+    probe.linker.spelling === ""
+      ? null
+      : await resolvedToolIdentity(probe.linker.spelling);
+  return createHash("sha256")
+    .update("implicit-linker-v3\0")
+    .update(environmentFingerprint)
+    .update("\0")
+    .update(probe.compilerIdentity)
+    .update("\0")
+    .update(probe.linkerInvocation)
+    .update("\0")
+    .update(driver.argv.join("\x1f"))
+    .update("\0")
+    .update(driver.targetArgs.join("\x1f"))
+    .update("\0")
+    .update(linkArgs.join("\x1f"))
+    .update("\0")
+    .update(invocationArgs.join("\x1f"))
+    .update("\0")
+    .update(traceArgs.join("\x1f"))
+    .update("\0")
+    .update(probe.dependencies.join("\x1f"))
+    .update("\0")
+    .update(probe.dependencyFingerprint)
+    .update("\0")
+    .update(probe.linker.spelling)
+    .update("\0")
+    .update(linkerIdentity ?? probe.linker.identity ?? "<unresolved>")
+    .digest("hex");
+}
+
+const stableImplicitLinkerMemos = new Map<string, Promise<string>>();
+function implicitLinkerFingerprint(
+  driver: Pick<CcDriver, "argv" | "targetArgs" | "target">,
+  environmentFingerprint: string,
+  linkArgs: readonly string[],
+  effectiveInvocationArgs?: readonly string[],
+  traceInvocationArgs?: readonly string[],
+): Promise<string> {
+  const invocationArgs = effectiveInvocationArgs ?? [...driver.targetArgs, ...linkArgs];
+  const traceArgs = traceInvocationArgs ?? [...driver.targetArgs, ...linkArgs];
+  const key = [
+    environmentFingerprint,
+    driver.argv.join("\x1f"),
+    driver.target ?? "<native>",
+    driver.targetArgs.join("\x1f"),
+    linkArgs.join("\x1f"),
+    invocationArgs.join("\x1f"),
+    traceArgs.join("\x1f"),
+  ].join("\0");
+  return stableTestMemo(stableImplicitLinkerMemos, key, () =>
+    implicitLinkerFingerprintFresh(
+      driver,
+      environmentFingerprint,
+      linkArgs,
+      effectiveInvocationArgs,
+      traceInvocationArgs,
+    ),
+  );
 }
 
 let ccacheMemo: Promise<boolean> | null = null;
@@ -886,33 +2577,135 @@ function ccacheAvailable(): Promise<boolean> {
   return ccacheMemo;
 }
 
-/** Content hash of every .c/.h in the runtime src dir plus the vendor pin —
+/** Content hash of every .c/.h in the runtime src dir, the Ryū sources
+ * textually included by scr_number.c, and the separately-built vendor pins —
  * everything a binary links that the emitted C bytes don't already cover
- * (npm-embedded C rides inside the emitted C; the engine archive and lre
- * objects are pinned by QJS_COMMIT, the same trust their own caches use).
- * Memoized behind a stat signature so watch-mode edits re-hash. */
-let rtFingerprintMemo: { sig: string; hash: string } | null = null;
-async function runtimeFingerprint(rtDir: string): Promise<string> {
-  const names = (await readdir(rtDir)).filter((n) => n.endsWith(".c") || n.endsWith(".h")).sort();
-  const stats = await Promise.all(names.map((n) => stat(join(rtDir, n))));
-  const sig = stats.map((s, i) => `${names[i] ?? ""}:${s.size}:${s.mtimeMs}`).join("|");
-  if (rtFingerprintMemo !== null && rtFingerprintMemo.sig === sig) return rtFingerprintMemo.hash;
+ * (npm-embedded C rides inside the emitted C; the engine and standalone
+ * vendor archives are pinned by their version constants). The small source
+ * tree is hashed on every identity calculation: a stat-only memo can miss a
+ * same-size edit whose timestamp was preserved by a copy/sync tool. */
+async function runtimeFingerprintFresh(rtDir: string): Promise<string> {
+  const groups = await Promise.all(
+    [
+      { label: "runtime", dir: rtDir },
+      { label: "ryu", dir: join(rtDir, "..", "vendor", "ryu") },
+    ].map(async (group) => {
+      const names = (await readdir(group.dir)).filter((n) => n.endsWith(".c") || n.endsWith(".h")).sort();
+      return { ...group, names };
+    }),
+  );
   const h = createHash("sha256").update(QJS_COMMIT).update(MBEDTLS_VERSION).update(ZLIB_VERSION);
-  for (const n of names) h.update(n).update("\0").update(await readFile(join(rtDir, n))).update("\0");
-  const hash = h.digest("hex");
-  rtFingerprintMemo = { sig, hash };
-  return hash;
+  for (const group of groups) {
+    for (const n of group.names) {
+      h.update(group.label).update("/").update(n).update("\0").update(await readFile(join(group.dir, n))).update("\0");
+    }
+  }
+  return h.digest("hex");
+}
+
+const stableRuntimeFingerprintMemos = new Map<string, Promise<string>>();
+export function runtimeFingerprint(rtDir: string): Promise<string> {
+  const key = resolve(rtDir);
+  return stableTestMemo(stableRuntimeFingerprintMemos, key, () => runtimeFingerprintFresh(rtDir));
+}
+
+class CacheInputsChangedError extends Error {
+  constructor() {
+    super("runtime inputs changed while populating the native object cache");
+    this.name = "CacheInputsChangedError";
+  }
+}
+
+function cacheDigestPath(path: string): string {
+  return `${path}.sha256`;
+}
+
+async function fileDigest(path: string): Promise<string> {
+  return createHash("sha256").update(await readFile(path)).digest("hex");
+}
+
+/** Cache entries are disposable data, not trusted compiler output. Atomic
+ * rename prevents ordinary partial writes, while the adjacent digest catches
+ * disk damage, manual truncation, and entries left by an interrupted/older
+ * publisher before they reach clang, the linker, or `ar`. */
+async function validCachedFile(object: string): Promise<boolean> {
+  try {
+    const digestPath = cacheDigestPath(object);
+    const expected = (await readFile(digestPath, "utf8")).trim();
+    const valid = /^[0-9a-f]{64}$/.test(expected) && (await fileDigest(object)) === expected;
+    if (valid) {
+      const now = new Date();
+      await Promise.all([
+        utimes(object, now, now).catch(() => undefined),
+        utimes(digestPath, now, now).catch(() => undefined),
+      ]);
+    }
+    return valid;
+  } catch {
+    return false;
+  }
+}
+
+/** Copy a cache entry and verify the private copy before it can become a
+ * caller-visible artifact. Verifying after the copy closes the gap between a
+ * source-side digest check and a concurrent replacement/truncation. */
+async function copyValidCachedFile(source: string, destination: string): Promise<boolean> {
+  try {
+    const digestPath = cacheDigestPath(source);
+    const expected = (await readFile(digestPath, "utf8")).trim();
+    if (!/^[0-9a-f]{64}$/.test(expected)) return false;
+    await copyFile(source, destination);
+    if ((await fileDigest(destination)) !== expected) {
+      await rm(destination, { force: true }).catch(() => undefined);
+      return false;
+    }
+    const now = new Date();
+    await Promise.all([
+      utimes(source, now, now).catch(() => undefined),
+      utimes(digestPath, now, now).catch(() => undefined),
+    ]);
+    return true;
+  } catch {
+    await rm(destination, { force: true }).catch(() => undefined);
+    return false;
+  }
+}
+
+/** Publish a complete executable/archive and its digest through private names.
+ * Data is installed before its verifier, so a racing reader can only observe
+ * an invalid/missing digest and take the fresh-build path. */
+async function publishCachedFile(source: string, destination: string): Promise<void> {
+  const directory = dirname(destination);
+  await mkdir(directory, { recursive: true });
+  const nonce = `${process.pid}-${Math.random().toString(36).slice(2)}`;
+  const tmp = join(directory, `.tmp-${basename(destination).slice(0, 8)}-${nonce}`);
+  const tmpDigest = `${tmp}.sha256`;
+  try {
+    await copyFile(source, tmp);
+    await chmod(tmp, 0o600);
+    await writeFile(tmpDigest, `${await fileDigest(tmp)}\n`, { mode: 0o600 });
+    await rename(tmp, destination);
+    await rename(tmpDigest, cacheDigestPath(destination));
+  } finally {
+    await Promise.all([
+      rm(tmp, { force: true }).catch(() => undefined),
+      rm(tmpDigest, { force: true }).catch(() => undefined),
+    ]);
+  }
 }
 
 /** The cached .o set for one flag flavor, compiled on first need. Concurrent
  * first builds (parallel test workers on a cold cache) may duplicate work;
- * per-file atomic renames make every winner equivalent. */
+ * per-file atomic renames make every winner equivalent. Publication is held
+ * until verifyInputs confirms that the source/header fingerprint used by the
+ * key still describes the bytes clang just read. */
 async function ensureRuntimeObjects(
   root: string,
   ccArgv: string[],
   cflags: string[],
   sources: string[],
   keyPrefix: string,
+  verifyInputs: () => Promise<boolean>,
 ): Promise<Map<string, string>> {
   const setKey = createHash("sha256")
     .update(keyPrefix)
@@ -921,15 +2714,20 @@ async function ensureRuntimeObjects(
     .slice(0, 24);
   const objDir = join(root, "obj", setKey);
   const objOf = (src: string): string => join(objDir, `${basename(src, ".c")}.o`);
-  const present = await Promise.all(sources.map((s) => fileExists(objOf(s))));
+  const present = await Promise.all(sources.map((s) => validCachedFile(objOf(s))));
   const missing = sources.filter((_, i) => !present[i]);
   if (missing.length > 0) {
     // ccache wraps only the default clang driver — multi-word drivers
     // (`zig cc`) run bare; their object sets are keyed apart anyway.
-    const useCcache = ccArgv.length === 1 && ccArgv[0] === "clang" && (await ccacheAvailable());
+    const useCcache =
+      process.env["SCRIPTC_TEST_DISABLE_CCACHE"] !== "1" &&
+      ccArgv.length === 1 &&
+      ccArgv[0] === "clang" &&
+      (await ccacheAvailable());
     await mkdir(objDir, { recursive: true });
     const tmpDir = await mkdtemp(join(root, "obj", "build-"));
     try {
+      const compiled = new Map<string, { object: string; digest: string }>();
       // Modest parallelism: a flavor's objects build once, but several cold
       // workers can race here — keep each build's CPU footprint small.
       const width = 4;
@@ -939,25 +2737,78 @@ async function ensureRuntimeObjects(
             const tmpObj = join(tmpDir, `${basename(src, ".c")}.o`);
             const argv = [...(useCcache ? ["ccache"] : []), ...ccArgv, ...cflags, "-c", src, "-o", tmpObj];
             await execFileAsync(argv[0] ?? "clang", argv.slice(1));
-            await rename(tmpObj, objOf(src));
+            compiled.set(src, { object: tmpObj, digest: await fileDigest(tmpObj) });
           }),
         );
+      }
+      // The fingerprint was computed before these subprocesses started. Do
+      // not place their outputs under that key if a checkout/package update
+      // changed any runtime source or included header while clang was reading.
+      if (!(await verifyInputs())) throw new CacheInputsChangedError();
+      for (const [src, built] of compiled) {
+        const destination = objOf(src);
+        const tmpDigest = `${built.object}.sha256`;
+        await writeFile(tmpDigest, `${built.digest}\n`);
+        // Publish data first and its verifier second. A concurrent reader in
+        // the tiny gap sees a missing/mismatched digest and falls back safely.
+        await rename(built.object, destination);
+        await rename(tmpDigest, cacheDigestPath(destination));
       }
     } finally {
       await rm(tmpDir, { recursive: true, force: true });
     }
   }
-  return new Map(sources.map((s) => [s, objOf(s)]));
+  if (!(await verifyInputs())) throw new CacheInputsChangedError();
+  const objects = new Map(sources.map((s) => [s, objOf(s)]));
+  if (!(await Promise.all([...objects.values()].map(validCachedFile))).every(Boolean)) {
+    throw new Error("native object cache integrity check failed");
+  }
+  return objects;
 }
 
-/** Size-capped LRU sweep of the whole cache root, at most once per process
- * and only after a write. Oldest-mtime files go first until the tree is back
- * under 75% of the cap; read hits bump mtimes so hot entries survive. */
-let pruneDone = false;
+/** Give one active link/archive operation private names for its cached
+ * runtime objects. A hard link keeps the inode alive if another process's LRU
+ * sweep unlinks the cache entry; filesystems that cannot hard-link across the
+ * cache/tmp boundary fall back to a copy. If eviction wins before staging,
+ * the caller catches the read failure and performs a fully fresh compile. */
+export async function stageRuntimeObjects(
+  objects: ReadonlyMap<string, string>,
+  stageDir: string,
+): Promise<Map<string, string>> {
+  await mkdir(stageDir, { recursive: true });
+  const now = new Date();
+  const staged = await Promise.all(
+    [...objects].map(async ([source, object]) => {
+      const destination = join(stageDir, basename(object));
+      try {
+        await link(object, destination);
+      } catch {
+        await copyFile(object, destination);
+      }
+      // Object files participate in the same mtime-based LRU as complete
+      // artifacts. A successful stage is a cache read, so promote the source
+      // name best-effort (it may have raced an eviction after the hard link).
+      await utimes(object, now, now).catch(() => undefined);
+      return [source, destination] as const;
+    }),
+  );
+  return new Map(staged);
+}
+
+/** Size-capped LRU sweep of the whole cache root. A caller-configured cap is
+ * enforced after every successful cache write. The 4 GiB default is checked on
+ * the first and every 64th write in a long-lived process: a full tree walk per
+ * corpus program would otherwise become quadratic as the cache grows. Oldest-
+ * mtime files go first until the tree is back under 75% of the cap; reads bump
+ * mtimes. Active links use private staged names/hard links, so cache names can
+ * be unlinked safely. */
+const rootWriteCounts = new Map<string, number>();
 async function pruneCache(root: string): Promise<void> {
-  if (pruneDone) return;
-  pruneDone = true;
-  const capBytes = Number(process.env["SCRIPTC_CACHE_MAX_MB"] ?? "4096") * 1024 * 1024;
+  const configuredCap = process.env["SCRIPTC_CACHE_MAX_MB"];
+  const writes = (rootWriteCounts.get(root) ?? 0) + 1;
+  rootWriteCounts.set(root, writes);
+  if (configuredCap === undefined && writes !== 1 && writes % 64 !== 0) return;
+  const capBytes = Number(configuredCap ?? "4096") * 1024 * 1024;
   if (!Number.isFinite(capBytes) || capBytes <= 0) return;
   const files: { path: string; size: number; mtimeMs: number }[] = [];
   const walk = async (dir: string): Promise<void> => {
@@ -975,29 +2826,34 @@ async function pruneCache(root: string): Promise<void> {
   let total = files.reduce((n, f) => n + f.size, 0);
   if (total <= capBytes) return;
   files.sort((a, b) => a.mtimeMs - b.mtimeMs);
-  const recent = Date.now() - 60 * 60 * 1000; // never evict anything a live run may be using
   for (const f of files) {
-    if (total <= capBytes * 0.75 || f.mtimeMs > recent) break;
-    await unlink(f.path).catch(() => undefined);
-    total -= f.size;
+    if (total <= capBytes * 0.75) break;
+    try {
+      await unlink(f.path);
+      total -= f.size;
+    } catch {
+      // A concurrent reader/publisher may already have moved the name.
+    }
   }
 }
 
 /** Compiles one C program together with the runtime sources.
- * Without a cache dir (the production default), the runtime (a dozen small
- * files) is recompiled on every build in one historical clang invocation —
- * no cached-archive staleness bugs. --dynamic additionally compiles
+ * With caching disabled, the runtime (a dozen small files) is recompiled on
+ * every build in one historical clang invocation — no cached-archive
+ * staleness bugs. --dynamic additionally compiles
  * scr_island.c under SCR_DYNAMIC and links the cached engine archive (built
  * lazily, see above); regex-using programs additionally compile scr_regex.c
  * and link libregexp (the cached objects, or the archive's own copy under
  * --dynamic). Without either, the command line is exactly the historical
  * one — regex-free static builds must stay byte-identical.
  *
- * With SCRIPTC_CACHE_DIR set (the test lanes; see the cache block above),
- * unchanged programs skip clang via the binary cache, and misses link the
- * program's own TU against cached per-flavor runtime objects. */
+ * With a caller-supplied dependency identity and an enabled cache root,
+ * unchanged programs skip payload code generation/linking via the binary
+ * cache after lightweight metadata probes, and misses link the program's own
+ * TU against cached per-flavor runtime objects. */
 export async function compileC(opts: CcOptions): Promise<void> {
   const rtDir = runtimeSrcDir();
+  const sanitize = opts.sanitize ?? false;
   const dynamic = opts.dynamic ?? false;
   const regex = opts.regex ?? false;
   // fetch's implementation switch: the default is the NATIVE bridge
@@ -1007,7 +2863,11 @@ export async function compileC(opts: CcOptions): Promise<void> {
   // (scr_fetch_curl.c + system libcurl / the linux soname stub)
   // compilable for one release as the flip's reference.
   const fetchOn = opts.fetch ?? false;
-  const curlFetch = fetchOn && process.env["SCRIPTC_FETCH_CURL"] === "1";
+  // The retired curl bridge has only a SCR_DYNAMIC implementation.
+  // Static fetch always keeps the native runtime even when a developer
+  // has the comparison switch exported in their shell.
+  const curlFetch =
+    dynamic && fetchOn && process.env["SCRIPTC_FETCH_CURL"] === "1";
   const nativeFetch = fetchOn && !curlFetch;
   // The island's node:http/https client bridge: embedded graphs that
   // import those builtins get working clients over the same socket units
@@ -1053,30 +2913,116 @@ export async function compileC(opts: CcOptions): Promise<void> {
       );
     }
   }
-  const engineArchive = dynamic ? await ensureEngineArchive(opts.sanitize ?? false, driver) : null;
-  const tlsArchive = tls ? await ensureTlsArchive(opts.sanitize ?? false, driver) : null;
+  const cachePolicy = toolchainEnvironmentCachePolicy();
+  const configuredCacheRoot = cacheRootDir();
+  const toolchainEnv = toolchainEnvironmentFingerprint();
+  const persistentDriverCache =
+    cachePolicy.runtimeObjects &&
+    configuredCacheRoot !== null &&
+    await compilerDriverSupportsPersistentCache(driver, toolchainEnv);
+  // Only compiler-generated TUs opt in. Arbitrary `compileC` / `--from-c`
+  // inputs may include caller-owned headers whose contents are not otherwise
+  // represented in this key, so they retain the fully uncached historical
+  // path unless the caller supplies its own complete dependency identity.
+  let root =
+    opts.cacheIdentity === undefined || !persistentDriverCache
+      ? null
+      : configuredCacheRoot;
+  if (root !== null) {
+    try {
+      await ensurePrivateCacheRoot(
+        root,
+        process.env["SCRIPTC_CACHE_DIR"] === undefined,
+      );
+    } catch {
+      root = null;
+    }
+  }
+  let implicitToolchain: string | null = null;
+  if (persistentDriverCache) {
+    try {
+      implicitToolchain = await implicitToolchainFingerprint(driver, toolchainEnv);
+    } catch {
+      // Cache discovery is best-effort. In particular, a compiler wrapper can
+      // compile successfully without implementing the metadata probes.
+      root = null;
+    }
+  }
+  const vendorBuildIdentity = await currentVendorCacheBuildIdentity(
+    driver,
+    `${toolchainEnv}\0${implicitToolchain ?? "<uncached>"}`,
+  );
+  // Mutable include/SDK/config inputs can change behind a stable environment
+  // spelling. The complete/runtime cache is disabled below; vendor objects
+  // must follow the same rule instead of silently surviving in package-local
+  // .cache. A private root gives this invocation the usual vendor build recipe
+  // without publishing or reusing those prerequisites.
+  const transientVendorRoot = persistentDriverCache && implicitToolchain !== null
+    ? null
+    : join(
+        tmpdir(),
+        `scriptc-vendor-${process.pid}-${Math.random().toString(36).slice(2)}`,
+      );
+  const vendorCacheRoot = transientVendorRoot ?? vendorBuildCacheRoot();
+  // Every vendor output path is deterministic from pins, flags, driver, and
+  // target. Build the command/key from those paths now, but do not materialize
+  // them until a complete-binary lookup has missed.
+  const engineArchive = dynamic
+    ? engineArchivePath(sanitize, driver, vendorBuildIdentity, vendorCacheRoot)
+    : null;
+  const tlsArchive = tls
+    ? tlsArchivePath(sanitize, driver, vendorBuildIdentity, vendorCacheRoot)
+    : null;
   // --dynamic + regex shares the archive's libregexp (its host hooks and
   // ours would collide; see scr_regex.c) — the standalone objects are for
   // static builds only.
-  const lreObjects = regex && !dynamic ? await ensureLreObjects(opts.sanitize ?? false, driver) : [];
+  const lreObjects = regex && !dynamic
+    ? lreObjectPaths(sanitize, driver, vendorBuildIdentity, vendorCacheRoot)
+    : [];
   // Vendored zlib is the CROSS story only — host builds keep the exact
   // historical `-lz` system link (see CcOptions.zlib). The native fetch's
   // gzip decoder rides the same objects/link.
   const zlibObjects =
     ((opts.zlib ?? false) || nativeFetch) && driver.target !== null
-      ? await ensureZlibObjects(opts.sanitize ?? false, driver)
+      ? zlibObjectPaths(sanitize, driver, vendorBuildIdentity, vendorCacheRoot)
       : [];
   // The libcurl import stub is likewise CROSS-only — host builds keep the
   // exact historical system `-lcurl` link (see CcOptions.fetch). Curl
   // reference builds only.
   const curlStubDir =
-    curlFetch && driver.target !== null ? await ensureCurlStub(driver) : null;
+    curlFetch && driver.target !== null
+      ? curlStubDirPath(driver, vendorBuildIdentity, vendorCacheRoot)
+      : null;
+  const materializeVendorPrerequisites = async (): Promise<void> => {
+    // Preserve the historical order to avoid multiplying first-build resource
+    // pressure when several large vendor sets are cold simultaneously.
+    if (dynamic) {
+      await ensureEngineArchive(sanitize, driver, vendorBuildIdentity, vendorCacheRoot);
+    }
+    if (tls) await ensureTlsArchive(sanitize, driver, vendorBuildIdentity, vendorCacheRoot);
+    if (regex && !dynamic) {
+      await ensureLreObjects(sanitize, driver, vendorBuildIdentity, vendorCacheRoot);
+    }
+    if (zlibObjects.length > 0) {
+      await ensureZlibObjects(sanitize, driver, vendorBuildIdentity, vendorCacheRoot);
+    }
+    if (curlStubDir !== null) {
+      await ensureCurlStub(driver, vendorBuildIdentity, vendorCacheRoot);
+    }
+  };
   // rt() maps each runtime source's path on the command line: identity for
   // the historical single invocation, cached-.o substitution on cache misses.
-  const buildArgs = (rt: (path: string) => string): string[] => [
+  const buildArgs = (
+    rt: (path: string) => string,
+    build: {
+      programPath?: string;
+      outPath?: string;
+      compilerVisibleSource?: string;
+    } = {},
+  ): string[] => [
     "-std=c11",
     ...driver.targetArgs,
-    ...(opts.sanitize
+    ...(sanitize
       ? ["-O1", "-fsanitize=address", "-DSCR_RC_AUDIT"]
       : ["-O2"]),
     "-fno-math-errno",
@@ -1095,6 +3041,7 @@ export async function compileC(opts: CcOptions): Promise<void> {
     "-Wno-deprecated-declarations", // ucontext fibers (scr_async.c)
     "-I", rtDir,
     ...RUNTIME_SOURCES.map((f) => rt(join(rtDir, f))),
+    ...(opts.copying ? [rt(join(rtDir, "scr_copying.c"))] : []),
     // win32 targets compile the libc-shim TU (stpcpy, arc4random_buf,
     // gmtime_r, strcasestr — the _WIN32 block in scr_runtime.h declares
     // them) and link advapi32 (the CSPRNG RtlGenRandom/SystemFunction036,
@@ -1110,21 +3057,21 @@ export async function compileC(opts: CcOptions): Promise<void> {
       : []),
     ...(opts.assert || regex || opts.symbol ? [rt(join(rtDir, "scr_assert.c"))] : []),
     ...(opts.inspect ? [rt(join(rtDir, "scr_inspect.c"))] : []),
-    ...(opts.dynInvoke ? [rt(join(rtDir, "scr_dyn_invoke.c"))] : []),
+    ...((opts.dynInvoke || nativeFetch) ? [rt(join(rtDir, "scr_dyn_invoke.c"))] : []),
     ...(opts.dc ? [rt(join(rtDir, "scr_dc.c"))] : []),
-    ...(opts.dynAsync || opts.dynInvoke || opts.dc ? [rt(join(rtDir, "scr_async_dyn.c"))] : []),
+    ...(opts.dynAsync || opts.dynInvoke || opts.dc || nativeFetch ? [rt(join(rtDir, "scr_async_dyn.c"))] : []),
     // The zlib UNIT (scr_zlib.c) gates on zlib.* IR use; the LINK (system
     // libz on hosts, the vendored per-target objects on cross builds)
     // also serves the native fetch's gzip decoder — spread exactly once.
     ...(opts.zlib
       ? driver.target !== null
         ? ["-I", vendorZlibDir(), rt(join(rtDir, "scr_zlib.c")), ...zlibObjects]
-        : [rt(join(rtDir, "scr_zlib.c")), "-lz"]
+        : [rt(join(rtDir, "scr_zlib.c"))]
       : nativeFetch
         ? driver.target !== null
           ? ["-I", vendorZlibDir(), ...zlibObjects]
-          : ["-lz"]
-        : []),
+          : []
+      : []),
     // The zlib ↔ island bridge: only when BOTH halves are in the build
     // (the scr_inspect_island.c pattern) — the emitted main calls its
     // installer exactly then.
@@ -1172,7 +3119,11 @@ export async function compileC(opts: CcOptions): Promise<void> {
           // link line cannot change.
           ...(targetPlatform(driver) === "win32" ? ["-lbcrypt"] : []),
         ]
-      : []),
+        : []),
+    // Static fetch is the engine-free half of scr_fetch.c. Dynamic builds
+    // compile the same source beside scr_island.c below, where its
+    // SCR_DYNAMIC half installs the full web surface.
+    ...(nativeFetch && !dynamic ? [rt(join(rtDir, "scr_fetch.c"))] : []),
     ...(engineArchive
       ? [
           "-DSCR_DYNAMIC",
@@ -1224,15 +3175,52 @@ export async function compileC(opts: CcOptions): Promise<void> {
     // note about that. Never present for .c inputs, so the historical C
     // command line cannot change by a byte.
     ...(opts.cPath.endsWith(".ll") ? ["-Wno-override-module"] : []),
-    opts.cPath,
+    ...(build.compilerVisibleSource !== undefined && build.programPath !== undefined
+      ? [
+          `-ffile-prefix-map=${build.programPath}=${build.compilerVisibleSource}`,
+          "-iquote",
+          dirname(resolve(build.compilerVisibleSource)),
+        ]
+      : []),
+    build.programPath ?? opts.cPath,
     ...(opts.linkInputs ?? []),
     ...(opts.systemLibraries ?? []).map((name) => `-l${name}`),
+    // GNU ld resolves libraries from left to right and commonly enables
+    // --as-needed: host libz must follow scr_zlib.c/scr_fetch.c and every
+    // generated/native input that references inflate symbols. Cross
+    // builds use vendored zlib objects in the input section above.
+    ...(((opts.zlib ?? false) || nativeFetch) && driver.target === null
+      ? ["-lz"]
+      : []),
     // glibc keeps libm separate from libc. This must trail the generated
     // program and every native FFI input because GNU ld resolves archives
     // from left to right.
     ...driver.linkArgs,
-    "-o", opts.outPath,
+    "-o", build.outPath ?? opts.outPath,
   ];
+  // Compile-only flags shared by runtime-object population and the caller-TU
+  // dependency probe. They reproduce the option set every TU sees in the
+  // historical single clang invocation.
+  const cflags = [
+    "-std=c11",
+    ...driver.targetArgs,
+    ...(sanitize
+      ? ["-O1", "-fsanitize=address", "-DSCR_RC_AUDIT"]
+      : ["-O2"]),
+    "-fno-math-errno",
+    "-fno-strict-aliasing", // the emitted object model type-puns — see buildArgs
+    "-Wno-deprecated-declarations",
+    "-I", rtDir,
+    ...(regex || dynamic ? ["-I", vendorEngineDir()] : []),
+    ...(zlibObjects.length > 0 ? ["-I", vendorZlibDir()] : []),
+    ...(curlStubDir !== null ? ["-I", join(vendorCurlDir(), "include")] : []),
+    ...(tlsArchive !== null ? ["-I", join(vendorTlsDir(), "include")] : []),
+    ...(dynamic ? ["-DSCR_DYNAMIC"] : []),
+  ];
+  const programCompilerArgs = opts.cPath.endsWith(".ll")
+    ? [...cflags, "-Wno-override-module"]
+    : cflags;
+  const programSourceExtension = opts.cPath.endsWith(".ll") ? ".ll" : ".c";
   const ccName = driver.argv.join(" ");
   const runClang = async (args: string[]): Promise<void> => {
     try {
@@ -1255,76 +3243,201 @@ export async function compileC(opts: CcOptions): Promise<void> {
     }
   };
 
-  const root = cacheRootDir();
+  let runtimeCompilerInvocation: string | null = null;
+  let programCompilerInvocation: string | null = null;
+  if (root !== null) {
+    try {
+      runtimeCompilerInvocation = await effectiveCompilerInvocationFingerprint(
+        driver,
+        toolchainEnv,
+        cflags,
+      );
+      programCompilerInvocation = programSourceExtension === ".ll"
+        ? await effectiveCompilerInvocationFingerprint(
+            driver,
+            toolchainEnv,
+            programCompilerArgs,
+            programSourceExtension,
+          )
+        : runtimeCompilerInvocation;
+    } catch {
+      // Preserve the uncached build for wrappers that compile successfully but
+      // cannot provide a dry-run trace for the real build flavor.
+      root = null;
+    }
+  }
+
   if (root === null) {
     // The exact historical command line, byte for byte.
-    await runClang(buildArgs((p) => p));
+    try {
+      await materializeVendorPrerequisites();
+      await runClang(buildArgs((p) => p));
+    } finally {
+      if (transientVendorRoot !== null) {
+        await rm(transientVendorRoot, { recursive: true, force: true }).catch(() => undefined);
+      }
+    }
     return;
   }
 
-  const [cv, fingerprint, cBytes, linkBytes] = await Promise.all([
-    ccVersionOnce(driver.argv),
-    runtimeFingerprint(rtDir),
-    readFile(opts.cPath),
-    Promise.all((opts.linkInputs ?? []).map((path) => readFile(path))),
-  ]);
-  // The key sees the full command line with the two program-specific paths
-  // normalized out (their CONTENT is what matters: the C bytes are hashed,
-  // the out path is where the result lands). Runtime and vendor paths stay
-  // verbatim — their contents are covered by the fingerprint and the pin.
-  const identityArgs = buildArgs((p) => p).map((a) =>
-    a === opts.cPath ? "<program.c>" : a === opts.outPath ? "<out>" : a,
-  );
-  const key = createHash("sha256")
-    .update("bin-v1\0")
-    // The driver spelling joins the version string: `zig cc --version`
-    // reports the clang underneath and could otherwise collide with a
-    // same-version host clang.
-    .update(ccName).update("\0")
-    .update(cv).update("\0")
-    .update(fingerprint).update("\0")
-    .update(identityArgs.join("\x1f")).update("\0")
-    .update(cBytes);
-  for (const bytes of linkBytes) key.update("\0ffi-link\0").update(bytes);
-  const keyHex = key
-    .digest("hex");
-  const binDir = join(root, "bin");
-  const cachedBin = join(binDir, keyHex);
+  let cv: string;
+  let fingerprint: string;
+  let cBytes: Buffer;
   try {
-    // NEVER copy over outPath in place: overwriting an already-executed
-    // signed binary invalidates the kernel's per-vnode code-signature cache
-    // on macOS and the next exec dies with SIGKILL. Copy to a fresh inode
-    // and rename it into place instead.
-    const tmpOut = `${opts.outPath}.hit-${process.pid}-${Math.random().toString(36).slice(2)}`;
-    await copyFile(cachedBin, tmpOut);
-    await chmod(tmpOut, 0o755);
-    await rename(tmpOut, opts.outPath);
-    const now = new Date();
-    await utimes(cachedBin, now, now).catch(() => undefined); // LRU bump
-    return; // hit: clang skipped entirely
+    [cv, fingerprint, cBytes] = await Promise.all([
+      ccVersionOnce(driver.argv, toolchainEnv, true),
+      runtimeFingerprint(rtDir),
+      readFile(opts.cPath),
+    ]);
   } catch {
-    /* miss — build below, then publish */
+    // A version/fingerprint probe is an optimization boundary. If the compiler
+    // itself can still compile, preserve the pre-cache behavior instead of
+    // surfacing a metadata command's failure as the build result.
+    await materializeVendorPrerequisites();
+    await runClang(buildArgs((p) => p));
+    return;
+  }
+  // Caller-supplied native inputs can all hide mutable dependencies: `-l`
+  // resolves through ambient search paths, while a thin archive or linker
+  // script can retain identical top-level bytes as its referenced files are
+  // rebuilt. Keep the safe runtime-object cache, but force a fresh final link
+  // whenever the caller supplies either form.
+  let cacheCompleteArtifact =
+    cachePolicy.completeArtifacts &&
+    (opts.linkInputs?.length ?? 0) === 0 &&
+    (opts.systemLibraries?.length ?? 0) === 0;
+  let programDependencies: string | null = null;
+  if (cacheCompleteArtifact) {
+    try {
+      programDependencies = await translationUnitDependencyFingerprint(
+        driver,
+        cflags,
+        opts.cPath,
+        cBytes,
+        toolchainEnv,
+      );
+    } catch {
+      // Program-header discovery is needed only for a complete hit. Runtime
+      // objects remain safe because they never contain the caller's TU.
+      cacheCompleteArtifact = false;
+    }
+  }
+  const linkProbeArgs = [
+    ...(sanitize ? ["-fsanitize=address"] : []),
+    ...(targetPlatform(driver) === "win32"
+      ? ["-ladvapi32", "-liphlpapi", "-lws2_32"]
+      : []),
+    ...(tls && targetPlatform(driver) === "win32" ? ["-lbcrypt"] : []),
+    ...(curlFetch && driver.target === null ? ["-lcurl"] : []),
+    ...(dynamic && !driver.linkArgs.includes("-lm") ? ["-lm"] : []),
+    ...(((opts.zlib ?? false) || nativeFetch) && driver.target === null ? ["-lz"] : []),
+    ...driver.linkArgs,
+  ];
+  // Both the wrapper dry run and dependency trace need the real build's
+  // compile/link flag shape: wrappers commonly inject flags or native inputs
+  // conditionally on optimization, sanitizer, dynamic, or platform switches.
+  const effectiveLinkInvocationArgs = [
+    ...programCompilerArgs,
+    ...(targetPlatform(driver) === "win32"
+      ? ["-ladvapi32", "-liphlpapi", "-lws2_32"]
+      : []),
+    ...(tls && targetPlatform(driver) === "win32" ? ["-lbcrypt"] : []),
+    ...(curlStubDir !== null ? [`-L${curlStubDir}`] : []),
+    ...(curlFetch && driver.target === null ? ["-lcurl"] : []),
+    ...(dynamic && !driver.linkArgs.includes("-lm") ? ["-lm"] : []),
+    ...(dynamic && targetPlatform(driver) === "darwin" ? ["-Wl,-dead_strip"] : []),
+    ...(dynamic && targetPlatform(driver) === "win32"
+      ? ["-Wl,--stack,8388608"]
+      : []),
+    ...(((opts.zlib ?? false) || nativeFetch) && driver.target === null ? ["-lz"] : []),
+    ...driver.linkArgs,
+  ];
+  // A complete hit is checked before cross-target curl's generated import stub
+  // is materialized. Its -L spelling still joins the dry-run identity, while
+  // the real trace omits only that not-yet-existing scriptc-owned directory.
+  const linkTraceInvocationArgs =
+    curlStubDir === null
+      ? effectiveLinkInvocationArgs
+      : effectiveLinkInvocationArgs.filter((arg) => arg !== `-L${curlStubDir}`);
+  let implicitLinker: string | null = null;
+  if (cacheCompleteArtifact) {
+    try {
+      implicitLinker = await implicitLinkerFingerprint(
+        driver,
+        toolchainEnv,
+        linkProbeArgs,
+        effectiveLinkInvocationArgs,
+        linkTraceInvocationArgs,
+      );
+    } catch {
+      // Some compiler wrappers/linkers do not implement trace mode. Runtime
+      // objects remain safely cacheable, but a complete executable cannot be
+      // keyed without knowing every implicit link input.
+      cacheCompleteArtifact = false;
+    }
+  }
+  const binDir = join(root, "bin");
+  let keyHex: string | null = null;
+  let cachedBin: string | null = null;
+  if (cacheCompleteArtifact) {
+    // The key sees the full command line with the two program-specific paths
+    // normalized out. The C bytes are hashed separately; Darwin additionally
+    // keys the output basename because ld embeds it in the ad-hoc signature.
+    // Runtime and vendor paths stay verbatim — their contents are covered by
+    // the fingerprint and the pin.
+    const identityArgs = buildArgs((p) => p).map((a) =>
+      a === opts.cPath ? "<program.c>" : a === opts.outPath ? "<out>" : a,
+    );
+    const key = createHash("sha256")
+      // v9 adds effective compiler-wrapper invocations for the real runtime,
+      // program, and link flavors.
+      .update("bin-v9\0")
+      .update(cacheTargetIdentity(driver)).update("\0")
+      .update(toolchainEnv).update("\0")
+      .update(implicitToolchain!).update("\0")
+      .update(runtimeCompilerInvocation!).update("\0")
+      .update(programCompilerInvocation!).update("\0")
+      .update(implicitLinker!).update("\0")
+      .update(programDependencies!).update("\0")
+      .update(opts.cacheIdentity!).update("\0")
+      // Preserve both the spelling clang sees (__FILE__) and the location used
+      // to resolve relative includes. The top-level bytes are not sufficient.
+      .update(opts.cPath).update("\0")
+      .update(resolve(opts.cPath)).update("\0")
+      .update(targetPlatform(driver) === "darwin" ? basename(opts.outPath) : "<out>").update("\0")
+      // The driver spelling joins the version string: `zig cc --version`
+      // reports the clang underneath and could otherwise collide with a
+      // same-version host clang.
+      .update(ccName).update("\0")
+      .update(cv).update("\0")
+      .update(fingerprint).update("\0")
+      .update(identityArgs.join("\x1f")).update("\0")
+      .update(cBytes);
+    keyHex = key.digest("hex");
+    cachedBin = join(binDir, keyHex);
+    const tmpOut = privateSiblingPath(opts.outPath, "bin-hit");
+    try {
+      // NEVER copy over outPath in place: overwriting an already-executed
+      // signed binary invalidates the kernel's per-vnode code-signature cache
+      // on macOS and the next exec dies with SIGKILL. Copy to a fresh inode
+      // and rename it into place instead.
+      if (!(await copyValidCachedFile(cachedBin, tmpOut))) {
+        throw new Error("invalid cached executable");
+      }
+      // Match a fresh linker output under the caller's current umask. Reusing a
+      // cache entry populated by a less restrictive shell must not widen access.
+      await chmod(tmpOut, 0o777 & ~process.umask());
+      await rename(tmpOut, opts.outPath);
+      return; // hit: the program/runtime payload compile and link were skipped
+    } catch {
+      await rm(tmpOut, { force: true }).catch(() => undefined);
+      /* miss — build below, then publish */
+    }
   }
 
-  // Miss: link the program's own TU against cached per-flavor runtime
-  // objects. cflags reproduces exactly the option set every TU sees in the
-  // single invocation (the clang driver applies all options to all inputs).
-  const cflags = [
-    "-std=c11",
-    ...driver.targetArgs,
-    ...(opts.sanitize
-      ? ["-O1", "-fsanitize=address", "-DSCR_RC_AUDIT"]
-      : ["-O2"]),
-    "-fno-math-errno",
-    "-fno-strict-aliasing", // the emitted object model type-puns — see buildArgs
-    "-Wno-deprecated-declarations",
-    "-I", rtDir,
-    ...(regex || dynamic ? ["-I", vendorEngineDir()] : []),
-    ...(zlibObjects.length > 0 ? ["-I", vendorZlibDir()] : []),
-    ...(curlStubDir !== null ? ["-I", join(vendorCurlDir(), "include")] : []),
-    ...(tlsArchive !== null ? ["-I", join(vendorTlsDir(), "include")] : []),
-    ...(dynamic ? ["-DSCR_DYNAMIC"] : []),
-  ];
+  await materializeVendorPrerequisites();
+
+  // Miss: link the program's own TU against cached per-flavor runtime objects.
   // Collect the runtime sources this build actually compiles (the same
   // conditionals as the command line, by construction).
   const rtInputs: string[] = [];
@@ -1332,21 +3445,125 @@ export async function compileC(opts: CcOptions): Promise<void> {
     rtInputs.push(p);
     return p;
   });
-  let objects: Map<string, string> | null = null;
+  const buildDir = await mkdtemp(join(tmpdir(), "scriptc-cache-build-"));
   try {
-    objects = await ensureRuntimeObjects(root, driver.argv, cflags, rtInputs, `obj-v1\0${ccName}\0${cv}\0${fingerprint}\0`);
-  } catch {
-    objects = null; // cache trouble is never a build failure
+    // Freeze the exact bytes used for the key. Generated TUs live at stable
+    // paths under .scriptc/, so two builds can otherwise overwrite that path
+    // between hashing and clang and publish one invocation's code under the
+    // other's key. The prefix map preserves the original __FILE__/debug-file
+    // spelling while clang reads this invocation-private snapshot.
+    const programPath = join(buildDir, `program${opts.cPath.endsWith(".ll") ? ".ll" : ".c"}`);
+    // Preserve the caller-visible basename while keeping Darwin builds on a
+    // private inode: ld uses this spelling as the embedded ad-hoc signing
+    // identifier. Other targets retain the basename-independent cache key.
+    const privateOut = join(
+      buildDir,
+      targetPlatform(driver) === "darwin"
+        ? basename(opts.outPath)
+        : process.platform === "win32"
+          ? "artifact.exe"
+          : "artifact",
+    );
+    await writeFile(programPath, cBytes);
+
+    let objects: Map<string, string> | null = null;
+    let cacheInputsStable = true;
+    let objectImplicitVerification: Promise<boolean> | null = null;
+    const objectImplicitToolchainStillMatches = (): Promise<boolean> => {
+      objectImplicitVerification ??= Promise.all([
+        implicitToolchainFingerprint(driver, toolchainEnv),
+        effectiveCompilerInvocationFingerprint(driver, toolchainEnv, cflags),
+      ]).then(
+        ([currentImplicit, currentInvocation]) =>
+          currentImplicit === implicitToolchain &&
+          currentInvocation === runtimeCompilerInvocation,
+        () => false,
+      );
+      return objectImplicitVerification;
+    };
+    try {
+      const cached = await ensureRuntimeObjects(
+        root,
+        driver.argv,
+        cflags,
+        rtInputs,
+        `obj-v5\0${cacheTargetIdentity(driver)}\0${toolchainEnv}\0${implicitToolchain}\0${runtimeCompilerInvocation}\0${ccName}\0${cv}\0${fingerprint}\0`,
+        async () =>
+          (await runtimeFingerprint(rtDir)) === fingerprint &&
+          (await objectImplicitToolchainStillMatches()),
+      );
+      objects = await stageRuntimeObjects(cached, join(buildDir, "runtime-objects"));
+    } catch (err) {
+      if (err instanceof CacheInputsChangedError) cacheInputsStable = false;
+      objects = null; // cache trouble is never a build failure
+    }
+
+    await runClang(
+      buildArgs(
+        (p) => objects?.get(p) ?? p,
+        { programPath, outPath: privateOut, compilerVisibleSource: opts.cPath },
+      ),
+    );
+    await installArtifact(privateOut, opts.outPath);
+
+    if (cachedBin !== null && keyHex !== null) {
+      // This check is deliberately fresh rather than the object-publication
+      // verification above. The final program compile/link can itself race an
+      // SDK header, compiler, linker, CRT, or system-library replacement; its
+      // bytes must not be published under the pre-build identity in that case.
+      const [currentRuntime, currentImplicit, currentRuntimeInvocation, currentProgramInvocation, currentProgramDependencies, currentLinker, currentCompiler] =
+        await Promise.all([
+          runtimeFingerprint(rtDir).catch(() => null),
+          implicitToolchainFingerprint(driver, toolchainEnv).catch(() => null),
+          effectiveCompilerInvocationFingerprint(driver, toolchainEnv, cflags).catch(
+            () => null,
+          ),
+          effectiveCompilerInvocationFingerprint(
+            driver,
+            toolchainEnv,
+            programCompilerArgs,
+            programSourceExtension,
+          ).catch(() => null),
+          translationUnitDependencyFingerprint(
+            driver,
+            cflags,
+            opts.cPath,
+            cBytes,
+            toolchainEnv,
+          ).catch(() => null),
+          implicitLinkerFingerprint(
+            driver,
+            toolchainEnv,
+            linkProbeArgs,
+            effectiveLinkInvocationArgs,
+            linkTraceInvocationArgs,
+          ).catch(() => null),
+          ccVersionOnce(driver.argv, toolchainEnv, true).catch(() => null),
+        ]);
+      cacheInputsStable =
+        cacheInputsStable &&
+        currentRuntime === fingerprint &&
+        currentImplicit === implicitToolchain &&
+        currentRuntimeInvocation === runtimeCompilerInvocation &&
+        currentProgramInvocation === programCompilerInvocation &&
+        currentProgramDependencies === programDependencies &&
+        currentLinker === implicitLinker &&
+        currentCompiler === cv;
+    }
+    if (cachedBin !== null && keyHex !== null && cacheInputsStable) {
+      try {
+        // Cache artifacts are data, never execution targets. Publication keeps
+        // generated code and embedded literals private; the hit path reapplies
+        // the caller's current executable mode to its destination copy.
+        await publishCachedFile(privateOut, cachedBin);
+      } catch {
+        /* publishing is best-effort */
+      }
+    }
+  } finally {
+    await rm(buildDir, { recursive: true, force: true }).catch(() => undefined);
   }
-  await runClang(buildArgs((p) => objects?.get(p) ?? p));
-  try {
-    await mkdir(binDir, { recursive: true });
-    const tmp = join(binDir, `.tmp-${keyHex.slice(0, 8)}-${process.pid}-${Math.random().toString(36).slice(2)}`);
-    await copyFile(opts.outPath, tmp);
-    await chmod(tmp, 0o755);
-    await rename(tmp, cachedBin);
-    await pruneCache(root);
-  } catch {
-    /* publishing is best-effort */
-  }
+  // Runtime-object population is itself a cache write, including on builds
+  // whose native link inputs disable complete-artifact publication.
+  await pruneCache(root).catch(() => undefined);
 }

@@ -32,3 +32,4 @@ tmp-*/
 .claude/
 .vercel/
 .env.local
+.env*

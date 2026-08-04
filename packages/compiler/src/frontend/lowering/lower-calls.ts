@@ -3297,6 +3297,12 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
       ts.isPropertyAccessExpression(expr.expression) &&
       L.isIslandExpr(expr.expression.expression)
     ) {
+      // Typed fetch/Web Streams handles map to island values under
+      // --dynamic, but their inventory still owns which methods exist.
+      // Reject unsupported rows before the universal jsval method path.
+      L.fenceStaticResponseMember(expr.expression, "call");
+      L.fenceStaticHeadersMember(expr.expression, "call");
+      L.fenceStaticReadableStreamMember(expr.expression, "call");
       const receiver = L.lowerExpr(expr.expression.expression);
       // A checker-`any` receiver whose VALUE lives in the checked-dynamic tree (a
       // checked-dynamic local behind the any-typed spelling — the JS
@@ -4013,6 +4019,19 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
         // hasOwnProperty on a program class CONSTRUCTOR — own statics are
         // compile-time-known, so a literal key folds to a constant.
         lowerClassHasOwnPropertyCall(L, expr, expr.expression) ??
+        // Response constructor-object operations are unsupported in both
+        // tiers. Keep their SC2020 inventory contract ahead of the island
+        // and generic-call fallbacks (Response.json otherwise reports the
+        // generic SC1090 fence).
+        L.fenceUnsupportedFetchConstructorMember(expr.expression) ??
+        // Static fetch responses are checked-dynamic handles, but the
+        // adopted undici declaration exposes a wider API than that handle.
+        // Fence unimplemented members before either the island or generic
+        // dyn receiver path can compile them into a runtime missing-method
+        // failure. Dynamic-only rows pass through these checks unchanged.
+        L.fenceStaticResponseMember(expr.expression, "call") ??
+        L.fenceStaticHeadersMember(expr.expression, "call") ??
+        L.fenceStaticReadableStreamMember(expr.expression, "call") ??
         L.lowerIslandMethodCall(expr, expr.expression) ??
         // Dyn receivers (JSON.parse-derived `unknown`/`any` values) —
         // validated-extract, then the static machinery. After the island
@@ -4106,6 +4125,17 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
         }
       }
       L.unsupported("SC1090", expr, `method calls like '${expr.expression.getText()}'`);
+    }
+
+    // The element spelling of an unsupported native Web method must fence
+    // before lowering the callee into a checked-dynamic keyed read.
+    if (ts.isElementAccessExpression(expr.expression)) {
+      const headersIterator = L.lowerDynamicHeadersIteratorCall(expr, expr.expression);
+      if (headersIterator) return headersIterator;
+      L.fenceUnsupportedFetchConstructorMember(expr.expression);
+      L.fenceStaticResponseMember(expr.expression, "call");
+      L.fenceStaticHeadersMember(expr.expression, "call");
+      L.fenceStaticReadableStreamMember(expr.expression, "call");
     }
 
     // The ELEMENT spelling of a primitive method call — `x['toString']()`,
@@ -4537,6 +4567,7 @@ export const DYN_DISPATCH_METHODS = new Set([
   "setEncoding", "setDefaultEncoding", "setTimeout", "read", "isPaused",
   "writeHead", "setHeader", "getHeader", "hasHeader", "removeHeader",
   "getHeaders", "getHeaderNames", "appendHeader", "flushHeaders",
+  "append", "delete", "get", "getSetCookie", "has", "set",
   "writeContinue", "writeEarlyHints", "cork", "uncork", "addTrailers",
   "ref", "unref", "address", "setNoDelay", "setKeepAlive", "connect",
   "resetAndDestroy", "destroySoon",
@@ -4549,6 +4580,15 @@ export const DYN_DISPATCH_METHODS = new Set([
   // server ops; no other dyn prototype declares either name, so the
   // remainder keeps the stored-member answers.
   "listen", "close",
+  // The native WHATWG readable-stream and AbortSignal handles used by
+  // static fetch. These route through SCR_DYN_HANDLE dispatch just like
+  // the http/net names above.
+  "getReader", "cancel", "releaseLock", "enqueue", "error",
+  "throwIfAborted", "addEventListener", "removeEventListener",
+  "dispatchEvent",
+  "preventDefault", "stopPropagation", "stopImmediatePropagation",
+  "composedPath",
+  "json", "text", "bytes",
   // Promise.prototype (SCR_DYN_PROMISE receivers): the reaction trio
   // rides the fiber machinery (scr_dyn_promise_then); on every other dyn
   // kind then/catch/finally answer the stored-member path (OBJ own

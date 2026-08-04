@@ -12,7 +12,8 @@
  * - Lexical scoping is resolved here: locals get function-unique ids
  *   ("x.0", "x.1" for shadowing); the IR is scope-flat.
  */
-import { isRelativeSpecifier } from "../shared.js";
+import { resolve } from "node:path";
+import { isRelativeSpecifier, tsgoPath } from "../shared.js";
 import * as ts from "../ts7/adapter.js";
 import type { ScrDiagnostic } from "../../diagnostics/diagnostic.js";
 import {
@@ -96,8 +97,8 @@ import { ParamShape, FnSig, GenericFnInfo, GenericInstance, bindingNeverReassign
 import { lowerArrayMethodCall, lowerBufferStaticCall, lowerBytesMethodCall, lowerBytesNew, lowerMapMethodCall, lowerMapForEachCall, buildMapForEachFn, lowerRecordOvfCaptureHelper, lowerEnvToPairsHelper, lowerSetMethodCall, lowerSetForEachCall, buildSetForEachFn, lowerRegexMethodCall, lowerStringMethodCall } from "./lower-containers.js";
 import { lowerStreamModuleCall } from "./lower-stream.js";
 import { lowerEmitOverrideSpec, type EmitSpecCtx, type EmitSpecRequest } from "./lower-emitter.js";
-import { builtinImportOf, createRequireBindingDecl, createRequireNamespaceDecl, createRequireSpecOf, stripTypeCasts, lowerBuiltinModuleCall, lowerFsToUnixTimestampCall, lowerFsLadderCall, lowerChildArgsArg, lowerSpawnSyncCall, lowerSpawnCall, lowerExecSyncCall, recordToEnvPairs, lowerJsonMethodCall, fencedBuiltinImportOf, lowerCryptoComposedCall, lowerUrlMethodCall, lowerSearchParamsMethodCall, lowerStatsMethodCall, lowerChildMethodCall, lowerAtomicsCall, lowerBuiltinExtraProperty, promisifiedExecFileDecl, lowerExecFileAsyncCall, execFileAsyncHelper, lowerStringDecoderMethodCall, strdecHelper, lowerReadlineMethodCall, lowerDcChannelMethodCall, lowerDcChannelProperty, lowerAlsMethodCall, lowerDcTracingChannelMethodCall, lowerDcTracingChannelProperty, lowerJsonProperty, lowerErrorCodeProperty, lowerProcessProperty, isProcessEnv, envValueType, lowerProcessEnvGet, lowerProcessMethodCall, lowerProcessOptionalMethodCall, lowerTimeoutMethodCall, envSnapshotHelper, isConsoleLog, consoleCallMember, lowerNumberStaticCall, lowerNumberStaticProperty, lowerDateCall, lowerTextCodecCall, lowerCryptoModuleCall, lowerFsConstantsProperty, lowerBuiltinConstantsProperty, builtinConstantBindingOf, builtinConstantsDestructureDecl, lowerProcessStreamProperty, lowerStringStaticCall, lowerStringLastIndexOfCall, lowerPromiseStaticCall } from "./lower-builtins.js";
-import { isIslandExpr, islandFuncValueFence, islandRegexpOf, jsvalIn, requireDynamicApi, islandGlobalFnOf, lowerDynamicImportCall, lowerFetchCall, lowerIslandMethodCall, lowerMathProperty, npmPackageOf, npmMemberFence, npmPackageOfSymbol } from "./lower-island.js";
+import { builtinImportOf, createRequireBindingDecl, createRequireNamespaceDecl, createRequireSpecOf, stripTypeCasts, lowerBuiltinModuleCall, lowerFsToUnixTimestampCall, lowerFsLadderCall, lowerChildArgsArg, lowerSpawnSyncCall, lowerSpawnCall, lowerExecSyncCall, recordToEnvPairs, lowerJsonMethodCall, fencedBuiltinImportOf, lowerCryptoComposedCall, lowerUrlMethodCall, lowerSearchParamsMethodCall, lowerStatsMethodCall, lowerChildMethodCall, lowerAtomicsCall, lowerBuiltinExtraProperty, promisifiedExecFileDecl, lowerExecFileAsyncCall, execFileAsyncHelper, lowerStringDecoderMethodCall, strdecHelper, lowerReadlineMethodCall, lowerDcChannelMethodCall, lowerDcChannelProperty, lowerAlsMethodCall, lowerDcTracingChannelMethodCall, lowerDcTracingChannelProperty, lowerJsonProperty, lowerErrorCodeProperty, lowerProcessProperty, isProcessEnv, envValueType, lowerProcessEnvGet, lowerProcessMethodCall, lowerProcessOptionalMethodCall, lowerTimeoutMethodCall, envSnapshotHelper, isConsoleLog, consoleCallMember, lowerNumberStaticCall, lowerNumberStaticProperty, lowerDateCall, lowerTextCodecCall, lowerCryptoModuleCall, lowerFsConstantsProperty, lowerBuiltinConstantsProperty, builtinConstantBindingOf, builtinConstantsDestructureDecl, lowerProcessStreamProperty, lowerStringStaticCall, lowerStringLastIndexOfCall, lowerPromiseStaticCall, textCodecBindingClassOf } from "./lower-builtins.js";
+import { fenceFetchObjectAssignment, fenceFetchObjectBinding, fenceStaticHeadersIteration, fenceStaticHeadersMember, fenceStaticReadableStreamMember, fenceStaticResponseMember, fenceUnsupportedFetchConstructorMember, isIslandExpr, islandFuncValueFence, islandRegexpOf, jsvalIn, requireDynamicApi, islandGlobalFnOf, lowerDynamicHeadersIteratorCall, lowerDynamicHeadersSpread, lowerDynamicImportCall, lowerFetchCall, lowerFetchElementMethodCall, lowerStaticFetchCompanionCall, lowerStaticAbortSignalListenerCall, lowerStaticReadableStreamCancelCall, lowerStaticReadableStreamControllerCall, lowerStaticReadableStreamNew, lowerStaticReadableStreamReaderCall, lowerStaticResponseCall, lowerIslandMethodCall, lowerMathProperty, npmPackageOf, npmMemberFence, npmPackageOfSymbol } from "./lower-island.js";
 import { lowerHttpHeadersElement, lowerNetModuleCall, lowerServerMethodCall, lowerServerProperty, lowerTlsRootCertificates } from "./lower-server.js";
 import { lowerDgramDnsModuleCall, lowerDgramMethodCall } from "./lower-dgram.js";
 import { lowerNodeTestModuleCall, lowerTestDirectCall, lowerTestMethodCall, lowerTestCtxProperty } from "./lower-test.js";
@@ -352,6 +353,12 @@ export interface LowerOptions {
    * imports; without this option ambient declarations keep Node's ordinary
    * ReferenceError behavior. */
   ffiImports?: readonly IrFfiImport[];
+  /** Coverage-only external host type surfaces. Their declarations inform
+   * the checker, while every runtime value use remains an SC1010 fence. */
+  externalTypes?: ReadonlyMap<string, string>;
+  /** The mapped entries plus relative declaration dependencies, attributed
+   * to their owning external specifier. */
+  externalTypeSpecifiersByFile?: ReadonlyMap<string, readonly string[]>;
 }
 
 /** The Lowerer's pass configuration (see lowerToIr). */
@@ -378,6 +385,23 @@ export interface LowererMode {
   /** Program-validated ambient declaration symbols for each FFI name.
    * Undefined in discovery's legacy call-local validation path. */
   ffiBindingSymbols?: ReadonlyMap<string, ReadonlySet<ts.Symbol>>;
+  /** LowerOptions.externalTypes, threaded through every lowering pass. */
+  externalTypes?: ReadonlyMap<string, string>;
+  /** LowerOptions.externalTypeSpecifiersByFile, shared by every pass. */
+  externalTypeSpecifiersByFile?: ReadonlyMap<string, readonly string[]>;
+}
+
+function directExternalTypeSpecifiersByFile(
+  externalTypes: ReadonlyMap<string, string>,
+): ReadonlyMap<string, readonly string[]> {
+  const out = new Map<string, string[]>();
+  for (const [specifier, file] of externalTypes) {
+    const key = tsgoPath(resolve(file));
+    const owners = out.get(key);
+    if (owners === undefined) out.set(key, [specifier]);
+    else if (!owners.includes(specifier)) owners.push(specifier);
+  }
+  return out;
 }
 
 /** Build lowering runs in two passes over the same ts.Program:
@@ -425,9 +449,14 @@ export function lowerToIr(
     });
   }
   const ffiImports = options.ffiImports ?? [];
+  const externalTypes = options.externalTypes ?? new Map<string, string>();
+  const externalTypeSpecifiersByFile = options.externalTypeSpecifiersByFile ??
+    directExternalTypeSpecifiersByFile(externalTypes);
   const validation = new Lowerer(program, entry, moduleOrder, dynamic, {
     targetPlatform,
     ffiImports,
+    externalTypes,
+    externalTypeSpecifiersByFile,
   });
   const ffiValidation = validateFfiImports(validation);
   // Discovery must use the same exact-symbol ownership as emit. Otherwise a
@@ -441,6 +470,8 @@ export function lowerToIr(
     : new Lowerer(program, entry, moduleOrder, dynamic, {
         targetPlatform,
         ffiImports,
+        externalTypes,
+        externalTypeSpecifiersByFile,
         ffiBindingSymbols: ffiValidation.symbolsByName,
       });
   const reachable = discovery.discover(options.libRoots);
@@ -450,6 +481,8 @@ export function lowerToIr(
     startupCrash,
     ffiImports,
     ffiBindingSymbols: ffiValidation.symbolsByName,
+    externalTypes,
+    externalTypeSpecifiersByFile,
   });
   for (const d of dynamicCycleDiags) emit.pushDiag(d);
   for (const d of ffiValidation.diagnostics) emit.pushDiag(d);
@@ -462,6 +495,8 @@ export function lowerToIr(
     targetPlatform,
     ffiImports,
     ffiBindingSymbols: ffiValidation.symbolsByName,
+    externalTypes,
+    externalTypeSpecifiersByFile,
   });
   const rem = remainder.run();
   return { ...result, unreached: { diagnostics: rem.diagnostics, stats: rem.stats } };
@@ -959,6 +994,17 @@ export class Lowerer {
    * (the ctx guard keeps hidden locals out of closures — a cross-function
    * walk falls back to the plain array walk and the fence). */
   readonly matchAllDrainIndexes = new Map<ts.Symbol, { idxsLocalId: string; ctx: FnCtx }>();
+  /** STORED numeric value iterators: `const it = numbers.values()` (and
+   * the equivalent `[Symbol.iterator]()` spelling) over number[] or a
+   * represented typed array has no first-class IR value, so its statically
+   * known protocol state lives in hidden source/cursor/done locals. A
+   * later for-of in the SAME function reads and advances them.
+   * `doneLocalId` is sticky: once next() observes the end, later source
+   * changes do not revive the exhausted iterator, exactly like Node. */
+  readonly numericIterators = new Map<
+    ts.Symbol,
+    { sourceLocalId: string; sourceType: IrType; indexLocalId: string; doneLocalId: string; ctx: FnCtx }
+  >();
   chainCounter = 0;
   /** Keyed by program-wide qualified class name (what IR object types carry). */
   readonly classes = new Map<string, ClassInfo>();
@@ -1165,6 +1211,9 @@ export class Lowerer {
   readonly ffiImportsByName: ReadonlyMap<string, IrFfiImport>;
   /** Non-null after whole-program FFI declaration validation. */
   readonly ffiBindingSymbols: ReadonlyMap<string, ReadonlySet<ts.Symbol>> | null;
+  /** Exact specifier mappings and their reverse declaration-file lookup. */
+  readonly externalTypes: ReadonlyMap<string, string>;
+  readonly externalTypeSpecifiersByFile: ReadonlyMap<string, readonly string[]>;
   /** Symbols a POISONED declaration statement would have bound: the
    * declaration's own diagnostic is already recorded, and no local/global
    * registered, so later references fall through every resolution step —
@@ -1220,6 +1269,9 @@ export class Lowerer {
     this.ffiImports = mode.ffiImports ?? [];
     this.ffiImportsByName = new Map(this.ffiImports.map((entry) => [entry.name, entry]));
     this.ffiBindingSymbols = mode.ffiBindingSymbols ?? null;
+    this.externalTypes = mode.externalTypes ?? new Map();
+    this.externalTypeSpecifiersByFile = mode.externalTypeSpecifiersByFile ??
+      directExternalTypeSpecifiersByFile(this.externalTypes);
     this.checker = program.getTypeChecker();
     this.typeCtx = {
       checker: this.checker,
@@ -1236,6 +1288,8 @@ export class Lowerer {
       mixinIntersectionInstance: (widened) => mixinIntersectionInstanceType(this, widened),
       isStdlibFile: this.isStdlibFile,
       isNpmFile: this.isNpmFile,
+      isExternalTypeFile: (sf) =>
+        this.externalTypeSpecifiersByFile.has(tsgoPath(resolve(sf.fileName))),
       dynamic: this.dynamic,
       targetPlatform: this.targetPlatform,
       // fileTag is filled just below; the hook is only ever CALLED during
@@ -1370,6 +1424,185 @@ export class Lowerer {
     if (cjsValue) symbol = cjsValue;
     this.flushDeferred(symbol);
     return symbol;
+  }
+
+  /** The configured external host module owning an expression's runtime
+   * value, or null. Alias chains are followed to their declaration file so
+   * direct imports and local re-export facades classify identically. Type
+   * references never call this helper and remain ordinary checker input. */
+  externalTypeSpecifierOf(expr: ts.Expression): string | null {
+    if (this.externalTypes.size === 0) return null;
+
+    let value: ts.Expression = expr;
+    while (
+      ts.isParenthesizedExpression(value) ||
+      ts.isAsExpression(value) ||
+      ts.isTypeAssertion(value) ||
+      ts.isNonNullExpression(value)
+    ) {
+      value = value.expression;
+    }
+    if (ts.isCallExpression(value)) {
+      if (value.expression.kind === ts.SyntaxKind.ImportKeyword) {
+        const spec = value.arguments[0];
+        return spec !== undefined && ts.isStringLiteralLike(spec) && this.externalTypes.has(spec.text)
+          ? spec.text
+          : null;
+      }
+      if (
+        ts.isIdentifier(value.expression) &&
+        value.expression.text === "require" &&
+        value.arguments.length === 1
+      ) {
+        const spec = value.arguments[0]!;
+        if (ts.isStringLiteralLike(spec) && this.externalTypes.has(spec.text)) return spec.text;
+      }
+      return this.externalTypeSpecifierOf(value.expression);
+    }
+    if (ts.isNewExpression(value)) return this.externalTypeSpecifierOf(value.expression);
+    if (ts.isTaggedTemplateExpression(value)) {
+      return this.externalTypeSpecifierOf(value.tag);
+    }
+    if (ts.isPropertyAccessExpression(value) || ts.isElementAccessExpression(value)) {
+      // Follow the runtime RECEIVER, not the property's declaration: a
+      // project-owned record may use an interface declared by the mapped
+      // file and remains ordinary static data (`const x: HostType = ...;
+      // x.field`). Only a value rooted in the imported module is external.
+      const receiver = this.externalTypeSpecifierOf(value.expression);
+      if (receiver !== null) return receiver;
+      const member = ts.isPropertyAccessExpression(value)
+        ? value.name.text
+        : value.argumentExpression !== undefined && ts.isStringLiteralLike(value.argumentExpression)
+          ? value.argumentExpression.text
+          : null;
+      return member !== null
+        ? this.externalTypeSpecifierOfNamespaceMember(value.expression, member)
+        : null;
+    }
+    if (!ts.isIdentifier(value)) return null;
+    return this.externalTypeSpecifierOfSymbol(this.checker.getSymbolAtLocation(value));
+  }
+
+  /** The source file a checker-resolved module-specifier node names. The
+   * checker path covers package.json aliases as well as relative imports;
+   * resolveImport is the fallback for the latter. */
+  private moduleSourceFileOf(from: ts.SourceFile, spec: ts.StringLiteral): ts.SourceFile | null {
+    const moduleSymbol = this.checker.getSymbolAtLocation(spec);
+    for (const decl of moduleSymbol ? this.checker.declarationsOf(moduleSymbol) : []) {
+      if (ts.isSourceFile(decl)) return decl;
+    }
+    return isRelativeSpecifier(spec.text) ? resolveImport(this.program, from, spec.text) : null;
+  }
+
+  /** Follow one project-module export through the checker's resolved export
+   * table, then recover its exact external route where alias declarations
+   * retain one. */
+  private externalTypeSpecifierOfModuleExport(
+    sf: ts.SourceFile,
+    exportName: string,
+    seenSymbols: Set<ts.Symbol>,
+    seenExports: Set<string>,
+  ): string | null {
+    const exportKey = `${tsgoPath(resolve(sf.fileName))}\0${exportName}`;
+    if (seenExports.has(exportKey)) return null;
+    seenExports.add(exportKey);
+    // Ask the checker which symbol the module ACTUALLY exports under this
+    // name. Syntax-only `export *` scanning cannot answer shadowing: a local
+    // or explicit export wins over a same-named star export, and a star
+    // contributes only names its target really exports. The resolved symbol
+    // retains route-aware ExportSpecifier/NamespaceExport declarations for
+    // exact mappings, while star exports resolve to the mapped declaration
+    // owner through externalTypeSpecifiersByFile.
+    const moduleSymbol = this.checker.getSymbolAtLocation(sf);
+    const exported = moduleSymbol?.getExports().get(exportName as ts.__String);
+    return this.externalTypeSpecifierOfSymbol(exported, seenSymbols, seenExports);
+  }
+
+  private externalTypeSpecifierOfNamespaceMember(expr: ts.Expression, member: string): string | null {
+    let value = expr;
+    while (
+      ts.isParenthesizedExpression(value) ||
+      ts.isAsExpression(value) ||
+      ts.isTypeAssertion(value) ||
+      ts.isNonNullExpression(value)
+    ) {
+      value = value.expression;
+    }
+    if (!ts.isIdentifier(value)) return null;
+    const symbol = this.checker.getSymbolAtLocation(value);
+    const namespaceDecl = symbol
+      ? this.checker.declarationsOf(symbol).find(ts.isNamespaceImport)
+      : undefined;
+    if (namespaceDecl === undefined) return null;
+    const importDecl = namespaceDecl.parent.parent;
+    if (!ts.isImportDeclaration(importDecl) || !ts.isStringLiteral(importDecl.moduleSpecifier)) return null;
+    if (this.externalTypes.has(importDecl.moduleSpecifier.text)) return importDecl.moduleSpecifier.text;
+    const dep = this.moduleSourceFileOf(importDecl.getSourceFile(), importDecl.moduleSpecifier);
+    return dep !== null && !dep.isDeclarationFile
+      ? this.externalTypeSpecifierOfModuleExport(dep, member, new Set(), new Set())
+      : null;
+  }
+
+  private externalTypeSpecifierOfSymbol(
+    symbol: ts.Symbol | undefined,
+    seenSymbols: Set<ts.Symbol> = new Set(),
+    seenExports: Set<string> = new Set(),
+  ): string | null {
+    if (symbol === undefined || seenSymbols.has(symbol)) return null;
+    seenSymbols.add(symbol);
+    const declarations = this.checker.declarationsOf(symbol);
+
+    // Route-aware alias hops run before declaration-file ownership. An
+    // exact import must keep the specifier it actually named, rather than
+    // inheriting whichever alias happened to register the shared file last.
+    for (const decl of declarations) {
+      let specNode: ts.Expression | undefined;
+      let importedName: string | null = null;
+      if (ts.isImportSpecifier(decl)) {
+        const importDecl: ts.Node = decl.parent.parent.parent;
+        if (ts.isImportDeclaration(importDecl)) specNode = importDecl.moduleSpecifier;
+        importedName = (decl.propertyName ?? decl.name).text;
+      } else if (ts.isImportClause(decl)) {
+        if (ts.isImportDeclaration(decl.parent)) specNode = decl.parent.moduleSpecifier;
+        importedName = "default";
+      } else if (ts.isNamespaceImport(decl)) {
+        const importDecl: ts.Node = decl.parent.parent;
+        if (ts.isImportDeclaration(importDecl)) specNode = importDecl.moduleSpecifier;
+        importedName = null;
+      } else if (ts.isExportSpecifier(decl)) {
+        const exportDecl: ts.Node = decl.parent.parent;
+        if (ts.isExportDeclaration(exportDecl)) specNode = exportDecl.moduleSpecifier;
+        importedName = (decl.propertyName ?? decl.name).text;
+      } else if (ts.isNamespaceExport(decl)) {
+        const exportDecl: ts.Node = decl.parent;
+        if (ts.isExportDeclaration(exportDecl)) specNode = exportDecl.moduleSpecifier;
+        importedName = "*";
+      } else {
+        continue;
+      }
+      if (specNode === undefined || !ts.isStringLiteral(specNode)) continue;
+      if (this.externalTypes.has(specNode.text)) return specNode.text;
+      // A namespace OBJECT from a project module is not wholly external;
+      // property accesses resolve their selected member separately above.
+      if (importedName === null) return null;
+      const dep = this.moduleSourceFileOf(decl.getSourceFile(), specNode);
+      return dep !== null && !dep.isDeclarationFile
+        ? this.externalTypeSpecifierOfModuleExport(dep, importedName, seenSymbols, seenExports)
+        : null;
+    }
+
+    for (const decl of declarations) {
+      const owners = this.externalTypeSpecifiersByFile.get(
+        tsgoPath(resolve(decl.getSourceFile().fileName)),
+      );
+      if (owners !== undefined && owners.length > 0) return owners[0]!;
+    }
+    if ((symbol.flags & ts.SymbolFlags.Alias) === 0) return null;
+    return this.externalTypeSpecifierOfSymbol(
+      this.checker.getAliasedSymbol(symbol),
+      seenSymbols,
+      seenExports,
+    );
   }
 
   /** The default-snapshot storage symbol a DEFAULT-import alias chain
@@ -2325,6 +2558,17 @@ export class Lowerer {
     throw new PoisonError();
   }
 
+  externalHostFence(specifier: string, node: ts.Node, valueUse = true): never {
+    this.unsupported(
+      "SC1010",
+      node,
+      valueUse
+        ? `values from the '${specifier}' external host module (types supplied by --external-types, but no runtime implementation or scriptc lowering was provided)`
+        : `the '${specifier}' external host module (types supplied by --external-types, but no runtime implementation or scriptc lowering was provided)`,
+      `the declaration mapping is analysis-only: coverage continues through project code, while executing ${valueUse ? "this value" : "this module"} requires an embedder integration with explicit runtime semantics`,
+    );
+  }
+
   /** The dynamic-family fence for an OPERATION on an `any`-origin
    * checked-dynamic value that only the engine can execute (operators,
    * iteration, computed member names, ...). Carries SC2011 — the same
@@ -2360,10 +2604,10 @@ export class Lowerer {
       this.pushDiag(noLoweringDiag(this.checker.typeToString(type), locOf(node), undefined, true));
       throw new PoisonError();
     }
-    // Island-backed ambient TYPES (Response, AbortSignal, RequestInit) in a
-    // STATIC build: the values live in the embedded engine, so the honest
-    // story is the per-site SC2012 — the same one the fetch call itself
-    // reports — not the generic supported-types recitation.
+    // Engine-backed ambient TYPES in a STATIC build report the per-site
+    // SC2012 rather than the generic supported-types recitation. Native
+    // fetch values map earlier to checked-dynamic handles and do not reach
+    // here; constructor objects such as Headers still can.
     if (
       !this.dynamic &&
       typeSym &&
@@ -2551,6 +2795,10 @@ export class Lowerer {
         RelativeTimeFormat: intlHint,
         Segmenter: intlHint,
         DisplayNames: intlHint,
+        TextEncoder:
+          "TextEncoder values have no representation — call through a const initialized with new TextEncoder(), or use the composed new TextEncoder().encode(s) form",
+        TextDecoder:
+          "TextDecoder values have no representation — call through a const initialized with the default new TextDecoder(), or use the composed new TextDecoder().decode(bytes) form",
       };
       this.pushDiag(
         noLoweringDiag(this.checker.typeToString(type), locOf(node), typeHints[stdlibOwnSym?.name ?? ""]),
@@ -2581,6 +2829,58 @@ export class Lowerer {
 
   stdlibMemberFence(access: ts.PropertyAccessExpression): void {
     return stdlibMemberFence(this, access);
+  }
+
+  fenceStaticResponseMember(
+    access: ts.PropertyAccessExpression | ts.ElementAccessExpression,
+    use: "read" | "call",
+  ): IrExpr | null {
+    return fenceStaticResponseMember(this, access, use);
+  }
+
+  fenceUnsupportedFetchConstructorMember(
+    access: ts.PropertyAccessExpression | ts.ElementAccessExpression,
+  ): IrExpr | null {
+    return fenceUnsupportedFetchConstructorMember(this, access);
+  }
+
+  fenceStaticHeadersMember(
+    access: ts.PropertyAccessExpression | ts.ElementAccessExpression,
+    use: "read" | "call",
+  ): IrExpr | null {
+    return fenceStaticHeadersMember(this, access, use);
+  }
+
+  fenceStaticHeadersIteration(node: ts.Node): void {
+    return fenceStaticHeadersIteration(this, node);
+  }
+
+  fenceFetchObjectAssignment(
+    target: ts.ObjectLiteralExpression,
+    source: ts.Expression,
+  ): void {
+    return fenceFetchObjectAssignment(this, target, source);
+  }
+
+  lowerDynamicHeadersIteratorCall(
+    call: ts.CallExpression,
+    access: ts.ElementAccessExpression,
+  ): IrExpr | null {
+    return lowerDynamicHeadersIteratorCall(this, call, access);
+  }
+
+  lowerDynamicHeadersSpread(
+    node: ts.Expression,
+    type: IrType & { kind: "array" },
+  ): IrExpr | null {
+    return lowerDynamicHeadersSpread(this, node, type);
+  }
+
+  fenceStaticReadableStreamMember(
+    access: ts.PropertyAccessExpression | ts.ElementAccessExpression,
+    use: "read" | "call",
+  ): IrExpr | null {
+    return fenceStaticReadableStreamMember(this, access, use);
   }
 
   typeOf(node: ts.Node): ts.Type {
@@ -5665,15 +5965,23 @@ export class Lowerer {
       }
     }
     // An OBJECT LITERAL against a checked-dynamic slot in a JS file (the
-    // getSupportInfo options argument — a dyn-ABI param): the value's
-    // world IS the checked-dynamic tree — build the dyn literal directly, before the
-    // island gate could claim the checker's `any` context (an island
-    // build could never land in the slot: no engine→dyn crossing).
+    // getSupportInfo options argument — a dyn-ABI param), or against the
+    // standard RequestInit type in TypeScript: the value's world IS the
+    // checked-dynamic tree — build the dyn literal directly.
     if (expected?.kind === "dyn") {
       let x: ts.Expression = node;
       while (ts.isParenthesizedExpression(x)) x = x.expression;
-      if (ts.isObjectLiteralExpression(x) && isJsSourceFile(x.getSourceFile())) {
-        return lowerDynObjectLiteral(this, x);
+      if (ts.isObjectLiteralExpression(x)) {
+        const contextual = this.checker.getContextualType(x);
+        const widened = contextual
+          ? this.checker.getBaseTypeOfLiteralType(contextual)
+          : undefined;
+        const sym = widened?.getAliasSymbol() ?? widened?.getSymbol();
+        const requestInit =
+          sym?.name === "RequestInit" && this.isStdlibSymbol(sym);
+        if (isJsSourceFile(x.getSourceFile()) || requestInit) {
+          return lowerDynObjectLiteral(this, x);
+        }
       }
     }
     // An ARRAY LITERAL against a UNION slot whose own type has no static
@@ -6737,6 +7045,24 @@ export class Lowerer {
     // binding-form text.
     if (symbol) {
       const d = this.checker.valueDeclarationOf(symbol);
+      if (
+        d && ts.isVariableDeclaration(d) && ts.isVariableDeclarationList(d.parent) &&
+        (d.parent.flags & ts.NodeFlags.Const) !== 0
+      ) {
+        const codec = textCodecBindingClassOf(this, d.name, d.initializer);
+        if (codec !== null) {
+          const call = codec === "TextEncoder" ? `${name}.encode(s)` : `${name}.decode(bytes)`;
+          const composed =
+            codec === "TextEncoder"
+              ? "new TextEncoder().encode(s)"
+              : "new TextDecoder().decode(bytes)";
+          this.noLowering(
+            `${codec} instance stored in ${name}`,
+            node,
+            `${call} compiles through this const; the codec object itself has no representation (the composed ${composed} form also compiles)`,
+          );
+        }
+      }
       if (d && ts.isVariableDeclaration(d) && d.initializer === undefined) {
         const t = this.checker.getTypeOfSymbol(symbol);
         const parts = t.isUnionType() ? t.getTypes() : [t];
@@ -6823,6 +7149,9 @@ export class Lowerer {
     isLet: boolean,
     out: IrStmt[],
     dynSpell?: string,): void {
+    if (ts.isObjectBindingPattern(pattern)) {
+      fenceFetchObjectBinding(this, pattern);
+    }
     // An ISLAND source (`const { readFileSync } = await import("fs")` —
     // a namespace handle, or any 'any'-typed object): each bound name is
     // an engine property read, mirroring the island property-read rule —
@@ -7223,13 +7552,21 @@ export class Lowerer {
   }
 
   lowerCall(expr: ts.CallExpression): IrExpr {
-    // The island-backed ambient fetch and dynamic import() claim their
-    // calls before the general dispatch (the general identifier-call paths
-    // have no lowering for a promise-returning ambient global, and
-    // `import` is a keyword callee no identifier path matches).
+    // Ambient fetch (native in static builds, island-backed under
+    // --dynamic) and dynamic import() claim their calls before the general
+    // dispatch. The general identifier-call paths have no lowering for a
+    // promise-returning ambient global, and `import` is a keyword callee no
+    // identifier path matches.
     return (
       lowerFfiCall(this, expr) ??
       lowerFetchCall(this, expr) ??
+      lowerStaticFetchCompanionCall(this, expr) ??
+      lowerStaticAbortSignalListenerCall(this, expr) ??
+      lowerStaticReadableStreamCancelCall(this, expr) ??
+      lowerStaticReadableStreamControllerCall(this, expr) ??
+      lowerStaticReadableStreamReaderCall(this, expr) ??
+      lowerStaticResponseCall(this, expr) ??
+      lowerFetchElementMethodCall(this, expr) ??
       lowerDynamicImportCall(this, expr) ??
       lowerCall(this, expr)
     );
@@ -7465,7 +7802,7 @@ export class Lowerer {
       const arg = this.lowerExpr(expr.arguments[0]!);
       return { kind: "jsOp", op: "construct", args: [ctor, arg], type: JSVAL, loc };
     }
-    return lowerNew(this, expr);
+    return lowerStaticReadableStreamNew(this, expr) ?? lowerNew(this, expr);
   }
 
   lowerFieldRead(expr: ts.PropertyAccessExpression): IrExpr | null {

@@ -21,8 +21,15 @@ import {
 
 const loc = { file: "corpus.ts", start: 0, end: 0 };
 const F64 = { kind: "f64" } as const;
+const STRING = { kind: "string" } as const;
 const BOOL = { kind: "bool" } as const;
 const VOID = { kind: "void" } as const;
+const MODEL = { kind: "record", shapeId: "model-shape" } as const;
+const MODEL_CLASS = { kind: "object", className: "Model" } as const;
+const OPTIONAL_NUMBER = { kind: "union", unionId: "optional-number" } as const;
+const RESIZE_MSG = { kind: "union", unionId: "resize-msg" } as const;
+const RESIZED = { kind: "record", shapeId: "resized-shape" } as const;
+const NOOP = { kind: "record", shapeId: "noop-shape" } as const;
 
 const num = (value: number, spelling?: string): IrExpr =>
   spelling === undefined
@@ -93,6 +100,111 @@ function only(mod: IrModule): IntVerdict {
   expect(vs.length).toBe(1);
   return vs[0]!;
 }
+
+const recordRef = (name = "m"): IrExpr => ({ kind: "varRef", localId: `${name}.0`, type: MODEL, loc });
+const countRead = (name = "m"): IrExpr => ({
+  kind: "recordGet",
+  obj: recordRef(name),
+  shapeId: MODEL.shapeId,
+  field: "count",
+  type: F64,
+  loc,
+});
+const labelRead = (name = "m"): IrExpr => ({
+  kind: "recordGet",
+  obj: recordRef(name),
+  shapeId: MODEL.shapeId,
+  field: "label",
+  type: STRING,
+  loc,
+});
+const countWrite = (value: IrExpr, name = "m"): IrStmt => ({
+  kind: "recordSet",
+  obj: recordRef(name),
+  shapeId: MODEL.shapeId,
+  field: "count",
+  value,
+  loc,
+});
+
+const RECORD_CFG: IntSlotConfig = {
+  fns: new Map(),
+  records: new Map([
+    [MODEL.shapeId, new Map([["count", { cls: "i64", paths: ["Model.count"] }]])],
+  ]),
+};
+
+function recordCase(body: IrStmt[], names = ["m"], extraFns: IrFunction[] = []): IrModule {
+  return {
+    irVersion: 3,
+    sourceFile: "fields.ts",
+    functions: [
+      ...extraFns,
+      {
+        name: "case",
+        params: names.map((name) => ({ localId: `${name}.0`, name, type: MODEL })),
+        returnType: VOID,
+        locals: names.map((name) => ({ id: `${name}.0`, name, type: MODEL, mutable: true })),
+        body,
+        loc,
+      },
+    ],
+    entry: "case",
+  };
+}
+
+function onlyRecord(body: IrStmt[], names = ["m"], extraFns: IrFunction[] = []): IntVerdict {
+  const vs = checkLibraryIntegerSlots(recordCase(body, names, extraFns), RECORD_CFG);
+  expect(vs.length).toBe(1);
+  return vs[0]!;
+}
+
+function onlyOrdinaryRecord(body: IrStmt[], extraFns: IrFunction[] = []): IntVerdict {
+  const vs = checkLibraryIntegerSlots(recordCase(body, ["m"], [sink("send"), ...extraFns]), CFG);
+  expect(vs.length).toBe(1);
+  return vs[0]!;
+}
+
+const classRef = (): IrExpr => ({ kind: "varRef", localId: "m.0", type: MODEL_CLASS, loc });
+const classCountRead = (): IrExpr => ({
+  kind: "fieldGet",
+  obj: classRef(),
+  className: MODEL_CLASS.className,
+  field: "count",
+  type: F64,
+  loc,
+});
+
+function onlyOrdinaryClass(body: IrStmt[]): IntVerdict {
+  const mod: IrModule = {
+    irVersion: 3,
+    sourceFile: "class-fields.ts",
+    functions: [
+      sink("send"),
+      {
+        name: "case",
+        params: [{ localId: "m.0", name: "m", type: MODEL_CLASS }],
+        returnType: VOID,
+        locals: [{ id: "m.0", name: "m", type: MODEL_CLASS, mutable: true }],
+        body,
+        loc,
+      },
+    ],
+    entry: "case",
+  };
+  const vs = checkLibraryIntegerSlots(mod, CFG);
+  expect(vs.length).toBe(1);
+  return vs[0]!;
+}
+
+const noopFn = (name: string, returnsBool = false): IrFunction => ({
+  name,
+  params: [],
+  returnType: returnsBool ? BOOL : VOID,
+  locals: [],
+  body: returnsBool ? [{ kind: "return", value: { kind: "boolLit", value: true, type: BOOL, loc }, loc }] : [],
+  loc,
+});
 
 describe("the ask-4 conformance corpus over scriptc IR", () => {
   test("1. max-safe-integer-exact — PROVE, crossing value 9007199254740991", () => {
@@ -268,6 +380,71 @@ describe("the domain's edges beyond the corpus", () => {
     expect(vs[0]!.detail).toContain(`[${SAFE_MIN}, ${SAFE_MAX}]`);
   });
 
+  test("a matching unit tag makes an optional return vacuous", () => {
+    const x: IrExpr = { kind: "varRef", localId: "x.0", type: OPTIONAL_NUMBER, loc };
+    const one: IrExpr = {
+      kind: "unionWrap",
+      unionId: OPTIONAL_NUMBER.unionId,
+      tag: 0,
+      value: num(1),
+      type: OPTIONAL_NUMBER,
+      loc,
+    };
+    const mod: IrModule = {
+      irVersion: 3,
+      sourceFile: "optional.ts",
+      functions: [{
+        name: "normalize",
+        params: [{ localId: "x.0", name: "x", type: OPTIONAL_NUMBER }],
+        returnType: OPTIONAL_NUMBER,
+        locals: [{ id: "x.0", name: "x", type: OPTIONAL_NUMBER, mutable: true }],
+        body: [
+          {
+            kind: "if",
+            cond: {
+              kind: "unionIsTag",
+              unionId: OPTIONAL_NUMBER.unionId,
+              tag: 1,
+              negated: false,
+              value: x,
+              type: BOOL,
+              loc,
+            },
+            then: [{ kind: "return", value: x, loc }],
+            else_: null,
+            loc,
+          },
+          { kind: "return", value: one, loc },
+        ],
+        loc,
+      }],
+      unions: [{
+        id: OPTIONAL_NUMBER.unionId,
+        arms: [F64, { kind: "nullT" }],
+      }],
+      entry: "normalize",
+    };
+    const cfg: IntSlotConfig = {
+      fns: new Map([[
+        "normalize",
+        {
+          fnName: "normalize",
+          params: [null],
+          paramPaths: [null],
+          ret: "u64",
+          retPath: "helpers.normalize.return",
+          paramSeeds: [null],
+        },
+      ]]),
+      records: new Map(),
+    };
+    const vs = checkLibraryIntegerSlots(mod, cfg);
+    expect(vs).toHaveLength(2);
+    expect(vs.every((v) => v.outcome === "prove")).toBe(true);
+    expect(Number.isNaN(vs[0]!.provenLo)).toBe(true);
+    expect(vs[1]!.provenLo).toBe(1);
+  });
+
   test("a guard that only excludes NaN still refuses on the unbounded range", () => {
     // if (a === a) send(a) — NaN excluded, but the interval stays ±∞.
     const v = only(caseModule(["a"], [], [iff(bin("===", ref("a.0"), ref("a.0")), [send(ref("a.0"))])]));
@@ -329,5 +506,327 @@ describe("the domain's edges beyond the corpus", () => {
     expect(v.outcome).toBe("refuse");
     expect(v.obligation).toBe("wholeness");
     expect(v.detail).toContain("NaN");
+  });
+});
+
+describe("straight-line ordinary-field refinement", () => {
+  test("ordered comparisons refine a repeated record field into Math.trunc", () => {
+    const v = onlyOrdinaryRecord([
+      iff(and(bin(">=", countRead(), num(0)), bin("<=", countRead(), num(100))), [
+        send(math("trunc", countRead())),
+      ]),
+    ]);
+    expect(v.outcome).toBe("prove");
+    expect(v.provenLo).toBe(0);
+    expect(v.provenHi).toBe(100);
+  });
+
+  test("an unrelated string !== conjunct preserves the numeric field facts", () => {
+    const labelIsNotSkip: IrExpr = {
+      kind: "strEq",
+      negated: true,
+      left: labelRead(),
+      right: { kind: "strLit", value: "skip", type: STRING, loc },
+      type: BOOL,
+      loc,
+    };
+    const range = and(bin(">=", countRead(), num(0)), bin("<=", countRead(), num(100)));
+    const v = onlyOrdinaryRecord([
+      iff(and(labelIsNotSkip, range), [send(math("trunc", countRead()))]),
+    ]);
+    expect(v.outcome).toBe("prove");
+    expect(v.provenLo).toBe(0);
+    expect(v.provenHi).toBe(100);
+  });
+
+  test("a union discriminant conjunct preserves narrowed payload-field facts", () => {
+    const msgRef = (): IrExpr => ({ kind: "varRef", localId: "msg.0", type: RESIZE_MSG, loc });
+    const widthRead = (): IrExpr => ({
+      kind: "recordGet",
+      obj: {
+        kind: "unionNarrow",
+        unionId: RESIZE_MSG.unionId,
+        tag: 1,
+        value: msgRef(),
+        type: RESIZED,
+        loc,
+      },
+      shapeId: RESIZED.shapeId,
+      field: "w",
+      type: F64,
+      loc,
+    });
+    const isResized: IrExpr = {
+      kind: "strEq",
+      negated: false,
+      left: {
+        kind: "unionDisc",
+        unionId: RESIZE_MSG.unionId,
+        field: "kind",
+        value: msgRef(),
+        type: STRING,
+        loc,
+      },
+      right: { kind: "strLit", value: "resized", type: STRING, loc },
+      type: BOOL,
+      loc,
+    };
+    const mod = recordCase([
+      iff(and(isResized, and(bin(">=", widthRead(), num(0)), bin("<=", widthRead(), num(65535)))), [
+        send(math("trunc", widthRead())),
+      ]),
+    ], ["msg"], [sink("send")]);
+    mod.functions[1]!.params[0]!.type = RESIZE_MSG;
+    mod.functions[1]!.locals[0]!.type = RESIZE_MSG;
+    mod.unions = [{ id: RESIZE_MSG.unionId, arms: [NOOP, RESIZED] }];
+
+    const v = only(mod);
+    expect(v.outcome).toBe("prove");
+    expect(v.provenLo).toBe(0);
+    expect(v.provenHi).toBe(65535);
+  });
+
+  test("a union discriminant read preserves an existing field fact", () => {
+    const msgRef = (): IrExpr => ({ kind: "varRef", localId: "msg.0", type: RESIZE_MSG, loc });
+    const isResized: IrExpr = {
+      kind: "strEq",
+      negated: false,
+      left: {
+        kind: "unionDisc",
+        unionId: RESIZE_MSG.unionId,
+        field: "kind",
+        value: msgRef(),
+        type: STRING,
+        loc,
+      },
+      right: { kind: "strLit", value: "resized", type: STRING, loc },
+      type: BOOL,
+      loc,
+    };
+    const mod = recordCase([
+      iff(bin(">=", countRead(), num(0)), [
+        iff(and(isResized, bin("<=", countRead(), num(100))), [
+          send(math("trunc", countRead()), "sendU64"),
+        ]),
+      ]),
+    ], ["m", "msg"], [sink("sendU64")]);
+    mod.functions[1]!.params[1]!.type = RESIZE_MSG;
+    mod.functions[1]!.locals[1]!.type = RESIZE_MSG;
+    mod.unions = [{ id: RESIZE_MSG.unionId, arms: [NOOP, RESIZED] }];
+
+    const v = only(mod);
+    expect(v.outcome).toBe("prove");
+    expect(v.provenLo).toBe(0);
+    expect(v.provenHi).toBe(100);
+  });
+
+  test("ordered comparisons refine a repeated class field into Math.trunc", () => {
+    const v = onlyOrdinaryClass([
+      iff(and(bin(">=", classCountRead(), num(0)), bin("<=", classCountRead(), num(100))), [
+        send(math("trunc", classCountRead())),
+      ]),
+    ]);
+    expect(v.outcome).toBe("prove");
+    expect(v.provenLo).toBe(0);
+    expect(v.provenHi).toBe(100);
+  });
+
+  test("a call between an ordinary-field guard and use kills the proof", () => {
+    const call: IrStmt = {
+      kind: "exprStmt",
+      expr: { kind: "call", callee: "touch", args: [], type: VOID, loc },
+      loc,
+    };
+    const v = onlyOrdinaryRecord([
+      iff(and(bin(">=", countRead(), num(0)), bin("<=", countRead(), num(100))), [
+        call,
+        send(math("trunc", countRead())),
+      ]),
+    ], [noopFn("touch")]);
+    expect(v.outcome).toBe("refuse");
+    expect(v.obligation).toBe("wholeness");
+    expect(v.detail).toContain("NaN");
+  });
+
+  test("a heap write between an ordinary-field guard and use kills the proof", () => {
+    const otherWrite: IrStmt = {
+      kind: "recordSet",
+      obj: recordRef(),
+      shapeId: MODEL.shapeId,
+      field: "other",
+      value: num(0),
+      loc,
+    };
+    const v = onlyOrdinaryRecord([
+      iff(and(bin(">=", countRead(), num(0)), bin("<=", countRead(), num(100))), [
+        otherWrite,
+        send(math("trunc", countRead())),
+      ]),
+    ]);
+    expect(v.outcome).toBe("refuse");
+    expect(v.obligation).toBe("wholeness");
+    expect(v.detail).toContain("NaN");
+  });
+});
+
+describe("straight-line declared-field refinement", () => {
+  test("an if guard refines the repeated field read through its boundary write", () => {
+    const v = onlyRecord([
+      iff(bin("<", countRead(), num(1000)), [
+        countWrite(bin("+", countRead(), num(1))),
+      ]),
+    ]);
+    expect(v.outcome).toBe("prove");
+    expect(v.provenLo).toBe(SAFE_MIN + 1);
+    expect(v.provenHi).toBe(1000);
+  });
+
+  test("a ternary condition shares the field refinement path", () => {
+    const value: IrExpr = {
+      kind: "ternary",
+      cond: bin("<", countRead(), num(1000)),
+      then: bin("+", countRead(), num(1)),
+      else_: num(0),
+      type: F64,
+      loc,
+    };
+    const v = onlyRecord([countWrite(value)]);
+    expect(v.outcome).toBe("prove");
+    expect(v.provenLo).toBe(SAFE_MIN + 1);
+    expect(v.provenHi).toBe(1000);
+  });
+
+  test("an early-return guard carries its sole reachable edge", () => {
+    const v = onlyRecord([
+      iff(bin(">=", countRead(), num(1000)), [{ kind: "return", value: null, loc }]),
+      countWrite(bin("+", countRead(), num(1))),
+    ]);
+    expect(v.outcome).toBe("prove");
+    expect(v.provenHi).toBe(1000);
+  });
+
+  test("the boundary check precedes the call's path kill", () => {
+    const sendCount: IrFunction = {
+      name: "sendCount",
+      params: [{ localId: "x.0", name: "x", type: F64 }],
+      returnType: VOID,
+      locals: [{ id: "x.0", name: "x", type: F64, mutable: true }],
+      body: [],
+      loc,
+    };
+    const cfg: IntSlotConfig = {
+      fns: new Map([
+        ["sendCount", {
+          fnName: "sendCount",
+          params: ["i64"],
+          paramPaths: ["exports.sendCount.params[0]"],
+          ret: null,
+          retPath: null,
+          paramSeeds: [null],
+        }],
+      ]),
+      records: RECORD_CFG.records,
+    };
+    const call: IrStmt = {
+      kind: "exprStmt",
+      expr: {
+        kind: "call",
+        callee: "sendCount",
+        args: [bin("+", countRead(), num(1))],
+        type: VOID,
+        loc,
+      },
+      loc,
+    };
+    const vs = checkLibraryIntegerSlots(
+      recordCase([iff(bin("<", countRead(), num(1000)), [call])], ["m"], [sendCount]),
+      cfg,
+    );
+    expect(vs).toHaveLength(1);
+    expect(vs[0]!.outcome).toBe("prove");
+    expect(vs[0]!.provenHi).toBe(1000);
+  });
+
+  test("a call between guard and use restores the declared seed", () => {
+    const call: IrStmt = {
+      kind: "exprStmt",
+      expr: { kind: "call", callee: "touch", args: [], type: VOID, loc },
+      loc,
+    };
+    const v = onlyRecord([
+      iff(bin("<", countRead(), num(1000)), [
+        call,
+        countWrite(bin("+", countRead(), num(1))),
+      ]),
+    ], ["m"], [noopFn("touch")]);
+    expect(v.outcome).toBe("refuse");
+    expect(v.obligation).toBe("range");
+  });
+
+  test("a heap write between guard and use kills possible aliases", () => {
+    const otherWrite: IrStmt = {
+      kind: "recordSet",
+      obj: recordRef(),
+      shapeId: MODEL.shapeId,
+      field: "other",
+      value: num(0),
+      loc,
+    };
+    const v = onlyRecord([
+      iff(bin("<", countRead(), num(1000)), [
+        otherWrite,
+        countWrite(bin("+", countRead(), num(1))),
+      ]),
+    ]);
+    expect(v.outcome).toBe("refuse");
+    expect(v.obligation).toBe("range");
+  });
+
+  test("rebinding the receiver kills its path without alias analysis", () => {
+    const v = onlyRecord([
+      iff(bin("<", countRead(), num(1000)), [
+        { kind: "assign", localId: "m.0", value: recordRef("other"), loc },
+        countWrite(bin("+", countRead(), num(1))),
+      ]),
+    ], ["m", "other"]);
+    expect(v.outcome).toBe("refuse");
+    expect(v.obligation).toBe("range");
+  });
+
+  test("a suspension between guard and use kills the path", () => {
+    const suspend: IrStmt = {
+      kind: "exprStmt",
+      expr: {
+        kind: "awaitExpr",
+        value: { kind: "boolLit", value: true, type: BOOL, loc },
+        type: VOID,
+        loc,
+      },
+      loc,
+    };
+    const v = onlyRecord([
+      iff(bin("<", countRead(), num(1000)), [
+        suspend,
+        countWrite(bin("+", countRead(), num(1))),
+      ]),
+    ]);
+    expect(v.outcome).toBe("refuse");
+    expect(v.obligation).toBe("range");
+  });
+
+  test("a later call in a compound guard cannot resurrect a stale path", () => {
+    const cond: IrExpr = {
+      kind: "logical",
+      op: "&&",
+      left: bin("<", countRead(), num(1000)),
+      right: { kind: "call", callee: "touch", args: [], type: BOOL, loc },
+      type: BOOL,
+      loc,
+    };
+    const v = onlyRecord([
+      iff(cond, [countWrite(bin("+", countRead(), num(1)))]),
+    ], ["m"], [noopFn("touch", true)]);
+    expect(v.outcome).toBe("refuse");
+    expect(v.obligation).toBe("range");
   });
 });

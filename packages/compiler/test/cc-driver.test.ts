@@ -118,6 +118,22 @@ test("host-native clang static build compiles the runtime and runs", async () =>
   expect(stdout).toBe("clang says hi\n");
 });
 
+test("host-native clang static build links native fetch after zlib inputs", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "scr-host-fetch-clang-"));
+  const cPath = join(dir, "program.c");
+  await writeFile(
+    cPath,
+    "void scr_fetch_install(void);\nint main(void) { scr_fetch_install(); return 0; }\n",
+  );
+  const outPath = join(dir, "program");
+  // Ubuntu's GNU ld defaults to left-to-right/as-needed resolution. This
+  // link fails when -lz precedes scr_fetch.c even though ld64 accepts it.
+  await withCcEnv(undefined, undefined, () =>
+    compileC({ cPath, outPath, fetch: true }),
+  );
+  await execFileAsync(outPath);
+}, 600_000);
+
 const HELLO_C = '#include <stdio.h>\nint main(void) { printf("zigcc says hi\\n"); return 0; }\n';
 
 describe.skipIf(!zigOnPath())("zig cc builds (zig on PATH)", () => {

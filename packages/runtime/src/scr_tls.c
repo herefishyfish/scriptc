@@ -336,17 +336,14 @@ typedef struct ScrTlsCli {
 } ScrTlsCli;
 
 /* The default trust anchors when no `ca` option is given: the system
- * bundle, standing in for Node's compiled-in Mozilla roots. Probed once
- * across the distro spellings — /etc/ssl/cert.pem first (macOS ships it;
- * Alpine links it), then Debian/Ubuntu's ca-certificates.crt,
- * Fedora/RHEL's ca-bundle.crt, and openSUSE's ca-bundle.pem. On macOS
- * only the first path exists, so the probe order changes nothing there.
- * A host with none leaves the chain empty: verification fails, exactly
- * the no-roots behavior /etc/ssl/cert.pem-only had. Windows is that host
- * by construction (no PEM bundle ships; the OS store is cert-database-
- * shaped) — a no-`ca` client there fails verification like a bundle-less
- * Unix host, which agrees with the oracle wherever the fixtures tread
- * (their CAs are local, never in Node's Mozilla roots either). */
+ * bundle, standing in for Node's compiled-in Mozilla roots, plus
+ * NODE_EXTRA_CA_CERTS. The system bundle is probed once across the distro
+ * spellings — /etc/ssl/cert.pem first (macOS ships it; Alpine links it),
+ * then Debian/Ubuntu's ca-certificates.crt, Fedora/RHEL's ca-bundle.crt,
+ * and openSUSE's ca-bundle.pem. On macOS only the first path exists, so
+ * the probe order changes nothing there. A host with none leaves only the
+ * optional extra chain. Windows is that host by construction (no PEM
+ * bundle ships; the OS store is cert-database-shaped). */
 static mbedtls_x509_crt scr_tls_system_roots;
 static bool scr_tls_system_roots_loaded = false;
 
@@ -385,6 +382,13 @@ static mbedtls_x509_crt *scr_tls_system_ca(void) {
     };
     for (size_t i = 0; i < sizeof bundles / sizeof bundles[0]; i++) {
       if (mbedtls_x509_crt_parse_file(&scr_tls_system_roots, bundles[i]) == 0) break;
+    }
+    const char *extra = NULL;
+    size_t extra_len = 0;
+    if (scr_tls_ca_extra_pem(&extra, &extra_len) && extra_len > 0) {
+      (void)mbedtls_x509_crt_parse(
+          &scr_tls_system_roots, (const unsigned char *)extra,
+          extra_len + 1);
     }
   }
   return &scr_tls_system_roots;

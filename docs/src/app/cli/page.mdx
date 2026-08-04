@@ -13,6 +13,8 @@ Usage:
   scriptc coverage <file.ts|.js> --dynamic  what a --dynamic build compiles, and what still blocks it
   scriptc build <file.ts|.js> --target android
                                             emit an Android Gradle/NDK project
+  scriptc coverage <file.ts|.js> --external-types <specifier=file.d.ts>
+                                            type-resolve an embedder-provided module for analysis
 ```
 
 ## scriptc build
@@ -124,6 +126,9 @@ Analyzes the program without producing a binary and reports, statement by statem
   <dt><code>--provenance-sources</code></dt>
   <dd>EXPERIMENTAL. Compile npm dependencies from their provenance-attested source, fetched at the attested commit, as static program modules; packages without a usable attestation keep the engine path (a note, never a failure).</dd>
 
+  <dt><code>--external-types &lt;specifier=file.d.ts&gt;</code></dt>
+  <dd>Coverage only. Map an exact bare module specifier to a local declaration file supplied by an embedder. Repeat the option for multiple modules. The declaration supplies checker types so application coverage can continue; runtime imports and values remain explicit <code>SC1010</code> blockers. Relative paths resolve from the current working directory. Accepted files end in <code>.d.ts</code>, <code>.d.mts</code>, or <code>.d.cts</code>.</dd>
+
   <dt><code>--sanitize</code></dt>
   <dd>Build with AddressSanitizer plus the runtime reference-count audit — the same lane the compiler's own test corpus runs under. Useful when a program misbehaves and you want leaks or memory errors to be loud.</dd>
 
@@ -134,7 +139,7 @@ Analyzes the program without producing a binary and reports, statement by statem
   <dd>Keep (default) or delete the generated program translation unit next to the executable — the <code>.ll</code> file under the default LLVM backend, or the <code>.c</code> under <code>--backend c</code> (and when the default build fell back). The generated C is readable and annotated with source lines.</dd>
 
   <dt><code>--from-c</code></dt>
-  <dd>Treat the input as a C (or <code>.ll</code>) file. Toolchain plumbing and debugging.</dd>
+  <dd>Treat the input as a C (or <code>.ll</code>) file. Toolchain plumbing and debugging. These arbitrary translation units bypass the persistent artifact cache because their header dependency graph is caller-owned.</dd>
 
   <dt><code>-h, --help</code></dt>
   <dd>Show usage.</dd>
@@ -143,6 +148,15 @@ Analyzes the program without producing a binary and reports, statement by statem
 ## Environment variables
 
 <dl>
+  <dt><code>SCRIPTC_CACHE_DIR</code></dt>
+  <dd>Override the persistent build-cache root. By default it is <code>$XDG_CACHE_HOME/scriptc/build</code> when that variable is set, <code>$HOME/Library/Caches/scriptc/build</code> on macOS, <code>%LOCALAPPDATA%\scriptc\cache\build</code> on Windows, and <code>$HOME/.cache/scriptc/build</code> on other platforms. The cache stores checksum-verified, content-addressed executables, library archives, and per-flavor runtime objects. Identities include the compiler's resolved system-header dependencies and linker/assembler identities. The compiler remains required so dependency selection is rediscovered on every cache-enabled invocation. FFI builds with archive/object inputs or ambient <code>system_libraries</code> always relink against their current dependencies while retaining runtime-object reuse. Mutable compiler input paths such as <code>CPATH</code> and <code>SDKROOT</code>, and compiler wrappers, bypass persistent artifacts and objects so dependencies rebuilt in place cannot go stale. Opaque archiver wrappers rebuild library program members and archives while retaining runtime-object reuse. Direct Clang, Apple's system Clang shim, <code>zig cc</code>, trusted platform archivers, and <code>zig ar</code> retain their applicable persistent tiers. An existing POSIX override must already be private; otherwise caching is bypassed without changing the directory's permissions.</dd>
+
+  <dt><code>SCRIPTC_NO_CACHE</code></dt>
+  <dd>Set to <code>1</code> to bypass all build-cache reads and writes. An explicitly empty <code>SCRIPTC_CACHE_DIR</code> has the same effect.</dd>
+
+  <dt><code>SCRIPTC_CACHE_MAX_MB</code></dt>
+  <dd>Maximum build-cache size in megabytes. The default is <code>4096</code>; the default cache is swept periodically, while an explicitly configured cap is checked after every successful cache write. Least-recently-used entries are removed when the cache exceeds the cap.</dd>
+
   <dt><code>SCRIPTC_CC</code></dt>
   <dd>The C compiler to invoke. <code>zigcc</code> selects zig's bundled clang, which enables cross-compilation with its bundled sysroots.</dd>
 

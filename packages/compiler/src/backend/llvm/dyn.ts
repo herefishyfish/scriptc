@@ -51,6 +51,7 @@ export const DK = {
   HANDLE: 9,
   PROMISE: 10,
   JSVAL: 11, /* SCR_DYN_JSVAL — island values held by reference */
+  TYPED_REF: 12, /* SCR_DYN_TYPED_REF — static Web-stream transit capsule */
 } as const;
 
 /** What the dyn helpers need beyond the walker host: interned immortal
@@ -335,6 +336,37 @@ export class LlDyn {
     const name = `sc_dm_${this.dynMatchers.size}`;
     this.dynMatchers.set(key, name);
     const B = new BlockBuilder();
+    if (isRefCounted(t) && t.kind !== "dyn") {
+      this.host.declare(`declare zeroext i1 @scr_dyn_typed_ref_is(ptr, ptr, i64)`);
+      const matched = B.tmp();
+      B.line(
+        `${matched} = call zeroext i1 @scr_dyn_typed_ref_is(ptr %d, ptr ${this.host.cstr(key)}, i64 ${Buffer.byteLength(key, "utf8")})`,
+      );
+      const lRef = B.newLabel("dm.tr");
+      const lNext = B.newLabel("dm.nt");
+      B.condBr(matched, lRef, lNext);
+      B.startBlock(lRef);
+      B.terminate(`ret i1 true`);
+      B.startBlock(lNext);
+    }
+    if (t.kind !== "dyn") {
+      this.host.declare(`declare ptr @scr_dyn_typed_ref_materialize(ptr)`);
+      this.host.declare(`declare void @scr_dyn_release_v(ptr)`);
+      const kind = this.kindOf(B, "%d");
+      const capsule = B.tmp();
+      B.line(`${capsule} = icmp eq i32 ${kind}, ${DK.TYPED_REF}`);
+      const lCapsule = B.newLabel("dm.tr.mat");
+      const lPlain = B.newLabel("dm.tr.plain");
+      B.condBr(capsule, lCapsule, lPlain);
+      B.startBlock(lCapsule);
+      const materialized = B.tmp();
+      const matched = B.tmp();
+      B.line(`${materialized} = call ptr @scr_dyn_typed_ref_materialize(ptr %d)`);
+      B.line(`${matched} = call zeroext i1 @${name}(ptr ${materialized})`);
+      B.line(`call void @scr_dyn_release_v(ptr ${materialized})`);
+      B.terminate(`ret i1 ${matched}`);
+      B.startBlock(lPlain);
+    }
     const kindIs = (k: number): void => {
       const kd = this.kindOf(B, "%d");
       const r = B.tmp();
@@ -536,6 +568,132 @@ export class LlDyn {
     host.declare(`declare void @scr_dyn_check_fail(ptr, ptr, ptr)`);
     const want = host.cstr(this.dynDesc(t));
     const B = new BlockBuilder();
+    if (isRefCounted(t) && t.kind !== "dyn") {
+      host.declare(`declare zeroext i1 @scr_dyn_typed_ref_is(ptr, ptr, i64)`);
+      host.declare(`declare ptr @scr_dyn_typed_ref_unbox(ptr)`);
+      const matched = B.tmp();
+      B.line(
+        `${matched} = call zeroext i1 @scr_dyn_typed_ref_is(ptr %d, ptr ${host.cstr(key)}, i64 ${Buffer.byteLength(key, "utf8")})`,
+      );
+      const lRef = B.newLabel("dc.tr");
+      const lNext = B.newLabel("dc.nt");
+      B.condBr(matched, lRef, lNext);
+      B.startBlock(lRef);
+      const ref = B.tmp();
+      B.line(`${ref} = call ptr @scr_dyn_typed_ref_unbox(ptr %d)`);
+      B.terminate(`ret ptr ${ref}`);
+      B.startBlock(lNext);
+      if (t.kind !== "union") {
+        host.declare(`declare ptr @scr_dyn_typed_ref_materialize(ptr)`);
+        host.declare(`declare ptr @scr_dyn_typed_ref_cached_cast(ptr, ptr, i64)`);
+        host.declare(`declare void @scr_dyn_typed_ref_cache_cast(ptr, ptr, i64, ptr, ptr, ptr)`);
+        host.declare(`declare void @scr_dyn_release_v(ptr)`);
+        const rc = vAdapters(host, t);
+        const kind = this.kindOf(B, "%d");
+        const capsule = B.tmp();
+        B.line(`${capsule} = icmp eq i32 ${kind}, ${DK.TYPED_REF}`);
+        const lCapsule = B.newLabel("dc.tr.cap");
+        const lPlain = B.newLabel("dc.tr.plain");
+        B.condBr(capsule, lCapsule, lPlain);
+        B.startBlock(lCapsule);
+        const cached = B.tmp();
+        B.line(`${cached} = call ptr @scr_dyn_typed_ref_cached_cast(ptr %d, ptr ${host.cstr(key)}, i64 ${Buffer.byteLength(key, "utf8")})`);
+        const hasCached = B.tmp();
+        B.line(`${hasCached} = icmp ne ptr ${cached}, null`);
+        if (t.kind !== "record" && t.kind !== "array") {
+          const lCached = B.newLabel("dc.tr.hit");
+          const lMaterialize = B.newLabel("dc.tr.mat");
+          B.condBr(hasCached, lCached, lMaterialize);
+          B.startBlock(lCached);
+          B.terminate(`ret ptr ${cached}`);
+          B.startBlock(lMaterialize);
+        }
+        const materialized = B.tmp();
+        const checked = B.tmp();
+        B.line(`${materialized} = call ptr @scr_dyn_typed_ref_materialize(ptr %d)`);
+        B.line(`${checked} = call ${retTy} @${name}(ptr ${materialized}, ptr %path)`);
+        B.line(`call void @scr_dyn_release_v(ptr ${materialized})`);
+        const ok = B.tmp();
+        B.line(`${ok} = icmp ne ptr ${checked}, null`);
+        if (t.kind === "record" || t.kind === "array") {
+          const shape = t.kind === "record"
+            ? host.recordsById.get(t.shapeId)
+            : undefined;
+          if (t.kind === "record" && !shape) {
+            throw new Error(
+              `llvm emitter bug: cached typed-ref cast of unknown shape ${t.shapeId}`,
+            );
+          }
+          const lOk = B.newLabel("dc.tr.ok");
+          const lBad = B.newLabel("dc.tr.bad");
+          B.condBr(ok, lOk, lBad);
+          B.startBlock(lBad);
+          const lBadDrop = B.newLabel("dc.tr.bad.drop");
+          const lBadRet = B.newLabel("dc.tr.bad.ret");
+          B.condBr(hasCached, lBadDrop, lBadRet);
+          B.startBlock(lBadDrop);
+          B.line(`call void ${releaseSym(host, t)}(ptr ${cached})`);
+          B.br(lBadRet);
+          B.startBlock(lBadRet);
+          B.terminate(`ret ptr null`);
+          B.startBlock(lOk);
+          const lRefresh = B.newLabel("dc.tr.refresh");
+          const lCache = B.newLabel("dc.tr.put");
+          B.condBr(hasCached, lRefresh, lCache);
+          B.startBlock(lRefresh);
+          const members = t.kind === "record"
+            ? [
+                ...shape!.fields.map((field, index) => ({
+                  index: index + 1,
+                  type: llFieldType(field.type),
+                  name: field.name,
+                })),
+                ...(shape!.indexValue
+                  ? [{
+                      index: shape!.fields.length + 1,
+                      type: "ptr" as const,
+                      name: "[key: string] overflow",
+                    }]
+                  : []),
+              ]
+            : [
+                { index: 1, type: "i64" as const, name: "length" },
+                { index: 2, type: "i64" as const, name: "capacity" },
+                { index: 7, type: "ptr" as const, name: "data" },
+              ];
+          members.forEach((member) => {
+            const cachedPtr = B.tmp();
+            const checkedPtr = B.tmp();
+            const oldValue = B.tmp();
+            const newValue = B.tmp();
+            const struct = t.kind === "record"
+              ? `%${mangleRecordStruct(t.shapeId)}`
+              : "%ScrArr";
+            B.line(`${cachedPtr} = getelementptr inbounds ${struct}, ptr ${cached}, i64 0, i32 ${member.index}`);
+            B.line(`${checkedPtr} = getelementptr inbounds ${struct}, ptr ${checked}, i64 0, i32 ${member.index}`);
+            B.line(`${oldValue} = load ${member.type}, ptr ${cachedPtr} ; ${member.name}`);
+            B.line(`${newValue} = load ${member.type}, ptr ${checkedPtr}`);
+            B.line(`store ${member.type} ${newValue}, ptr ${cachedPtr}`);
+            B.line(`store ${member.type} ${oldValue}, ptr ${checkedPtr}`);
+          });
+          B.line(`call void ${releaseSym(host, t)}(ptr ${checked})`);
+          B.terminate(`ret ptr ${cached}`);
+          B.startBlock(lCache);
+          B.line(`call void @scr_dyn_typed_ref_cache_cast(ptr %d, ptr ${host.cstr(key)}, i64 ${Buffer.byteLength(key, "utf8")}, ptr ${checked}, ptr ${rc.retain}, ptr ${rc.release})`);
+          B.terminate(`ret ptr ${checked}`);
+        } else {
+          const lCache = B.newLabel("dc.tr.put");
+          const lReturn = B.newLabel("dc.tr.ret");
+          B.condBr(ok, lCache, lReturn);
+          B.startBlock(lCache);
+          B.line(`call void @scr_dyn_typed_ref_cache_cast(ptr %d, ptr ${host.cstr(key)}, i64 ${Buffer.byteLength(key, "utf8")}, ptr ${checked}, ptr ${rc.retain}, ptr ${rc.release})`);
+          B.br(lReturn);
+          B.startBlock(lReturn);
+          B.terminate(`ret ptr ${checked}`);
+        }
+        B.startBlock(lPlain);
+      }
+    }
     /** kind test with the standard fail path (got = %d). */
     const requireKind = (k: number, hint: string): void => {
       const kd = this.kindOf(B, "%d");
@@ -572,9 +730,11 @@ export class LlDyn {
         break;
       }
       case "dyn": {
-        // An `unknown` slot: the checked-dynamic tree subtree passes through as-is.
-        const r = this.retainDyn(B, "%d");
-        B.terminate(`ret ptr ${r}`);
+        // Preserve the capsule at an unknown boundary. Generic dyn
+        // operations materialize its one cached detached view, while
+        // strict equality keeps repeated stream references identical.
+        const retained = this.retainDyn(B, "%d");
+        B.terminate(`ret ptr ${retained}`);
         break;
       }
       case "bytes": {
@@ -703,13 +863,17 @@ export class LlDyn {
           const m = this.objGetLit(B, "%d", f.name);
           if (f.type.kind === "dyn") {
             // An `unknown` field: a present key passes through, a missing
-            // one IS the undefined dyn value.
+            // one IS the undefined dyn value. Go through the dyn builder so
+            // a Web-stream typed-ref capsule cannot escape inside a checked
+            // record field.
             const has = B.tmp();
             B.line(`${has} = icmp ne ptr ${m}, null`);
             const sel = B.tmp();
             const u = this.undef(B);
             B.line(`${sel} = select i1 ${has}, ptr ${m}, ptr ${u}`);
-            storeInto(f.name, f.type, this.retainDyn(B, sel));
+            const value = B.tmp();
+            B.line(`${value} = call ptr @${this.dynCheckHelper(f.type)}(ptr ${sel}, ptr ${pathSlot})`);
+            storeInto(f.name, f.type, value);
           } else if (utag >= 0 && f.type.kind === "union") {
             const unit = host.unitInstanceRef(f.type.unionId, utag);
             const has = B.tmp();
@@ -893,6 +1057,75 @@ export class LlDyn {
           }
           B.startBlock(lNext);
         });
+        // Preserve an exact typed-ref arm above. If no producer tag matched,
+        // retry the union against the ordinary copy-based structural
+        // snapshot (the compiler's width-coercion stance, rather than a
+        // live narrowed alias).
+        host.declare(`declare ptr @scr_dyn_typed_ref_materialize(ptr)`);
+        host.declare(`declare ptr @scr_dyn_typed_ref_cached_cast(ptr, ptr, i64)`);
+        host.declare(`declare void @scr_dyn_typed_ref_cache_cast(ptr, ptr, i64, ptr, ptr, ptr)`);
+        host.declare(`declare void @scr_dyn_release_v(ptr)`);
+        host.declare(`declare void @scr_union_release(ptr)`);
+        const rc = vAdapters(host, t);
+        const kind = this.kindOf(B, "%d");
+        const capsule = B.tmp();
+        B.line(`${capsule} = icmp eq i32 ${kind}, ${DK.TYPED_REF}`);
+        const lCapsule = B.newLabel("dcu.cap");
+        const lFail = B.newLabel("dcu.fail");
+        B.condBr(capsule, lCapsule, lFail);
+        B.startBlock(lCapsule);
+        const cached = B.tmp();
+        B.line(`${cached} = call ptr @scr_dyn_typed_ref_cached_cast(ptr %d, ptr ${host.cstr(key)}, i64 ${Buffer.byteLength(key, "utf8")})`);
+        const hasCached = B.tmp();
+        B.line(`${hasCached} = icmp ne ptr ${cached}, null`);
+        const materialized = B.tmp();
+        const checked = B.tmp();
+        B.line(`${materialized} = call ptr @scr_dyn_typed_ref_materialize(ptr %d)`);
+        B.line(`${checked} = call ptr @${name}(ptr ${materialized}, ptr %path)`);
+        B.line(`call void @scr_dyn_release_v(ptr ${materialized})`);
+        const ok = B.tmp();
+        B.line(`${ok} = icmp ne ptr ${checked}, null`);
+        const lOk = B.newLabel("dcu.ok");
+        const lBad = B.newLabel("dcu.bad");
+        B.condBr(ok, lOk, lBad);
+        B.startBlock(lBad);
+        const lBadDrop = B.newLabel("dcu.bad.drop");
+        const lBadRet = B.newLabel("dcu.bad.ret");
+        B.condBr(hasCached, lBadDrop, lBadRet);
+        B.startBlock(lBadDrop);
+        B.line(`call void @scr_union_release(ptr ${cached})`);
+        B.br(lBadRet);
+        B.startBlock(lBadRet);
+        B.terminate(`ret ptr null`);
+        B.startBlock(lOk);
+        const lRefresh = B.newLabel("dcu.refresh");
+        const lCache = B.newLabel("dcu.put");
+        B.condBr(hasCached, lRefresh, lCache);
+        B.startBlock(lRefresh);
+        ([
+          [1, "i32", "tag"],
+          [2, "ptr", "retain"],
+          [3, "ptr", "release"],
+          [4, "ptr", "trace"],
+          [5, "i64", "slot"],
+        ] as const).forEach(([index, fieldType, fieldName]) => {
+          const cachedPtr = B.tmp();
+          const checkedPtr = B.tmp();
+          const oldValue = B.tmp();
+          const newValue = B.tmp();
+          B.line(`${cachedPtr} = getelementptr inbounds %ScrUnion, ptr ${cached}, i64 0, i32 ${index}`);
+          B.line(`${checkedPtr} = getelementptr inbounds %ScrUnion, ptr ${checked}, i64 0, i32 ${index}`);
+          B.line(`${oldValue} = load ${fieldType}, ptr ${cachedPtr} ; ${fieldName}`);
+          B.line(`${newValue} = load ${fieldType}, ptr ${checkedPtr}`);
+          B.line(`store ${fieldType} ${newValue}, ptr ${cachedPtr}`);
+          B.line(`store ${fieldType} ${oldValue}, ptr ${checkedPtr}`);
+        });
+        B.line(`call void @scr_union_release(ptr ${checked})`);
+        B.terminate(`ret ptr ${cached}`);
+        B.startBlock(lCache);
+        B.line(`call void @scr_dyn_typed_ref_cache_cast(ptr %d, ptr ${host.cstr(key)}, i64 ${Buffer.byteLength(key, "utf8")}, ptr ${checked}, ptr ${rc.retain}, ptr ${rc.release})`);
+        B.terminate(`ret ptr ${checked}`);
+        B.startBlock(lFail);
         B.line(`call void @scr_dyn_check_fail(ptr %path, ptr ${want}, ptr %d)`);
         B.terminate(`ret ptr null`);
         break;
@@ -981,6 +1214,7 @@ export class LlDyn {
     this.toDynFns.set(key, name);
     const host = this.host;
     const B = new BlockBuilder();
+    let sourceAccessor: { name: string; release: string } | null = null;
     switch (t.kind) {
       case "f64": {
         host.declare(`declare ptr @scr_dyn_new_num(double)`);
@@ -1016,6 +1250,14 @@ export class LlDyn {
       }
       case "dyn": {
         const r = this.retainDyn(B, "%v");
+        B.terminate(`ret ptr ${r}`);
+        break;
+      }
+      case "func": {
+        const r = B.tmp();
+        B.line(
+          `${r} = call ptr @${this.dynFuncBoxHelper(t)}(ptr %v, ptr null)`,
+        );
         B.terminate(`ret ptr ${r}`);
         break;
       }
@@ -1069,9 +1311,24 @@ export class LlDyn {
           B.terminate(`ret ptr ${d}`);
           break;
         }
-        host.declare(`declare ptr @scr_dyn_new_obj()`);
         const d = B.tmp();
-        B.line(`${d} = call ptr @scr_dyn_new_obj()`);
+        const carriesListenerIdentity = shape.fields.some(
+          (f) => f.name === "handleEvent" && f.type.kind === "func",
+        );
+        if (carriesListenerIdentity) {
+          const rc = vAdapters(host, t);
+          sourceAccessor = {
+            name: `${name}_source_access`,
+            release: rc.release,
+          };
+          host.declare(`declare ptr @scr_dyn_new_obj_with_identity(ptr, ptr, ptr)`);
+          B.line(
+            `${d} = call ptr @scr_dyn_new_obj_with_identity(ptr %v, ptr ${rc.retain}, ptr @${sourceAccessor.name})`,
+          );
+        } else {
+          host.declare(`declare ptr @scr_dyn_new_obj()`);
+          B.line(`${d} = call ptr @scr_dyn_new_obj()`);
+        }
         // Keys insert in DECLARED order (JS insertion order); internal
         // '%'-fields follow so a record→dyn→record round trip keeps them.
         const byName = new Map(shape.fields.map((f) => [f.name, f]));
@@ -1340,6 +1597,21 @@ export class LlDyn {
       `}`,
       ``,
     );
+    if (sourceAccessor) {
+      this.defs.push(
+        `define internal ptr @${sourceAccessor.name}(ptr %v, i1 %materialize) ${FN_ATTRS} { ; live listener source ${key}`,
+        `entry:`,
+        `  br i1 %materialize, label %snapshot, label %release`,
+        `snapshot:`,
+        `  %d = call ptr @${name}(ptr %v)`,
+        `  ret ptr %d`,
+        `release:`,
+        `  call void ${sourceAccessor.release}(ptr %v)`,
+        `  ret ptr null`,
+        `}`,
+        ``,
+      );
+    }
     return name;
   }
 
@@ -1457,7 +1729,7 @@ export class LlDyn {
       const kd = this.kindOf(B, "%d");
       const done = B.newLabel("ds.d");
       const labels = new Map<number, string>();
-      for (const k of [DK.NULL, DK.BOOL, DK.NUM, DK.STR, DK.ARR, DK.OBJ, DK.UNDEF, DK.BYTES, DK.FUNC, DK.HANDLE, DK.PROMISE, DK.JSVAL]) {
+      for (const k of [DK.NULL, DK.BOOL, DK.NUM, DK.STR, DK.ARR, DK.OBJ, DK.UNDEF, DK.BYTES, DK.FUNC, DK.HANDLE, DK.PROMISE, DK.JSVAL, DK.TYPED_REF]) {
         labels.set(k, B.newLabel(`ds.k${k}`));
       }
       B.terminate(
@@ -1469,6 +1741,16 @@ export class LlDyn {
         // leaves the exception pending and appends nothing).
         host.declare(`declare void @scr_dyn_isl_tostr_buf(ptr, ptr)`);
         B.line(`call void @scr_dyn_isl_tostr_buf(ptr %b, ptr %d)`);
+        B.br(done);
+      }
+      B.startBlock(labels.get(DK.TYPED_REF)!);
+      {
+        host.declare(`declare ptr @scr_dyn_typed_ref_materialize(ptr)`);
+        host.declare(`declare void @scr_dyn_release_v(ptr)`);
+        const materialized = B.tmp();
+        B.line(`${materialized} = call ptr @scr_dyn_typed_ref_materialize(ptr %d)`);
+        B.line(`call void @sc_ds_buf(ptr %b, ptr ${materialized})`);
+        B.line(`call void @scr_dyn_release_v(ptr ${materialized})`);
         B.br(done);
       }
       B.startBlock(labels.get(DK.UNDEF)!);
@@ -1931,6 +2213,25 @@ export class LlDyn {
       B.terminate(`ret ptr null`);
       B.startBlock(lNext);
     }
+    // Typed stream capsules expose their one cached, refreshed dyn view to
+    // ordinary property reads while the capsule itself keeps identity.
+    {
+      const isTyped = B.tmp();
+      B.line(`${isTyped} = icmp eq i32 ${kd}, ${DK.TYPED_REF}`);
+      const lTyped = B.newLabel("kg.tr");
+      const lNext = B.newLabel("kg.n");
+      B.condBr(isTyped, lTyped, lNext);
+      B.startBlock(lTyped);
+      host.declare(`declare ptr @scr_dyn_typed_ref_materialize(ptr)`);
+      host.declare(`declare void @scr_dyn_release_v(ptr)`);
+      const materialized = B.tmp();
+      const r = B.tmp();
+      B.line(`${materialized} = call ptr @scr_dyn_typed_ref_materialize(ptr %d)`);
+      B.line(`${r} = call ptr @${name}(ptr ${materialized}, ptr %k, i1 %opt)`);
+      B.line(`call void @scr_dyn_release_v(ptr ${materialized})`);
+      B.terminate(`ret ptr ${r}`);
+      B.startBlock(lNext);
+    }
     // ISLAND-held receivers: o[k] reads the REAL engine property (getters
     // included, throws bridged catchably) and the result wraps back
     // scalar-normalized — the routed keyed read that retired the fence.
@@ -2324,6 +2625,24 @@ export class LlDyn {
     host.declare(`declare void @scr_str_release(ptr)`);
     const B = new BlockBuilder();
     const kd = this.kindOf(B, "%d");
+    // Typed stream capsules iterate their cached, refreshed dyn view.
+    {
+      const isTyped = B.tmp();
+      B.line(`${isTyped} = icmp eq i32 ${kd}, ${DK.TYPED_REF}`);
+      const lTyped = B.newLabel("din.tr");
+      const lNext = B.newLabel("din.nt");
+      B.condBr(isTyped, lTyped, lNext);
+      B.startBlock(lTyped);
+      host.declare(`declare ptr @scr_dyn_typed_ref_materialize(ptr)`);
+      host.declare(`declare void @scr_dyn_release_v(ptr)`);
+      const materialized = B.tmp();
+      const out = B.tmp();
+      B.line(`${materialized} = call ptr @scr_dyn_typed_ref_materialize(ptr %d)`);
+      B.line(`${out} = call ptr @${name}(ptr ${materialized}, i64 %n)`);
+      B.line(`call void @scr_dyn_release_v(ptr ${materialized})`);
+      B.terminate(`ret ptr ${out}`);
+      B.startBlock(lNext);
+    }
     // ISLAND-held sources: an engine array IS iterable — the not-iterable
     // TypeError below would be a wrong claim. Loud fence (lane
     // dyn-routing-ops).

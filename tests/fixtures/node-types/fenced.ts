@@ -15,11 +15,23 @@ const timer = setInterval(() => {
 timer.unref();
 timer.refresh();
 timer.close();
-/* The web-platform globals ride in with @types/node (undici): they RESOLVE
- * (no "Cannot find name") and their uses fence cleanly. */
+/* The web-platform globals ride in with @types/node (undici):
+ * AbortController fences, while fetch and a typed RequestInit lower. */
 const controller = new AbortController();
 controller.abort();
-fetch("https://example.invalid/");
+const fetchInit: RequestInit = {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: "{}",
+};
+fetch("https://example.invalid/", fetchInit);
+async function inspectResponse(url: string): Promise<void> {
+  const response = await fetch(url);
+  console.log(response.type);
+  response.clone();
+}
+void inspectResponse;
+ReadableStream.from(new Set([1, 2]));
 /* Members of SUPPORTED builtin modules beyond the lowered tables: they
  * typecheck under @types/node and fence with the module-qualified name —
  * calls and value reads alike. */
@@ -69,3 +81,15 @@ generateKeyPair("rsa", { modulusLength: 2048 }, () => {});
 createCipheriv("aes-128-cbc", Buffer.alloc(16), Buffer.alloc(16));
 pbkdf2Sync("pw", "salt", 100000, 64, "sha512");
 setFips(false);
+fetch("https://example.invalid/", {
+  integrity: "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+});
+async function inspectReadableStream(url: string): Promise<void> {
+  const body = (await fetch(url)).body!;
+  body.tee();
+  const tee = body.tee;
+  body["tee"]();
+  const bracketTee = body["tee"];
+}
+void inspectReadableStream;
+// End of the declared-but-not-lowered surface.

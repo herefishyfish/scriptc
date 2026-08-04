@@ -10,13 +10,28 @@ import { accessorSlotProp } from "../ir/nodes.js";
 // import path.
 export { typeKey };
 
-/** The island-backed ambient TYPE names of the fetch slice: standard-
- * library interfaces whose VALUES live in the embedded engine (the
- * engine's fetch mints the Response; AbortSignal.timeout mints the
- * signal), so under --dynamic they map to island handles (jsval) exactly
- * like npm-declared types. Checked with declaration provenance in mapType;
- * consumed by the lowerer's badType for the static-build wording. */
-export const ISLAND_AMBIENT_TYPES = ["Response", "RequestInit", "AbortSignal", "Headers"] as const;
+/** The ambient TYPE names of the fetch slice. Under --dynamic their
+ * values live in the embedded engine and map to island handles (jsval).
+ * Static fetch gives Response, RequestInit, AbortSignal, response
+ * Headers, and the readable Web Streams slice native checked-dynamic
+ * handle representations. The Headers constructor itself remains
+ * dynamic-only even though response.headers is native.
+ * Declaration provenance is checked in mapType so user types with the
+ * same names keep their ordinary structural representation. */
+export const ISLAND_AMBIENT_TYPES = [
+  "Response",
+  "RequestInit",
+  "Event",
+  "EventTarget",
+  "AbortSignal",
+  "Headers",
+  "ReadableStream",
+  "ReadableStreamDefaultReader",
+  "ReadableStreamDefaultController",
+  "ReadableStreamReadResult",
+  "ReadableStreamReadValueResult",
+  "ReadableStreamReadDoneResult",
+] as const;
 
 /** The frontend's record-shape interner. Records are monomorphic structural
  * shapes: fields sorted by name form the canonical identity, and two types
@@ -532,6 +547,11 @@ export interface TypeMapperCtx {
    * under --dynamic: the package's implementation runs in the embedded
    * engine, so its values are island handles. */
   isNpmFile: (sf: ts.SourceFile) => boolean;
+  /** True for a declaration file explicitly mapped by coverage's
+   * --external-types option. These declarations are trusted as structural
+   * type descriptions for project-owned values, but their imported runtime
+   * bindings are fenced separately by the Lowerer. */
+  isExternalTypeFile: (sf: ts.SourceFile) => boolean;
   /** --dynamic: `any` maps to the island handle type (jsval). Off, `any`
    * stays unmapped and the requires-dynamic diagnostic fires per site. */
   dynamic: boolean;
@@ -859,10 +879,12 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   // rule fires only when the type's own identity is declaration-file-
   // declared — interfaces, classes, type literals, and aliases from the
   // .d.ts. The standard library's declaration files are carved out (their
-  // surfaces have static lowerings), and the program's own compiled
-  // modules are never declaration files. Without --dynamic it stays
-  // unmapped; badType reports the per-package requires-dynamic diagnostic
-  // for node_modules types and the generic story otherwise.
+  // surfaces have static lowerings), as are declarations explicitly mapped
+  // by --external-types: those describe project-owned structural data while
+  // the Lowerer fences their imported runtime bindings. The program's own
+  // compiled modules are never declaration files. Without --dynamic this
+  // stays unmapped; badType reports the per-package requires-dynamic
+  // diagnostic for node_modules types and the generic story otherwise.
   const npmSym = widened.getAliasSymbol() ?? widened.getSymbol();
   const npmDecls = npmSym ? checker.declarationsOf(npmSym) : undefined;
   if (
@@ -870,7 +892,7 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
     npmDecls.length > 0 &&
     npmDecls.every((d) => {
       const sf = d.getSourceFile();
-      return sf.isDeclarationFile && !ctx.isStdlibFile(sf);
+      return sf.isDeclarationFile && !ctx.isStdlibFile(sf) && !ctx.isExternalTypeFile(sf);
     })
   ) {
     return ctx.dynamic ? JSVAL : null;
@@ -1354,28 +1376,76 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   // no-op cast, error-typed listener params accept it, and the `.code`
   // read has its own lowering (errno/syscall/path stay per-member fences).
   if (isStdlibInterface("ErrnoException")) return { kind: "object", className: "%Error" };
-  // The fetch ambient slice (Response, RequestInit, AbortSignal): island-
-  // backed ambient TYPES — the values behind them live in the embedded
-  // engine (fetch's Response, AbortSignal.timeout's signal), so under
-  // --dynamic they map to island handles exactly like npm-declared types,
-  // and every operation on them rides the engine ops with validated exits
-  // at typed boundaries. Provenance, not names: a user's own `interface
-  // Response` maps as a record like any other. Without the flag they stay
-  // unmapped; the use sites report the per-site requires-dynamic story
-  // (the fetch/AbortSignal.timeout lowerings' SC2012, badType's naming
-  // for a bare value of the type).
+  // The fetch ambient slice: under --dynamic these are island handles
+  // exactly like npm-declared types. Static fetch has one deliberately
+  // narrower native representation: Response is an opaque checked-
+  // dynamic capsule consumed only by the Response method lowerings, and
+  // RequestInit is a checked-dynamic options object consumed by native
+  // fetch. AbortSignal, response Headers, and the readable Web Streams
+  // slice are native handles carried by that same checked-dynamic
+  // representation. Provenance, not names: a user's own `interface
+  // Response` maps as a record like any other.
   // Interface OR class declarations (the shipped fallback declares
   // interfaces; @types/node's undici-types declares Response as a class).
+  {
+    const alias = widened.getAliasSymbol();
+    if (
+      !ctx.dynamic &&
+      alias?.name === "ReadableStreamReadResult" &&
+      checker.declarationsOf(alias).some(
+        (d) =>
+          ts.isTypeAliasDeclaration(d) &&
+          ctx.isStdlibFile(d.getSourceFile()),
+      )
+    ) {
+      const elemTs = widened.getAliasTypeArguments()?.[0];
+      const elem =
+        elemTs && elemTs.flags & ts.TypeFlags.Any
+          ? DYN
+          : elemTs
+            ? mapType(elemTs, ctx)
+            : null;
+      if (!elem) return null;
+      return genResultRecord(elem, VOID, ctx.shapes, ctx.unions);
+    }
+  }
+  if (
+    !ctx.dynamic &&
+    psym &&
+    (psym.name === "ReadableStreamReadValueResult" ||
+      psym.name === "ReadableStreamReadDoneResult") &&
+    checker.declarationsOf(psym).some(
+      (d) =>
+        ts.isInterfaceDeclaration(d) &&
+        ctx.isStdlibFile(d.getSourceFile()),
+    )
+  ) {
+    const elemTs = checker.getTypeArguments(widened as ts.TypeReference)[0];
+    const elem =
+      elemTs && elemTs.flags & ts.TypeFlags.Any
+        ? DYN
+        : elemTs
+          ? mapType(elemTs, ctx)
+          : null;
+    if (!elem) return null;
+    return genResultRecord(elem, VOID, ctx.shapes, ctx.unions);
+  }
   if (
     psym &&
     (ISLAND_AMBIENT_TYPES as readonly string[]).includes(psym.name) &&
+    !(
+      psym.name === "ReadableStream" &&
+      checker.declarationsOf(psym).some(
+        (d) => ts.isInterfaceDeclaration(d) && isDeclaredInAmbientNamespace(d, "NodeJS"),
+      )
+    ) &&
     checker.declarationsOf(psym).some(
       (d) =>
         (ts.isInterfaceDeclaration(d) || ts.isClassDeclaration(d)) &&
         ctx.isStdlibFile(d.getSourceFile()),
     )
   ) {
-    return ctx.dynamic ? JSVAL : null;
+    return ctx.dynamic ? JSVAL : DYN;
   }
   // ReadonlyMap/ReadonlySet are the SAME runtime values as Map/Set — the
   // readonly-ness is a checker-only view (no mutating members on the
@@ -2860,15 +2930,17 @@ function isMappedShape(t: ts.Type): boolean {
 }
 
 /** The record path's provenance fence. Declared shapes (object literals,
- * interfaces, type literals) must come from user code, never a .d.ts — the
- * empty ambient interfaces (Object, Function, Boolean, ...) exist only to
+ * interfaces, type literals) must come from user code or an explicitly
+ * mapped external type surface, never an arbitrary .d.ts — the empty
+ * ambient interfaces (Object, Function, Boolean, ...) exist only to
  * satisfy tsc and must not become zero-field records. Checker-COMPUTED
  * shapes (mapped-type results, intersections) have no user declaration to
  * point at: mapped types pass here and get per-MEMBER provenance in the
  * field walk instead; an intersection passes when every part is itself an
  * ordinary provenance-passing object type (class parts keep their nominal
  * identity and never flatten into a struct). */
-function recordProvenanceOk(t: ts.Type, checker: ts.TypeChecker): boolean {
+function recordProvenanceOk(t: ts.Type, ctx: TypeMapperCtx): boolean {
+  const { checker } = ctx;
   if (t.isIntersectionType()) {
     return t.getTypes().every(
       (part) => {
@@ -2877,7 +2949,7 @@ function recordProvenanceOk(t: ts.Type, checker: ts.TypeChecker): boolean {
           !(partSym && partSym.flags & ts.SymbolFlags.Class) &&
           checker.getCallSignatures(part).length === 0 &&
           checker.getConstructSignatures(part).length === 0 &&
-          recordProvenanceOk(part, checker);
+          recordProvenanceOk(part, ctx);
       },
     );
   }
@@ -2885,7 +2957,10 @@ function recordProvenanceOk(t: ts.Type, checker: ts.TypeChecker): boolean {
   const tSym = t.getSymbol();
   const decls = tSym ? checker.declarationsOf(tSym) : undefined;
   if (!decls || decls.length === 0) return false;
-  return !decls.some((d) => d.getSourceFile().isDeclarationFile);
+  return !decls.some((d) => {
+    const sf = d.getSourceFile();
+    return sf.isDeclarationFile && !ctx.isExternalTypeFile(sf);
+  });
 }
 
 /** A GENERIC-callable member type (`m<T>(x: T): T` / `f: <T>(x: T) => T` in
@@ -3085,7 +3160,7 @@ function mapRecordTypeInner(widened: ts.Type, ctx: TypeMapperCtx): IrType | Reco
     !widened.isIntersectionType() &&
     indexValue === undefined &&
     checker.getPropertiesOfType(widened).length === 0;
-  if (!recordProvenanceOk(widened, checker) && !pureIndexShape && !anonymousEmpty) return null;
+  if (!recordProvenanceOk(widened, ctx) && !pureIndexShape && !anonymousEmpty) return null;
   // Checker-computed shapes (no user declaration) need two extra fences in
   // the member walk below; see the comments there.
   const computed = widened.isIntersectionType() || isMappedShape(widened);
@@ -3182,7 +3257,13 @@ function mapRecordTypeInner(widened: ts.Type, ctx: TypeMapperCtx): IrType | Reco
       // lib interface (`Readonly<Date>`) is still the lib's type world, not
       // a data shape. Synthesized members (a literal-key Record's) have no
       // declarations and pass.
-      if (computed && checker.declarationsOf(p).some((d) => d.getSourceFile().isDeclarationFile)) {
+      if (
+        computed &&
+        checker.declarationsOf(p).some((d) => {
+          const sf = d.getSourceFile();
+          return sf.isDeclarationFile && !ctx.isExternalTypeFile(sf);
+        })
+      ) {
         return null;
       }
       const fieldTs = checker.getTypeOfSymbol(p);
@@ -3482,7 +3563,13 @@ export function describeRecordMemberBlocker(widened: ts.Type, ctx: TypeMapperCtx
     // Computed shapes over LIBRARY members (`Readonly<Date>`): the record
     // fence there is per-member PROVENANCE (mapRecordTypeInner's rule), not
     // any one member's type — that story stays with the residual fence.
-    if (computed && checker.declarationsOf(p).some((d) => d.getSourceFile().isDeclarationFile)) {
+    if (
+      computed &&
+      checker.declarationsOf(p).some((d) => {
+        const sf = d.getSourceFile();
+        return sf.isDeclarationFile && !ctx.isExternalTypeFile(sf);
+      })
+    ) {
       return null;
     }
     const fieldTs = checker.getTypeOfSymbol(p);

@@ -20,7 +20,7 @@ import type { ClassInfo, ClassIteratorInfo } from "./lower-classes.js";
 import { genericIfaceBindingKeepsClass } from "./lower-classes.js";
 import { lowerStreamUnderscoreAssign, streamClassAliasDecl, streamSidesOf } from "./lower-stream.js";
 import { lowerHttpResPropertyAssignment, lowerServerCloseOverrideAssignment } from "./lower-server.js";
-import { builtinMemberRequireDecl, builtinNamespaceDestructureModuleOf, createRequireBindingDecl, createRequireCalleeFileOf, createRequireNamespaceDecl } from "./lower-builtins.js";
+import { builtinMemberRequireDecl, builtinNamespaceDestructureModuleOf, createRequireBindingDecl, createRequireCalleeFileOf, createRequireNamespaceDecl, textCodecBindingDecl } from "./lower-builtins.js";
 import { lowerEnumDeclaration } from "./lower-enums.js";
 import { abstractPropertyDeclOf, aliasTypeofNarrows, isMatchSliceType, lowerGroupsProjection, matchResultNamedGroupsOf, probeLower, pureReemittable, symbolFieldInfo } from "./lower-exprs.js";
 import { UNSUPPORTED, checkerPanicDiag, isCheckerPanic, requiresDynamicDiag } from "../../diagnostics/diagnostic.js";
@@ -879,8 +879,10 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
         requireSpecOf(decl.initializer) !== null &&
         isJsSourceFile(decl.getSourceFile())
       ) {
+        const spec = requireSpecOf(decl.initializer)!;
+        if (L.externalTypes.has(spec)) L.externalHostFence(spec, decl, false);
         if (ts.isSourceFile(stmt.parent)) {
-          const init = L.requireInitStmt(requireSpecOf(decl.initializer)!, decl);
+          const init = L.requireInitStmt(spec, decl);
           return init ? [init] : [];
         }
         // A nested BUILTIN require (`get inFreeBSDJail() { const { execSync }
@@ -890,7 +892,7 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
         // same routing top-level requires use, and no statement remains.
         // Relative requires keep the fence: their module-init-at-position
         // semantics needs storage this model doesn't represent.
-        if (canonicalBuiltinModule(requireSpecOf(decl.initializer)!) !== null) {
+        if (canonicalBuiltinModule(spec) !== null) {
           return [];
         }
         L.unsupported(
@@ -910,17 +912,109 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
         if (builtinNamespaceDestructureModuleOf(L, decl) !== null) return [];
         return L.lowerDestructuringDecl(decl, isLet);
       }
-      // A STORED matchAll drain (`const rows = s.matchAll(re)`): the drain
-      // runs through matchAllInto with a hidden companion index array so a
-      // later for-of over `rows` in the same function can serve `m.index`.
-      // Plain local consts only — module globals, TDZ-predeclared consts,
-      // and annotated non-drain types keep the ordinary path (and stored-
-      // row .index keeps its fence).
+      // STORED protocol values with statically closed representations:
+      // numeric value iterators retain source/cursor/done hidden locals; a
+      // matchAll drain retains its companion index array so a later
+      // for-of can serve `m.index`. Both are const-only interceptions.
+      const numericIterator = lowerNumericIteratorDecl(L, decl, isConst);
+      if (numericIterator) return numericIterator;
       const drained = lowerMatchAllDrainDecl(L, decl, isConst);
       if (drained) return drained;
       const lowered = L.lowerVarDecl(decl, isLet);
       return lowered ? [lowered] : [];
     });
+  }
+
+/** The numeric indexed source of a built-in value-iterator expression:
+   * `numbers.values()` or the equivalent
+   * `numbers[Symbol.iterator]()`, where numbers is number[] or one of the
+   * represented typed arrays (including Uint8Array). This is deliberately
+   * a syntax + provenance test rather than a mapping for the iterator
+   * object: it has observable mutable protocol state, represented by
+   * hidden locals only while a stored binding stays in one function. */
+  export function numericIteratorSourceOf(L: Lowerer, expr: ts.Expression | undefined): ts.Expression | null {
+    if (expr === undefined) return null;
+    let init = expr;
+    while (ts.isParenthesizedExpression(init)) init = init.expression;
+    if (!ts.isCallExpression(init) || init.questionDotToken || init.arguments.length !== 0) return null;
+
+    let receiver: ts.Expression | null = null;
+    if (
+      ts.isPropertyAccessExpression(init.expression) &&
+      !init.expression.questionDotToken &&
+      init.expression.name.text === "values" &&
+      L.isStdlibMember(init.expression)
+    ) {
+      receiver = init.expression.expression;
+    } else if (
+      ts.isElementAccessExpression(init.expression) &&
+      !init.expression.questionDotToken &&
+      init.expression.argumentExpression !== undefined
+    ) {
+      let key = init.expression.argumentExpression;
+      while (ts.isParenthesizedExpression(key)) key = key.expression;
+      if (
+        ts.isPropertyAccessExpression(key) &&
+        L.stdlibGlobalMember(key, "Symbol") === "iterator"
+      ) {
+        receiver = init.expression.expression;
+      }
+    }
+    if (receiver === null) return null;
+    const sourceT = L.mapTypeOf(L.typeOf(receiver));
+    return (
+      (sourceT?.kind === "array" && sourceT.elem.kind === "f64") ||
+      sourceT?.kind === "bytes"
+    ) ? receiver : null;
+  }
+
+/** A stored numeric value iterator does not become a first-class IR
+   * value. Its standard-library provenance proves the built-in iterator
+   * shape, so the declaration snapshots the indexed source and initializes
+   * the exact mutable protocol state:
+   *
+   *   const %source = numbers; let %index = 0; let %done = false;
+   *
+   * A same-function for-of resolves the binding symbol through
+   * numericIterators and drives these locals. Other value uses retain the
+   * iterator-object fence. */
+  function lowerNumericIteratorDecl(
+    L: Lowerer,
+    decl: ts.VariableDeclaration,
+    isConst: boolean,
+  ): IrStmt[] | null {
+    if (!isConst || !ts.isIdentifier(decl.name)) return null;
+    const sourceNode = numericIteratorSourceOf(L, decl.initializer);
+    if (sourceNode === null) return null;
+    const sym = L.checker.getSymbolAtLocation(decl.name);
+    if (!sym || L.tdzPredeclared.has(sym)) return null;
+    const source = L.lowerExpr(sourceNode);
+    if (
+      !(
+        (source.type.kind === "array" && source.type.elem.kind === "f64") ||
+        source.type.kind === "bytes"
+      )
+    ) {
+      L.badType(sourceNode, L.typeOf(sourceNode));
+    }
+    const loc = locOf(decl);
+    const indexedSource = L.declareHiddenLocal("%numiterSource", source.type);
+    const index = L.declareHiddenLocal("%numiterIndex", F64);
+    const done = L.declareHiddenLocal("%numiterDone", BOOL);
+    index.mutable = true;
+    done.mutable = true;
+    L.numericIterators.set(sym, {
+      sourceLocalId: indexedSource.id,
+      sourceType: source.type,
+      indexLocalId: index.id,
+      doneLocalId: done.id,
+      ctx: L.ctx,
+    });
+    return [
+      { kind: "varDecl", localId: indexedSource.id, init: source, loc },
+      { kind: "varDecl", localId: index.id, init: { kind: "numLit", value: 0, type: F64, loc }, loc },
+      { kind: "varDecl", localId: done.id, init: { kind: "boolLit", value: false, type: BOOL, loc }, loc },
+    ];
   }
 
 /** The stored-drain interception behind lowerVarStatement: lowers
@@ -1166,6 +1260,7 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
     out: IrStmt[],
     dynSpell?: string,): void {
     if (ts.isArrayBindingPattern(pattern)) {
+      L.fenceStaticHeadersIteration(pattern);
       // Tuple sources: each position is a field read of the tuple's record
       // shape — the positional twin of object destructuring below.
       const tupleShape =
@@ -1350,6 +1445,60 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
               type: DYN,
               loc: elLoc,
             };
+          }
+          L.bindPatternTarget(el.name, value, isLet, out);
+        });
+        return;
+      }
+      // Represented typed arrays are dense numeric iterables. Destructuring
+      // reads their elements in index order; a rest binding drains to a
+      // fresh number[] (never another typed array), exactly the iterator
+      // protocol's Array accumulation.
+      if (srcType.kind === "bytes") {
+        pattern.elements.forEach((el, i) => {
+          if (ts.isOmittedExpression(el) || el.name === undefined) return;
+          const loc = locOf(el);
+          if (el.dotDotDotToken) {
+            if (el.initializer) {
+              L.unsupported("SC1031", el, "defaults on rest elements");
+            }
+            const all: IrExpr = {
+              kind: "bytesIntrinsic",
+              method: "toArray",
+              receiver: srcRef(),
+              args: [],
+              type: arrayOf(F64),
+              loc,
+            };
+            const value: IrExpr = {
+              kind: "arrIntrinsic",
+              method: "slice",
+              receiver: all,
+              args: [{ kind: "numLit", value: i, type: F64, loc }],
+              type: arrayOf(F64),
+              loc,
+            };
+            L.bindPatternTarget(el.name, value, isLet, out);
+            return;
+          }
+          let value: IrExpr = {
+            kind: "bytesIntrinsic",
+            method: "get",
+            receiver: srcRef(),
+            args: [{ kind: "numLit", value: i, type: F64, loc }],
+            type: F64,
+            loc,
+          };
+          if (el.initializer) {
+            value = arrayPositionDefault(
+              L,
+              el,
+              value,
+              srcRef,
+              i,
+              F64,
+              out,
+            );
           }
           L.bindPatternTarget(el.name, value, isLet, out);
         });
@@ -2038,11 +2187,29 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
     if (isUnitType(elemT)) {
       return L.lowerExprExpecting(init, bodyT);
     }
+    const source = srcRef();
+    const length: IrExpr = source.type.kind === "bytes"
+      ? {
+          kind: "bytesIntrinsic",
+          method: "length",
+          receiver: source,
+          args: [],
+          type: F64,
+          loc,
+        }
+      : {
+          kind: "arrIntrinsic",
+          method: "length",
+          receiver: source,
+          args: [],
+          type: F64,
+          loc,
+        };
     const inRange: IrExpr = {
       kind: "bin",
       op: "<",
       left: { kind: "numLit", value: index, type: F64, loc },
-      right: { kind: "arrIntrinsic", method: "length", receiver: srcRef(), args: [], type: F64, loc },
+      right: length,
       type: BOOL,
       loc,
     };
@@ -2832,6 +2999,13 @@ export function lowerVarDecl(L: Lowerer, decl: ts.VariableDeclaration, isLet: bo
     // `const process = globalThis.process` — a stdlib-global snapshot:
     // alias plumbing (see stdlibGlobalAliasDecl), no storage, no code.
     if (!isLet && stdlibGlobalAliasDecl(L, decl.name, decl.initializer)) return null;
+
+    // `const encoder = new TextEncoder()` and the default TextDecoder
+    // twin: the codec has no general value representation, but calls
+    // through this stable binding resolve back to the initializer. The
+    // supported constructors are effect-free, so the declaration itself
+    // is compile-time alias plumbing with no storage or code.
+    if (!isLet && textCodecBindingDecl(L, decl.name, decl.initializer)) return null;
 
     // `const f = <T>(x: T) => x` — a generic function value binding: the
     // initializer monomorphizes per call-site-resolved signature exactly
@@ -3917,6 +4091,8 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
       createRequireCalleeFileOf(L, expr.expression) === null
     ) {
       const sf = expr.getSourceFile();
+      const spec = requireSpecOf(expr)!;
+      if (L.externalTypes.has(spec)) L.externalHostFence(spec, expr, false);
       // A bare require of a package NOTHING INSTALLED resolves, in ANY
       // CommonJS JS file (the export-assignment spellings tsgo marks
       // external included): Node throws MODULE_NOT_FOUND at exactly this
@@ -3924,7 +4100,6 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
       // optional-dependency try/require pattern. The compiled statement
       // IS that throw, wherever it sits.
       if (isCjsJsFile(sf)) {
-        const spec = requireSpecOf(expr)!;
         if (
           !isRelativeSpecifier(spec) &&
           canonicalBuiltinModule(spec) === null
@@ -3947,7 +4122,7 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
         }
       }
       if (isJsSourceFile(sf) && !ts.isExternalModule(sf)) {
-        const init = L.requireInitStmt(requireSpecOf(expr)!, expr);
+        const init = L.requireInitStmt(spec, expr);
         if (init) return init;
         return { kind: "block", body: [], loc: locOf(expr) };
       }
@@ -4728,6 +4903,11 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
   export function lowerDestructuringAssignParts(L: Lowerer, target: ts.ObjectLiteralExpression | ts.ArrayLiteralExpression,
     rhs: ts.Expression,
     loc: SrcLoc,): { stmts: IrStmt[]; value: IrExpr } {
+    if (ts.isArrayLiteralExpression(target)) {
+      L.fenceStaticHeadersIteration(rhs);
+    } else {
+      L.fenceFetchObjectAssignment(target, rhs);
+    }
     return destructuringAssignInto(L, target, L.lowerExpr(rhs), rhs, rhs, loc);
   }
 
@@ -5444,8 +5624,8 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
         loc,
       });
       elemsRef = () => ({ kind: "varRef", localId: iterTmp.id, type: srcType, loc });
-    } else if (srcType.kind !== "array" && !isTuple) {
-      if (elements.length === 0 && (srcType.kind === "string" || srcType.kind === "bytes" || srcType.kind === "map" || srcType.kind === "set")) {
+    } else if (srcType.kind !== "array" && srcType.kind !== "bytes" && !isTuple) {
+      if (elements.length === 0 && (srcType.kind === "string" || srcType.kind === "map" || srcType.kind === "set")) {
         // `[] = e` over a statically-iterable source: GetIterator +
         // immediate close — no user code can observe it, so evaluating
         // the RHS is the whole statement.
@@ -5472,6 +5652,16 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
           L.unsupported("SC1031", at, `destructuring the element ${i} the source tuple does not carry`);
         }
         return { kind: "recordGet", obj: tmpRef(), shapeId: (srcType as IrType & { kind: "record" }).shapeId, field: String(i), type: fieldType, loc: locOf(at) };
+      }
+      if (srcType.kind === "bytes") {
+        return {
+          kind: "bytesIntrinsic",
+          method: "get",
+          receiver: tmpRef(),
+          args: [{ kind: "numLit", value: i, type: F64, loc: locOf(at) }],
+          type: F64,
+          loc: locOf(at),
+        };
       }
       // Plain arrays read by index — a pattern wider than the runtime
       // array traps (the arrayGet discipline, divergence 4's policy; JS
@@ -5507,6 +5697,24 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
       // defaults on nested targets fence in the shared machinery).
       const readOf = (targetT: IrType | null): IrExpr => {
         if (isRest) {
+          if (srcType.kind === "bytes") {
+            const all: IrExpr = {
+              kind: "bytesIntrinsic",
+              method: "toArray",
+              receiver: tmpRef(),
+              args: [],
+              type: arrayOf(F64),
+              loc: locOf(el),
+            };
+            return {
+              kind: "arrIntrinsic",
+              method: "slice",
+              receiver: all,
+              args: [{ kind: "numLit", value: i, type: F64, loc: locOf(el) }],
+              type: arrayOf(F64),
+              loc: locOf(el),
+            };
+          }
           return isTuple
             ? tupleTailValue(L, el, tmpRef, srcType as IrType & { kind: "record" }, shape!, i, targetT)
             : { kind: "arrIntrinsic", method: "slice", receiver: tmpRef(), args: [{ kind: "numLit", value: i, type: F64, loc: locOf(el) }], type: srcType, loc: locOf(el) };
@@ -5545,7 +5753,19 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
           } else if (targetT !== null) {
             read = isTuple
               ? undefArmDefault(L, el, defaultNode, read, targetT)
-              : arrayPositionDefaultValue(L, el, defaultNode, read, tmpRef, i, (srcType as IrType & { kind: "array" }).elem, targetT, out);
+              : arrayPositionDefaultValue(
+                  L,
+                  el,
+                  defaultNode,
+                  read,
+                  tmpRef,
+                  i,
+                  srcType.kind === "bytes"
+                    ? F64
+                    : (srcType as IrType & { kind: "array" }).elem,
+                  targetT,
+                  out,
+                );
           }
         }
         return read;
@@ -5604,6 +5824,22 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
       }
       L.unsupported("SC1070", stmt, "'for await' (async iteration over anything but process.stdin and readable streams)");
     }
+    L.fenceStaticHeadersIteration(stmt.expression);
+    // A stored numeric value iterator declared in this function keeps its
+    // built-in protocol state in hidden locals (lowerVarStatement). The
+    // iterator's own [Symbol.iterator]() returns itself, so for-of resumes
+    // that cursor rather than starting another indexed-source walk.
+    {
+      let src: ts.Expression = stmt.expression;
+      while (ts.isParenthesizedExpression(src)) src = src.expression;
+      if (ts.isIdentifier(src)) {
+        const sym = L.resolveValueSymbol(src);
+        const state = sym ? L.numericIterators.get(sym) : undefined;
+        if (state?.ctx === L.ctx) {
+          return lowerForOfStoredNumericIterator(L, stmt, state, labels);
+        }
+      }
+    }
     // `for (const k of m.keys())` / `.values()` / `.entries()`: the
     // iterator methods consumed DIRECTLY by a for-of head ride the
     // container's live walk — exactly `for..of m` with the projection
@@ -5650,6 +5886,20 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
             return lowerForOfArrayIter(L, stmt, container as IrExpr & { type: IrType & { kind: "array" } }, proj);
           }
         }
+        // Typed arrays expose the same live indexed iterator projections.
+        // Their fixed length makes the walk simpler, but the yielded keys
+        // and [key, numeric value] pairs are identical to Array's.
+        if (recv?.kind === "bytes" && (proj === "keys" || proj === "entries")) {
+          const container = L.lowerExpr(src.expression.expression);
+          if (container.type.kind === "bytes") {
+            return lowerForOfArrayIter(
+              L,
+              stmt,
+              container as IrExpr & { type: IrType & { kind: "bytes" } },
+              proj,
+            );
+          }
+        }
       }
     }
     // `for (const m of s.matchAll(re))` — direct call or a stored-const
@@ -5682,18 +5932,21 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
         }
       }
     }
-    // `for (v of xs.values())` over an ARRAY receiver: Array.prototype
-    // .values() iterates the array's elements exactly — the iterator
-    // object never needs to exist, so the loop runs over the receiver
-    // itself (matchAll's eager-drain stance). Only the DIRECT for-of
-    // position unwraps; a stored iterator value keeps its fence.
-    let iterSrc: ts.Expression = stmt.expression;
-    {
+    // A DIRECT built-in value-iterator expression needs no first-class
+    // iterator object. The numeric recognizer covers number[] / typed
+    // arrays and both values/default spellings; retain the established
+    // generic Array.prototype.values() unwrap for every other T[] too.
+    // Stored numeric values took the retained-state path above.
+    let iterSrc = numericIteratorSourceOf(L, stmt.expression);
+    if (iterSrc === null) {
       let e: ts.Expression = stmt.expression;
       while (ts.isParenthesizedExpression(e)) e = e.expression;
       if (
-        ts.isCallExpression(e) && !e.questionDotToken && e.arguments.length === 0 &&
-        ts.isPropertyAccessExpression(e.expression) && !e.expression.questionDotToken &&
+        ts.isCallExpression(e) &&
+        !e.questionDotToken &&
+        e.arguments.length === 0 &&
+        ts.isPropertyAccessExpression(e.expression) &&
+        !e.expression.questionDotToken &&
         e.expression.name.text === "values" &&
         L.isStdlibMember(e.expression) &&
         L.mapTypeOf(L.typeOf(e.expression.expression))?.kind === "array"
@@ -5701,7 +5954,16 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
         iterSrc = e.expression.expression;
       }
     }
+    iterSrc ??= stmt.expression;
     let iterable = L.lowerExpr(iterSrc);
+    if (iterable.type.kind === "bytes") {
+      return lowerForOfBytes(
+        L,
+        stmt,
+        iterable as IrExpr & { type: IrType & { kind: "bytes" } },
+        labels,
+      );
+    }
     if (iterable.type.kind !== "array") {
       // The lib types strings as iterable too, so those for-ofs typecheck;
       // only arrays, Maps, and Sets have a lowering. Named specifically —
@@ -5923,6 +6185,211 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
       const local = L.declareLocal(decl.name, decl.name.text, iterable.type.elem, isLet);
       const body = L.inCtl("loop", () => L.lowerScopedBlock(stmt.statement), labels);
       return { kind: "forOf", localId: local.id, iterable, body, ...(labels && { labels }), loc: locOf(stmt) };
+    } finally {
+      L.scopes.pop();
+    }
+  }
+
+/** Direct for-of over a represented typed array. The implicit iterator is
+   * unobservable, so instantiate its source/cursor/done state as ordinary
+   * hidden locals and share the retained numeric-iterator driver. */
+  function lowerForOfBytes(
+    L: Lowerer,
+    stmt: ts.ForOfStatement,
+    iterable: IrExpr & { type: IrType & { kind: "bytes" } },
+    labels?: string[],
+  ): IrStmt {
+    const loc = locOf(stmt);
+    const source = L.declareHiddenLocal("%numiterSource", iterable.type);
+    const index = L.declareHiddenLocal("%numiterIndex", F64);
+    const done = L.declareHiddenLocal("%numiterDone", BOOL);
+    index.mutable = true;
+    done.mutable = true;
+    const loop = lowerForOfStoredNumericIterator(
+      L,
+      stmt,
+      {
+        sourceLocalId: source.id,
+        sourceType: iterable.type,
+        indexLocalId: index.id,
+        doneLocalId: done.id,
+      },
+      labels,
+    );
+    return {
+      kind: "block",
+      body: [
+        { kind: "varDecl", localId: source.id, init: iterable, loc },
+        { kind: "varDecl", localId: index.id, init: { kind: "numLit", value: 0, type: F64, loc }, loc },
+        { kind: "varDecl", localId: done.id, init: { kind: "boolLit", value: false, type: BOOL, loc }, loc },
+        loop,
+      ],
+      loc,
+    };
+  }
+
+/** Drive a stored built-in numeric value iterator through its retained
+   * protocol state. Unlike the ordinary array for-of IR, the cursor
+   * advances BEFORE the source body: breaking or returning from the body
+   * leaves the iterator positioned at the next element. Natural
+   * exhaustion sets the sticky done bit; breaking early does not.
+   *
+   *   while (true) {
+   *     if (%done) break;
+   *     if (%index >= %source.length) { %done = true; break; }
+   *     const value = %source[%index];
+   *     %index += 1;
+   *     <assign/bind head>; <body>
+   *   }
+   */
+  function lowerForOfStoredNumericIterator(
+    L: Lowerer,
+    stmt: ts.ForOfStatement,
+    state: {
+      sourceLocalId: string;
+      sourceType: IrType;
+      indexLocalId: string;
+      doneLocalId: string;
+    },
+    labels?: string[],
+  ): IrStmt {
+    let exprTarget: { id: string; type: IrType } | null = null;
+    let exprTargetNode: ts.Identifier | null = null;
+    if (!ts.isVariableDeclarationList(stmt.initializer)) {
+      let target: ts.Node = stmt.initializer;
+      while (ts.isParenthesizedExpression(target)) target = target.expression;
+      if (ts.isIdentifier(target)) {
+        exprTarget = L.resolveWritable(target);
+        exprTargetNode = target;
+      }
+      if (!exprTarget) {
+        L.unsupported(
+          "SC1090",
+          stmt.initializer,
+          "for-of over a stored numeric iterator assigning anything but a pre-declared identifier",
+        );
+      }
+    }
+    const list = ts.isVariableDeclarationList(stmt.initializer) ? stmt.initializer : null;
+    if (list && (list.flags & ts.NodeFlags.Using) !== 0) {
+      L.unsupported("SC1090", list, "'using' declarations (dispose-at-scope-exit semantics)");
+    }
+    const isLet = list !== null && (list.flags & ts.NodeFlags.Let) !== 0;
+    const decl = list ? list.declarations[0]! : null;
+    if (decl && !ts.isIdentifier(decl.name)) L.unsupported("SC1031", decl.name);
+
+    const loc = locOf(stmt);
+    const sourceT = state.sourceType;
+    if (
+      !(
+        (sourceT.kind === "array" && sourceT.elem.kind === "f64") ||
+        sourceT.kind === "bytes"
+      )
+    ) {
+      throw new Error("internal: retained numeric iterator has a non-numeric source");
+    }
+    const ref = (localId: string, type: IrType): IrExpr => ({ kind: "varRef", localId, type, loc });
+    const indexRef = (): IrExpr => ref(state.indexLocalId, F64);
+    const doneRef = (): IrExpr => ref(state.doneLocalId, BOOL);
+    const sourceRef = (): IrExpr => ref(state.sourceLocalId, sourceT);
+    const sourceLength = (): IrExpr => sourceT.kind === "array"
+      ? {
+          kind: "arrIntrinsic",
+          method: "length",
+          receiver: sourceRef(),
+          args: [],
+          type: F64,
+          loc,
+        }
+      : {
+          kind: "bytesIntrinsic",
+          method: "length",
+          receiver: sourceRef(),
+          args: [],
+          type: F64,
+          loc,
+        };
+    const sourceValue = (): IrExpr => sourceT.kind === "array"
+      ? { kind: "arrayGet", arr: sourceRef(), index: indexRef(), type: F64, loc }
+      : {
+          kind: "bytesIntrinsic",
+          method: "get",
+          receiver: sourceRef(),
+          args: [indexRef()],
+          type: F64,
+          loc,
+        };
+    const one: IrExpr = { kind: "numLit", value: 1, type: F64, loc };
+
+    L.scopes.push(new Map());
+    try {
+      const varTarget = exprTarget ?? (decl ? forOfVarTarget(L, decl) : null);
+      const value = varTarget
+        ? L.declareHiddenLocal("%numiterValue", F64)
+        : L.declareLocal(decl!.name as ts.Identifier, (decl!.name as ts.Identifier).text, F64, isLet);
+      const valueRef: IrExpr = ref(value.id, F64);
+      const blame: ts.Node = decl?.name ?? exprTargetNode ?? stmt.initializer;
+      const head: IrStmt[] = [
+        {
+          kind: "if",
+          cond: doneRef(),
+          then: [{ kind: "break", loc }],
+          else_: null,
+          loc,
+        },
+        {
+          kind: "if",
+          cond: {
+            kind: "bin",
+            op: ">=",
+            left: indexRef(),
+            right: sourceLength(),
+            type: BOOL,
+            loc,
+          },
+          then: [
+            {
+              kind: "assign",
+              localId: state.doneLocalId,
+              value: { kind: "boolLit", value: true, type: BOOL, loc },
+              loc,
+            },
+            { kind: "break", loc },
+          ],
+          else_: null,
+          loc,
+        },
+        {
+          kind: "varDecl",
+          localId: value.id,
+          init: sourceValue(),
+          loc,
+        },
+        {
+          kind: "assign",
+          localId: state.indexLocalId,
+          value: { kind: "bin", op: "+", left: indexRef(), right: one, type: F64, loc },
+          loc,
+        },
+        ...(varTarget
+          ? [
+              {
+                kind: "assign",
+                localId: varTarget.id,
+                value: L.coerceInto(blame, valueRef, varTarget.type),
+                loc,
+              } satisfies IrStmt,
+            ]
+          : []),
+      ];
+      const body = L.inCtl("loop", () => L.lowerScopedBlock(stmt.statement), labels);
+      return {
+        kind: "while",
+        cond: { kind: "boolLit", value: true, type: BOOL, loc },
+        body: [...head, ...body],
+        ...(labels && { labels }),
+        loc,
+      };
     } finally {
       L.scopes.pop();
     }

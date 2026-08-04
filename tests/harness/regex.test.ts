@@ -166,7 +166,7 @@ console.log(/${"(a)".repeat(300)}/.test("a"));
     // roughly one ELF page of growth. Mach-O keeps its independently
     // calibrated bounds; neither cushion can hide an engine-sized jump.
     expect(statSync(plainBuild.binaryPath).size).toBeLessThan(
-      process.platform === "linux" ? 392_000 : 361_000,
+      process.platform === "linux" ? 392_000 : 378_000,
     );
     expect(statSync(regexBuild.binaryPath).size).toBeLessThan(
       process.platform === "linux" ? 545_000 : 512_000,

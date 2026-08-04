@@ -47,6 +47,12 @@ Three tiers, always explicit:
 2. **Runs dynamically** (`--dynamic`) — an embedded JavaScript engine ([quickjs-ng](https://github.com/quickjs-ng/quickjs), ~620KB) executes what can't be static: npm dependencies' shipped JS, `any`-typed code. Every value crossing back into static code is validated at runtime — a lying type throws a catchable `TypeError` instead of corrupting memory.
 3. **Rejected** — everything else fails with a specific error code, a code frame, and usually a rewrite hint. Nothing is ever silently miscompiled.
 
+Projects whose runtime is supplied by an embedder can still measure their
+application code: `scriptc coverage` accepts repeatable
+`--external-types <specifier=file.d.ts>` mappings. The declaration supplies
+checker types; runtime uses remain explicit external-boundary blockers until
+the embedder provides executable semantics.
+
 ## What compiles
 
 The static surface covers the language and the standard library real programs use:
@@ -78,6 +84,8 @@ Measured on Apple M-series against the same workloads in Node, Go, Rust, and Zig
 | binary size | 170–200KB static, ~3MB with `--dynamic` + embedded deps | Go: ~2MB; Node SEA: 60–100MB |
 | memory (RSS) | 1–4MB typical | Node: 67–116MB |
 | runtime | JS-faithful f64 semantics; competitive with the systems languages on most workloads | integer inference and ownership analysis are on the roadmap |
+
+Builds use a bounded, content-addressed cache by default. After lightweight toolchain metadata probes, an unchanged executable or library archive is restored without rebuilding or relinking its program/runtime payload; after a source edit, stable runtime objects are reused and only the program translation unit is rebuilt. Cache identities include the compiler's resolved system-header bytes, linker/assembler identities, and exact implicit linker inputs (CRT objects, compiler runtimes, SDK stubs, and default libraries); every cached binary, archive, and runtime object is checksum-verified before use. The compiler remains required so dependency selection is rediscovered on every cache-enabled invocation. FFI builds with archive/object inputs or ambient `system_libraries` always relink against their current dependencies while retaining runtime-object reuse. Mutable compiler input paths such as `CPATH` and `SDKROOT`, and compiler wrappers, conservatively bypass persistent artifacts and objects so dependencies rebuilt in place cannot return stale native code. Opaque archiver wrappers similarly rebuild library program members and archives while retaining runtime-object reuse. Direct Clang, Apple's system Clang shim, `zig cc`, trusted platform archivers, and `zig ar` retain their applicable persistent tiers. Set `SCRIPTC_NO_CACHE=1` for a fully uncached build, or `SCRIPTC_CACHE_DIR` to choose the cache root; an existing POSIX override must already be private, otherwise caching is bypassed without changing its permissions.
 
 ## Escape hatches
 

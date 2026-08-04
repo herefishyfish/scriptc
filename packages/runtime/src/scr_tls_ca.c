@@ -32,6 +32,9 @@ static ScrArr *scr_ca_bundled = NULL;
 static ScrArr *scr_ca_system = NULL;
 static ScrArr *scr_ca_extra = NULL;
 static ScrArr *scr_ca_default = NULL;
+static char *scr_ca_extra_buf = NULL;
+static size_t scr_ca_extra_len = 0;
+static bool scr_ca_installed = false;
 static char *scr_ca_override_buf = NULL;
 static size_t scr_ca_override_len = 0;
 static uint64_t scr_ca_override_gen = 0; /* 0 = never set */
@@ -47,6 +50,9 @@ static void scr_ca_teardown(void) {
   if (scr_ca_extra != NULL) scr_arr_release(scr_ca_extra);
   if (scr_ca_default != NULL) scr_arr_release(scr_ca_default);
   scr_ca_bundled = scr_ca_system = scr_ca_extra = scr_ca_default = NULL;
+  free(scr_ca_extra_buf);
+  scr_ca_extra_buf = NULL;
+  scr_ca_extra_len = 0;
   free(scr_ca_override_buf);
   scr_ca_override_buf = NULL;
 }
@@ -123,6 +129,31 @@ static char *scr_ca_read_file(const char *path, size_t *out_len) {
   return buf;
 }
 
+/*
+ * Node consumes NODE_EXTRA_CA_CERTS while the process is initialized:
+ * changing process.env or replacing the referenced file later does not
+ * alter either TLS trust or getCACertificates("extra"). Generated main
+ * calls this install hook before user code; the lazy fallback only serves
+ * library/direct-runtime callers that have no executable startup hook.
+ */
+void scr_tls_ca_install(void) {
+  if (scr_ca_installed) return;
+  scr_ca_installed = true;
+  scr_ca_arm_teardown();
+  const char *path = getenv("NODE_EXTRA_CA_CERTS");
+  if (path != NULL && path[0] != '\0') {
+    scr_ca_extra_buf = scr_ca_read_file(path, &scr_ca_extra_len);
+  }
+}
+
+bool scr_tls_ca_extra_pem(const char **pem, size_t *len) {
+  scr_tls_ca_install();
+  if (scr_ca_extra_buf == NULL) return false;
+  *pem = scr_ca_extra_buf;
+  *len = scr_ca_extra_len;
+  return true;
+}
+
 /* The host bundle, probed in scr_tls.c's documented order. */
 static ScrArr *scr_ca_load_host_bundle(void) {
   ScrArr *arr = scr_arr_new(SCR_ELEM_STR, 128);
@@ -163,14 +194,10 @@ static ScrArr *scr_ca_extra_arr(void) {
   if (scr_ca_extra == NULL) {
     scr_ca_arm_teardown();
     scr_ca_extra = scr_arr_new(SCR_ELEM_STR, 4);
-    const char *path = getenv("NODE_EXTRA_CA_CERTS");
-    if (path != NULL && path[0] != '\0') {
-      size_t len = 0;
-      char *text = scr_ca_read_file(path, &len);
-      if (text != NULL) {
-        scr_ca_push_pem_blocks(scr_ca_extra, text, len);
-        free(text);
-      }
+    const char *pem = NULL;
+    size_t len = 0;
+    if (scr_tls_ca_extra_pem(&pem, &len)) {
+      scr_ca_push_pem_blocks(scr_ca_extra, pem, len);
     }
   }
   return scr_ca_extra;

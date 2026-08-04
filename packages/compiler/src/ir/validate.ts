@@ -92,6 +92,20 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "android.construct": { argTypes: [STRING, STRING], result: VOID },
   "android.call": { argTypes: [null, STRING, STRING, STRING], result: VOID },
   "android.staticField": { argTypes: [STRING, STRING, STRING], result: VOID },
+  "fetch.start": { argTypes: [STRING, DYN], result: { kind: "promise", inner: DYN } },
+  "fetch.responseJson": { argTypes: [DYN], result: { kind: "promise", inner: DYN } },
+  "fetch.responseText": { argTypes: [DYN], result: { kind: "promise", inner: STRING } },
+  "fetch.responseBytes": { argTypes: [DYN], result: { kind: "promise", inner: BYTES_U8 } },
+  "fetch.abortTimeout": { argTypes: [DYN], result: DYN },
+  "fetch.abortNow": { argTypes: [DYN], result: DYN },
+  "fetch.abortAny": { argTypes: [DYN], result: DYN },
+  "fetch.streamNew": { argTypes: [DYN], result: DYN },
+  // Program-dependent iterable: typed arrays/bytes/string stay intact so
+  // the native stream can pull lazily; checked-dynamic values are the
+  // fallback. The libCall validator below checks the closed set.
+  "fetch.streamFrom": { argTypes: [null], result: DYN },
+  // The chunk/result record depends on ReadableStream<T>; validated below.
+  "fetch.readerRead": { argTypes: [DYN], result: VOID },
   "island.eval": { argTypes: [STRING], result: STRING },
   "island.import": { argTypes: [STRING, STRING, STRING], result: JSVAL },
   "island.importDyn": { argTypes: [STRING], result: JSVAL },
@@ -1625,6 +1639,24 @@ function validateFunction(
   // the body of the optChain whose id it names.
   const activeChains = new Map<string, IrType>();
 
+  const liveDynRefEligible = (
+    type: IrType,
+    seen = new Set<string>(),
+  ): boolean => {
+    if (
+      type.kind === "record" ||
+      type.kind === "array" ||
+      type.kind === "bytes"
+    ) {
+      return true;
+    }
+    if (type.kind !== "union" || seen.has(type.unionId)) return false;
+    seen.add(type.unionId);
+    return unions.get(type.unionId)?.arms.some((arm) =>
+      liveDynRefEligible(arm, seen)
+    ) ?? false;
+  };
+
   function checkExpr(e: IrExpr): void {
     switch (e.kind) {
       case "numLit":
@@ -2252,6 +2284,14 @@ function validateFunction(
               ? { argTypes: [F64], minArgs: 1, result: F64 }
               : e.method === "slice" || e.method === "subarray"
                 ? { argTypes: [F64, F64], minArgs: 0, result: bytesOf(recv.elem) }
+                : e.method === "toReversed"
+                  ? { argTypes: [], minArgs: 0, result: bytesOf(recv.elem) }
+                : e.method === "with"
+                  ? { argTypes: [F64, F64], minArgs: 2, result: bytesOf(recv.elem) }
+                  : e.method === "join"
+                    ? { argTypes: [STRING], minArgs: 1, result: STRING }
+                    : e.method === "toArray"
+                      ? { argTypes: [], minArgs: 0, result: arrayOf(F64) }
                 : e.method === "setFrom"
                   ? { argTypes: [bytesOf(recv.elem), F64], minArgs: 1, result: VOID }
                   : e.method === "toString"
@@ -2316,10 +2356,16 @@ function validateFunction(
                   ? { argTypes: [elem], result: BOOL }
                   : e.method === "join"
                     ? { argTypes: [STRING], result: STRING }
-                    : e.method === "slice"
-                      ? { argTypes: [F64, F64], result: e.receiver.type }
-                      : e.method === "splice"
-                        ? { argTypes: [F64, F64], result: e.receiver.type }
+                : e.method === "slice"
+                  ? { argTypes: [F64, F64], result: e.receiver.type }
+                  : e.method === "toReversed"
+                    ? { argTypes: [], result: e.receiver.type }
+                    : e.method === "toSpliced"
+                      ? { argTypes: [F64, F64, e.receiver.type], result: e.receiver.type }
+                      : e.method === "with"
+                        ? { argTypes: [F64, elem], result: e.receiver.type }
+                  : e.method === "splice"
+                    ? { argTypes: [F64, F64], result: e.receiver.type }
                         : e.method === "shift"
                           ? { argTypes: [], result: e.type } // union-checked below
                           : { argTypes: [], result: F64 }; // length
@@ -3001,6 +3047,9 @@ function validateFunction(
         if (!canConvertToDyn(vt, (id) => records.get(id), (id) => unions.get(id))) {
           err(`dynFrom of non-dyn-convertible type ${vt.kind}`, e.loc);
         }
+        if (e.liveRef && !liveDynRefEligible(vt)) {
+          err(`live dynFrom of unsupported type ${vt.kind}`, e.loc);
+        }
         break;
       }
       case "dynFromJsval": {
@@ -3486,6 +3535,51 @@ function validateFunction(
           }
           break;
         }
+        if (e.fn === "fetch.streamFrom") {
+          const t = e.args[0]?.type;
+          const ok =
+            t?.kind === "string" ||
+            (t?.kind === "bytes" && t.elem === "u8") ||
+            (t?.kind === "array" &&
+              canConvertToDyn(
+                t.elem,
+                (id) => records.get(id),
+                (id) => unions.get(id),
+              )) ||
+            t?.kind === "dyn";
+          if (!ok) {
+            err(
+              `libCall fetch.streamFrom arg 0: expected a supported iterable, got ${t?.kind}`,
+              e.loc,
+            );
+          }
+          break;
+        }
+        if (e.fn === "fetch.readerRead") {
+          if (e.type.kind !== "promise" || e.type.inner.kind !== "record") {
+            err(
+              `libCall fetch.readerRead must return a promise of a read-result record`,
+              e.loc,
+            );
+          }
+          break;
+        }
+        if (e.fn === "fetch.responseText" || e.fn === "fetch.responseBytes") {
+          const valueType = e.fn === "fetch.responseText" ? STRING : BYTES_U8;
+          const inner = e.type.kind === "promise" ? e.type.inner : null;
+          const union = inner?.kind === "union" ? unions.get(inner.unionId) : undefined;
+          if (
+            inner === null ||
+            (!typeEquals(inner, valueType) &&
+              !union?.arms.some((arm) => typeEquals(arm, valueType)))
+          ) {
+            err(
+              `libCall ${e.fn} must return a promise whose value includes ${valueType.kind}`,
+              e.loc,
+            );
+          }
+          break;
+        }
         if (e.fn === "string.fromCharCode") {
           // One packed f64[] or one bytes value (the spread form).
           const t = e.args[0]?.type;
@@ -3625,12 +3719,14 @@ function validateFunction(
           }
           break;
         }
-        if (e.fn === "http.requestCb" || e.fn === "http.requestUrlCb" || e.fn === "http.clientOnResponse" ||
+        if (e.fn === "http.requestCb" || e.fn === "https.requestCb" ||
+            e.fn === "http.requestUrlCb" || e.fn === "http.clientOnResponse" ||
             e.fn === "http.requestAgentCb" || e.fn === "https.requestAgentCb" ||
             e.fn === "https.requestUrlCb") {
           // The response listener: void, no params or exactly (res: httpReq).
           const cbT = e.args[
             e.fn === "http.requestCb" ? 7
+            : e.fn === "https.requestCb" ? 9
             : e.fn === "http.requestUrlCb" || e.fn === "https.requestUrlCb" ? 3
             : e.fn === "http.requestAgentCb" ? 8
             : e.fn === "https.requestAgentCb" ? 10
@@ -4744,7 +4840,7 @@ function validateFunction(
           getProp: 1, setProp: 2, getIdx: 2, setIdx: 3, globalGet: 0,
           undefLit: 0, nullLit: 0, iterNew: 1, defineGetter: 3, objSpread: 2,
           callSpread: 3, // callee + pre array + spread source
-          callMethod: null, optCallMethod: null, callFn: null, construct: null, // receiver/callee + any number of args
+          callMethod: null, optCallMethod: null, callFn: null, callFnThis: null, construct: null, // receiver/callee + any number of args
           objLit: null, arrLit: null, tplStrings: null, // variable length (objLit: key/value pairs; tplStrings: n cooked + n raw)
         };
         const want = arity[e.op];
@@ -4753,6 +4849,9 @@ function validateFunction(
         }
         if (want === null && e.op !== "objLit" && e.op !== "arrLit" && e.op !== "tplStrings" && e.args.length < 1) {
           err(`jsOp ${e.op} needs a receiver/callee arg`, e.loc);
+        }
+        if (e.op === "callFnThis" && e.args.length < 2) {
+          err("jsOp callFnThis needs a callee and receiver", e.loc);
         }
         if (e.op === "objLit" && e.args.length % 2 !== 0) {
           err("jsOp objLit takes key/value pairs", e.loc);
