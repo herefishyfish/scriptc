@@ -3482,8 +3482,21 @@ function validateFunction(
           : e.args.length !== sig.argTypes.length) {
           err(`libCall ${e.fn}: ${e.args.length} args, expected ${sig.argTypes.length}`, e.loc);
         }
+        // `null` in an Android REFERENCE slot is the one unit value with a
+        // standalone runtime meaning — JNI null — so it reaches the emitter as
+        // a bare unitLit instead of a unionWrap arm, and the generic
+        // bare-unitLit rule below must not see it. NativeScript's own runtime
+        // converts a JS null/undefined argument to a null jobject for any
+        // reference parameter; this is that behaviour, decided statically.
+        const androidPrefix = e.fn === "android.construct"
+          ? 2
+          : e.fn === "android.call"
+          ? 4
+          : -1;
+        const isAndroidNullArg = (a: IrExpr, i: number) =>
+          androidPrefix >= 0 && i >= androidPrefix && a.type.kind === "nullT";
         e.args.forEach((a, i) => {
-          checkExpr(a);
+          if (!isAndroidNullArg(a, i)) checkExpr(a);
           const want = sig.argTypes[i];
           if (want) expectType(a, want, `libCall ${e.fn} arg ${i}`);
         });
@@ -3522,6 +3535,7 @@ function validateFunction(
             const supported =
               type.kind === "string" || type.kind === "bool" ||
               type.kind === "f64" || type.kind === "func" ||
+              type.kind === "nullT" ||
               isAndroidObjectType(type);
             if (!supported) {
               err(`libCall ${e.fn} arg ${i} has unsupported ${type.kind} type`, e.loc);

@@ -2809,7 +2809,13 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
         // JS identity — everything else fresh). Throwing members (the
         // may-throw seed set) get the standard pending check, emitted after
         // a result temp joins its frame so an unwind releases it.
-        const args = e.args.map((a) => E.emitExpr(a));
+        // A nullT argument reaches here only in an Android reference slot
+        // (validate rejects the type everywhere else). Unit types have no
+        // standalone value to emit, so it never goes through emitExpr — the
+        // JNI null is written straight into the argument array below.
+        const args = e.args.map((a) =>
+          a.type.kind === "nullT" ? { name: "NULL", type: a.type } : E.emitExpr(a)
+        );
         const arg = (i: number) => args[i]!.name;
         const finish = (call: string): Temp => {
           if (e.type.kind === "void") {
@@ -2850,6 +2856,11 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
                 case "object":
                   E.line(`${arr}[${i}].tag = SCR_ANDROID_ARG_OBJECT; ${arr}[${i}].value.object = ${value.name};`);
                   break;
+                case "nullT":
+                  // scr_android_args already maps a NULL ScrAndroidRef to a
+                  // JNI null under the object tag.
+                  E.line(`${arr}[${i}].tag = SCR_ANDROID_ARG_OBJECT; ${arr}[${i}].value.object = NULL;`);
+                  break;
                 case "string":
                   E.line(`${arr}[${i}].tag = SCR_ANDROID_ARG_STRING; ${arr}[${i}].value.string = ${value.name};`);
                   break;
@@ -2887,6 +2898,7 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
               return finish(`scr_android_call_bool(${callArgs})`);
             }
             return finish(`scr_android_call_number(${callArgs})`);
+          }
           case "fetch.start":
             E.usesTimers = true;
             return finish(`scr_fetch_static(${arg(0)}, ${arg(1)})`);

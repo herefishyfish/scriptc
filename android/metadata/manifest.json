@@ -10,53 +10,57 @@
       "sha256": "4566663c3876e022b4fa4ced8c8697c4ab1688267f090114fd92d027b32e619b"
     },
     {
+      "file": "core-1.13.0.jar",
+      "sha256": "bbbb0c4e02faa69f1303cff45201d7c6a7f208571fc8e5a69935cd7f334439bf"
+    },
+    {
+      "file": "appcompat-1.7.0.jar",
+      "sha256": "036566c1bf780cd8a8759713820203bb219a4bebfb1c6de551625cf3b879656e"
+    },
+    {
+      "file": "appcompat-resources-1.7.0.jar",
+      "sha256": "5086cb01af26288f1d212818638272792a6f8b5c3630248e43ba986814be14d9"
+    },
+    {
+      "file": "fragment-1.8.5.jar",
+      "sha256": "4c6fd2e758d8dffe13d2b66371b329ca7520d8f4c4df0b6391a5e4465d9759ce"
+    },
+    {
+      "file": "transition-1.5.1.jar",
+      "sha256": "de4631b3bcf43b194259738405dd8b0686287c7a5b1615ac6e7e9bb84af4a8ae"
+    },
+    {
+      "file": "viewpager-1.1.0.jar",
+      "sha256": "b3d2e1b21f092b95e167c28ef45f63afed535967fec8f3368c608cd2ef0bcee0"
+    },
+    {
+      "file": "activity-1.8.1.jar",
+      "sha256": "19cc1c0e8f925eccae7b8feadcd0efcec57262a206a7754817626ea4d3b37738"
+    },
+    {
+      "file": "lifecycle-runtime-2.6.2.jar",
+      "sha256": "6ea060cc3ded80fe7ba7407d8b0b6fc7f8ce67c025f67c893ed07b386a86fc77"
+    },
+    {
       "file": "lifecycle-common-2.6.2.jar",
       "sha256": "f34831b6c71cd844e1d35d1be49d5e79447c5ab856346531b1e8676fda7374b1"
     },
     {
-      "file": "dependency-0.jar",
+      "file": "widgets-classes.jar",
       "sha256": "e1ed6534f173381e5486858dfa66c7a2fdfcceba0d0e3f2efa8291f1a7ab5e94"
     },
     {
-      "file": "dependency-1.jar",
+      "file": "winter_tc-classes.jar",
       "sha256": "b271ee59f0b18471ebcc5a250cc6e84006547798dc3afab8844c2f9d3146b384"
     },
     {
-      "file": "dependency-2.jar",
-      "sha256": "bbbb0c4e02faa69f1303cff45201d7c6a7f208571fc8e5a69935cd7f334439bf"
-    },
-    {
-      "file": "dependency-3.jar",
-      "sha256": "036566c1bf780cd8a8759713820203bb219a4bebfb1c6de551625cf3b879656e"
-    },
-    {
-      "file": "dependency-4.jar",
-      "sha256": "5086cb01af26288f1d212818638272792a6f8b5c3630248e43ba986814be14d9"
-    },
-    {
-      "file": "dependency-5.jar",
-      "sha256": "4c6fd2e758d8dffe13d2b66371b329ca7520d8f4c4df0b6391a5e4465d9759ce"
-    },
-    {
-      "file": "dependency-6.jar",
-      "sha256": "de4631b3bcf43b194259738405dd8b0686287c7a5b1615ac6e7e9bb84af4a8ae"
-    },
-    {
-      "file": "dependency-7.jar",
-      "sha256": "b3d2e1b21f092b95e167c28ef45f63afed535967fec8f3368c608cd2ef0bcee0"
-    },
-    {
-      "file": "dependency-8.jar",
-      "sha256": "19cc1c0e8f925eccae7b8feadcd0efcec57262a206a7754817626ea4d3b37738"
-    },
-    {
-      "file": "dependency-9.jar",
-      "sha256": "6ea060cc3ded80fe7ba7407d8b0b6fc7f8ce67c025f67c893ed07b386a86fc77"
+      "file": "app-classes.jar",
+      "sha256": "74cedd0ab7e6f108fd4d57e10536af1f135a0ca1145dd5e42e8085ac27d10b70"
     }
   ],
   "streams": {
-    "treeNodeStream.dat": "95775786065045c09ccc072d9cb92b891297fa46678bb164af3f39c073cda24e",
-    "treeStringsStream.dat": "dd6c180a9f0f399904a56a33f031e6cd9a66749b046f69342ff94f080e97a422",
-    "treeValueStream.dat": "f1ec74602034052e51ffa6103fec5cca775b2c1c92c975a88204e20ec06794be"
+    "treeNodeStream.dat": "dea6e118edce48409d96bbe743a37dfd1f59847ed95ddf0c2e26d9967c375728",
+    "treeStringsStream.dat": "e4a9f0668657d4e7dfc8c4f25d627e7ea71957710dc81b558a9b1b060c266a4a",
+    "treeValueStream.dat": "0962c127894aa7e99c5bf8ef5adc736ab5890ed8bc4266893432c4f097ec1f66"
   }
 }

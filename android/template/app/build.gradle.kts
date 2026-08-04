@@ -1,4 +1,7 @@
-plugins { id("com.android.application") }
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+}
 
 android {
     namespace = __APPLICATION_ID_JSON__
@@ -18,6 +21,17 @@ android {
     externalNativeBuild {
         cmake { path = file("src/main/cpp/CMakeLists.txt") }
     }
+
+    // Java and Kotlin must agree on a JVM target or the Kotlin plugin fails
+    // the build; 17 also retires AGP's "source value 8 is obsolete" warnings.
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+}
+
+kotlin {
+    compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17) }
 }
 
 dependencies {
@@ -28,4 +42,9 @@ dependencies {
     implementation("androidx.fragment:fragment:1.8.5")
     implementation("androidx.transition:transition:1.5.1")
     implementation("androidx.viewpager:viewpager:1.1.0")
+    // widgets-release.aar is a local file dependency, so its transitive
+    // requirements are not resolved: org.nativescript.widgets.image.Fetcher
+    // needs exifinterface, and Utils/FileHelper need documentfile.
+    implementation("androidx.exifinterface:exifinterface:1.3.7")
+    implementation("androidx.documentfile:documentfile:1.0.1")
 }

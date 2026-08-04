@@ -7,7 +7,7 @@
 import * as ts from "../ts7/adapter.js";
 import { dirname } from "node:path";
 import type { Lowerer } from "./lowerer.js";
-import { androidObjectType, BOOL, CAUGHT, DYN, DYN_HANDLE_KINDS, F64, IrExpr, IrFunction, IrJsOp, IrLocal, IrRecordShape, IrStmt, IrType, JSVAL, NULL_T, REF_TRUTHY_KINDS, REGEX, RUNTIME_ERROR_CLASSES, SEARCH_PARAMS_T, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, canAdaptDynFuncTo, canBoxFuncIntoDyn, canDynCheckTo, funcOf, isJsonSafeType, isUnitType, jsOpResultKind, shapeHasAccessorSlots, typeEquals, typeKey, unionFuncSetArmsOk } from "../../ir/nodes.js";
+import { androidObjectType, BOOL, CAUGHT, DYN, DYN_HANDLE_KINDS, F64, IrExpr, IrFunction, IrJsOp, IrLocal, IrRecordShape, IrStmt, IrType, JSVAL, NULL_T, REF_TRUTHY_KINDS, REGEX, RUNTIME_ERROR_CLASSES, SEARCH_PARAMS_T, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, canAdaptDynFuncTo, canBoxFuncIntoDyn, canDynCheckTo, funcOf, isAndroidObjectType, isJsonSafeType, isUnitType, jsOpResultKind, shapeHasAccessorSlots, typeEquals, typeKey, unionFuncSetArmsOk } from "../../ir/nodes.js";
 import { cjsClassExprWholeExportOf, cjsExportAssignmentOf, cjsExportDiscardReason, isCjsExportTableLiteral, isCjsJsFile, isJsSourceFile, isModuleExportsAccess, isNodeEsmFile, locOf } from "../program.js";
 import { ARRAY_METHODS, builtinConstLit, builtinFenceHintOf, builtinModuleConstOf, builtinModulesArrayLit, builtinModuleFnOf, CompoundOp, ISLAND_SURFACE, isChildSurfaceMember, MAP_METHODS, NARROW_FIRST, SET_METHODS, STR_METHODS, UNSUPPORTED_EXPR, sideEffectFreeOptionValue, stdlibGlobalNameOf } from "./surfaces.js";
 import { UNSUPPORTED, blockedBindingUseDiag, recordShapeMismatchDiag, requiresDynamicPackageDiag, unsupportedDiag } from "../../diagnostics/diagnostic.js";
@@ -6780,6 +6780,14 @@ export function lowerTemplate(L: Lowerer, expr: ts.TemplateExpression): IrExpr {
     if (inner.type.kind !== "dyn" && inner.type.kind !== "jsval") {
       // A STATIC value cast `as any` is the explicit island entrance.
       const targetTs0 = L.checker.getTypeFromTypeNode(expr.type);
+      const target0 = L.mapTypeOf(targetTs0);
+      // Java reference casts keep the same jobject handle and only refine
+      // the class used for subsequent metadata lookup. This is required for
+      // APIs such as getSystemService(), whose JNI return is Object while
+      // NativeScript callers recover the service class with an `as` cast.
+      if (target0 && isAndroidObjectType(inner.type) && isAndroidObjectType(target0)) {
+        return { ...inner, type: target0, loc: locOf(expr) };
+      }
       if (targetTs0.flags & ts.TypeFlags.Any && L.dynamic) {
         return L.jsvalIn(inner, expr.expression);
       }
@@ -6791,7 +6799,7 @@ export function lowerTemplate(L: Lowerer, expr: ts.TemplateExpression): IrExpr {
       // opaque union-mismatch fence). Sub-union targets and same-type
       // casts keep the historic erasure.
       if (inner.type.kind === "union") {
-        const target = L.mapTypeOf(targetTs0);
+        const target = target0;
         if (target && target.kind !== "union" && !typeEquals(target, inner.type)) {
           const helper = L.narrowedArmHelper(inner.type.unionId, target, locOf(expr));
           if (helper) {
@@ -6811,7 +6819,14 @@ export function lowerTemplate(L: Lowerer, expr: ts.TemplateExpression): IrExpr {
       if (targetTs.flags & ts.TypeFlags.Any) return inner;
       const target = L.mapTypeOf(targetTs);
       if (!target) L.badType(expr.type, targetTs);
-      if (!L.boundarySafe(target)) {
+      // An ANDROID object target is not JSON-representable but is still a
+      // valid exit: an engine value may carry an Android host object, and
+      // coerceToExpected already unwraps one implicitly wherever a jsval
+      // meets a native slot (every Android call argument). The cast is the
+      // explicit spelling of that same jsExit — this is what makes
+      // `getSystemService(...) as android.os.BatteryManager` work, the
+      // declarations having typed every system service as `any`.
+      if (!isAndroidObjectType(target) && !L.boundarySafe(target)) {
         L.unsupported(
           "SC1090",
           expr,

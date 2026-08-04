@@ -214,6 +214,13 @@ export class AndroidMetadata {
     if (actual.kind === "jsval") {
       return expected.length > 1 ? 4 : null;
     }
+    // `null` is legal for any reference parameter and carries no class of its
+    // own, so it matches every object descriptor — single-character
+    // descriptors are the primitives, which cannot take it. Ranked below the
+    // statically typed matches so a known class still decides an overload.
+    if (actual.kind === "nullT") {
+      return expected.length > 1 ? 3 : null;
+    }
     if (actual.kind === "string") {
       if (expected === "java/lang/String") return 0;
       if (expected === "java/lang/CharSequence") return 1;

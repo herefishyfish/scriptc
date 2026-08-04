@@ -2751,7 +2751,7 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
             );
           }
         }
-        const resultType = L.mapTypeOf(L.typeOf(expr));
+        let resultType = L.mapTypeOf(L.typeOf(expr));
         if (resultType === null) {
           L.noLowering(`${javaClass}.${access.name.text} Android return type`, expr);
         }
@@ -2767,6 +2767,24 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
             error instanceof Error ? error.message : `${javaClass}.${access.name.text}`,
             expr,
           );
+        }
+        // NativeScript declares a few Java APIs (notably
+        // Activity.getSystemService) as `any`, but the metadata still has
+        // the concrete JNI return descriptor. Keep the libCall in the
+        // native Android world so an enclosing `as android.foo.Bar` can be
+        // an ordinary typed view of the returned jobject instead of first
+        // producing an unsupported island jsval result.
+        if (resultType!.kind === "jsval") {
+          const metadataReturn = method!.returnType;
+          const objectReturn = metadataReturn.startsWith("L") && metadataReturn.endsWith(";")
+            ? metadataReturn.slice(1, -1)
+            : metadataReturn;
+          resultType =
+            metadataReturn === "V" ? VOID :
+            metadataReturn === "Z" ? BOOL :
+            metadataReturn.length === 1 ? F64 :
+            objectReturn === "java/lang/String" ? STRING :
+            androidObjectType(objectReturn);
         }
         args = args.map((arg, index) => {
           const expected = method!.parameterTypes[index]!;
